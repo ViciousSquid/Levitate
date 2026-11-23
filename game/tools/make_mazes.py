@@ -14,7 +14,9 @@ a few hundred brushes. On top of the layout go:
 * the masonry that makes a wall a wall: a pier wherever walls meet and at
   every corner, and coping stones along the top,
 * lights: a glow at every pad, cell and flag, and a grid of fill lights for
-  the ``classic`` renderer (a lit match hides them; see game/graphics.py).
+  the ``classic`` renderer (a lit match hides them; see game/graphics.py),
+* navigation nodes for the rival craft: one in every open cell, linked to
+  the cells it opens onto (ledge tops are left out: craft stay on the floor).
 
 Every face is mapped at its material's real size (:data:`TILE`). The
 materials are photo-scanned surfaces from Poly Haven
@@ -496,7 +498,30 @@ def build(spec):
                     CELL * 2.6, **{FILL_LIGHT: True})
 
     scenery(b, world, wall_name, cap_name, width, depth)
+    # Last, so everything above keeps the ids and the layout it always had.
+    navigation(b, cols, rows, east, north, centre, set(ledges))
     return {"version": 3, "brushes": b.brushes, "things": b.things}
+
+
+#: How high a navigation node stands: on the floor, under a craft's hull.
+NODE_Y = 16
+
+
+def navigation(b, cols, rows, east, north, centre, ledges=()):
+    """The rival craft's navigation nodes (``levitatenode``): one at the
+    centre of every cell, linked to each neighbour it opens onto. A ledge's
+    top is not on the floor, so it has none and nothing links to it."""
+    def name(cell):
+        return f"Nav_{cell[0]}_{cell[1]}"
+
+    for r in range(rows):
+        for c in range(cols):
+            if (c, r) in ledges:
+                continue
+            links = [name(n) for n in open_cells((c, r), east, north, cols, rows)
+                     if n not in ledges]
+            x, z = centre(c, r)
+            b.thing("levitatenode", name((c, r)), (x, NODE_Y, z), links=",".join(links))
 
 
 def scenery(b, world, wall_name, cap_name, width, depth):

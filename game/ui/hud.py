@@ -201,6 +201,17 @@ class Hud:
                 p = to_screen(flag.pos[0], flag.pos[2])
                 painter.setBrush(colour)
                 painter.drawEllipse(p, 3.5, 3.5)
+        # Rival craft: a ringed dot in their colour; one carrying a flag of
+        # ours flashes in it.
+        rival = RED if match.rival_team == "red" else BLUE
+        home = RED if match.player_team == "red" else BLUE
+        dot = max(3.0, rect.width() * 0.022)
+        for x, z, carrying in getattr(match, "rivals", ()):
+            p = to_screen(x, z)
+            painter.setPen(QPen(QColor(240, 244, 255), max(1.0, dot * 0.35)))
+            painter.setBrush(home if carrying and blink else rival)
+            painter.drawEllipse(p, dot, dot)
+        painter.setPen(Qt.NoPen)
         # The craft: an arrow along its heading.
         px, _py, pz = match.player_pos
         p = to_screen(px, pz)
