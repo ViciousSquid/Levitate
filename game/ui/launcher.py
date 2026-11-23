@@ -111,12 +111,12 @@ def chosen_map():
 
 _ACCENT = "#40ECC8"   # Levitate's radar teal
 _PLAY_GREEN = "#C62828"   # Levitate red, the hull colour
-#: The maze picker's pastel orange, with hover, selected-row and border shades.
-#: Dark brown text on it keeps a contrast ratio above 9:1.
-_MAZE_ORANGE = "#FFC58F"
-_MAZE_ORANGE_HOVER = "#FFD2A8"
-_MAZE_ORANGE_SELECTED = "#F5A35C"
-_MAZE_ORANGE_BORDER = "#D9925A"
+#: The maze picker's very dark red, with hover, selected-row and border shades.
+#: White text on it keeps a contrast ratio above 15:1.
+_MAZE_RED = "#3A0A0C"
+_MAZE_RED_HOVER = "#4E1014"
+_MAZE_RED_SELECTED = "#7A1A20"
+_MAZE_RED_BORDER = "#6B1C20"
 # --- sizing ---------------------------------------------------------------
 # Every dimension in the launcher is a multiple of one text line, measured from
 # the application font. That is what makes it DPI-aware the same way the rest of
@@ -496,15 +496,15 @@ class Launcher(QDialog):
         for rel, title in self._mazes:
             self.maze_combo.addItem(title, rel)
         self.maze_combo.setToolTip("The maze PLAY starts in.")
-        # The maze picker stands out in pastel orange, closed and open alike.
+        # The maze picker stands out in very dark red, closed and open alike.
         self.maze_combo.setStyleSheet(
-            f"QComboBox {{ background-color:{_MAZE_ORANGE}; color:#2a1606;"
-            f" border:1px solid {_MAZE_ORANGE_BORDER}; font-weight:bold; }}"
-            f"QComboBox:hover {{ background-color:{_MAZE_ORANGE_HOVER}; }}"
-            f"QComboBox:disabled {{ background-color:#5a4a3e; color:#a89888; }}"
-            f"QComboBox QAbstractItemView {{ background-color:{_MAZE_ORANGE}; color:#2a1606;"
-            f" selection-background-color:{_MAZE_ORANGE_SELECTED}; selection-color:#1a0c02;"
-            f" border:1px solid {_MAZE_ORANGE_BORDER}; }}")
+            f"QComboBox {{ background-color:{_MAZE_RED}; color:white;"
+            f" border:1px solid {_MAZE_RED_BORDER}; font-weight:bold; }}"
+            f"QComboBox:hover {{ background-color:{_MAZE_RED_HOVER}; }}"
+            f"QComboBox:disabled {{ background-color:#2a2226; color:#8a7c80; }}"
+            f"QComboBox QAbstractItemView {{ background-color:{_MAZE_RED}; color:white;"
+            f" selection-background-color:{_MAZE_RED_SELECTED}; selection-color:white;"
+            f" border:1px solid {_MAZE_RED_BORDER}; }}")
         self.maze_combo.setEnabled(bool(self._mazes))
         self.maze_combo.currentIndexChanged.connect(self._save)
         form.addRow("Maze", self.maze_combo)
