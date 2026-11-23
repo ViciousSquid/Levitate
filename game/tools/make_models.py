@@ -208,13 +208,13 @@ def make_flag(team):
     pixels = weave.load()
     for y in range(h):
         for x in range(w):
-            pixels[x, y] = int(150 + 50 * math.sin(x * 1.6) * math.sin(y * 1.6)
+            pixels[x, y] = int(150 + 22 * math.sin(x * 0.8) * math.sin(y * 0.8)
                                + 30 * math.sin((x + y) * 0.35))
     shaded = Image.composite(image, Image.new("RGB", (w, h), tuple(int(c * 0.86) for c in cloth)),
                              weave.point(lambda v: 255 if v > 120 else 150))
     image = Image.blend(image, shaded, 0.5)
     _save(image, f"flag_{team}_cloth.png")
-    _save(_normal_map(weave, strength=1.6), f"flag_{team}_cloth_n.png")
+    _save(_normal_map(weave, strength=1.0), f"flag_{team}_cloth_n.png")
     material = Image.new("RGBA", (w, h), (255, 220, 0, 255))        # AO, roughness, metal, no glow
     _save(material, f"flag_{team}_cloth_m.png")
 
