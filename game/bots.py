@@ -96,6 +96,32 @@ BARRIER_RADIUS = 120.0
 MONSTER_TYPE = "hovercraft"
 
 
+class Pilot:
+    """A human craft as the rivals see it: where it is, how it moves, whether
+    a shield makes it heavy or a phantom hides it. *craft* has ``position``
+    and a settable ``velocity`` (the RuntimeAPI's PlayerState, or a remote
+    player's craft in a multiplayer race); *bonk* is called when a rival
+    rams it."""
+
+    def __init__(self, craft, shielded=False, hidden=False, bonk=None):
+        self.craft = craft
+        self.shielded = bool(shielded)
+        self.hidden = bool(hidden)
+        self.bonk = bonk
+
+    @property
+    def position(self):
+        return tuple(self.craft.position)
+
+    @property
+    def velocity(self):
+        return tuple(self.craft.velocity)
+
+    @velocity.setter
+    def velocity(self, value):
+        self.craft.velocity = value
+
+
 def bots_from(config) -> int:
     """The number of rival craft ``[Game] bots`` asks for, in 0..MAX_BOTS."""
     try:
@@ -494,6 +520,10 @@ class Squad:
         self.rng = random.Random(seed)
         self.bots = []
         self.spawns = None
+        #: Human craft playing from other computers (a multiplayer race):
+        #: they take seats as this computer's own players do.
+        self.remote_humans = 0
+        self._pilots = []
         self.benched = []                  # rivals that gave a human their seat
         self.nav = None
         self.routes = None                 # NodeGraph, or GridRoutes without nodes
@@ -619,16 +649,18 @@ class Squad:
     # -- seats -------------------------------------------------------------------
     def _human_positions(self):
         runtime = getattr(self.logic, "player_runtime", None)
-        return [tuple(float(v) for v in p.pos)
-                for p in (getattr(runtime, "player", None), getattr(runtime, "player2", None))
-                if p is not None]
+        local = [tuple(float(v) for v in p.pos)
+                 for p in (getattr(runtime, "player", None), getattr(runtime, "player2", None))
+                 if p is not None]
+        return local + [p.position for p in self._pilots[1:]]
 
     def humans(self):
         """How many human craft are playing: the player, and player 2 when
         split-screen is on."""
         runtime = getattr(self.logic, "player_runtime", None)
-        return (int(getattr(runtime, "player", None) is not None)
-                + int(getattr(runtime, "player2", None) is not None)) or 1
+        local = (int(getattr(runtime, "player", None) is not None)
+                 + int(getattr(runtime, "player2", None) is not None)) or 1
+        return local + int(self.remote_humans)
 
     def seat(self, match, humans, announce=True):
         """Make the rivals fit beside *humans* human craft in
@@ -646,7 +678,7 @@ class Squad:
         if change:
             self._entities_changed()
             if announce and match is not None and match.finished is None:
-                match.say("A PLAYER JOINED  —  A RIVAL MAKES ROOM" if change > 0
+                _announce(match, "A PLAYER JOINED  —  A RIVAL MAKES ROOM" if change > 0
                           else "A RIVAL RETURNS TO THE MAZE", 2.5)
         return change
 
@@ -703,10 +735,14 @@ class Squad:
             print(f"[Levitate] rival craft not indexed: {exc}")
 
     # -- per tick ----------------------------------------------------------------
-    def tick(self, match, player, dt, now, handling=None):
-        """Run every craft for *dt* seconds. *player* is the RuntimeAPI's
-        PlayerState; *handling* the player's HoverHandling (for the bump
-        flash)."""
+    def tick(self, match, pilots, dt, now, handling=None):
+        """Run every craft for *dt* seconds against *pilots*, the human
+        craft (:class:`Pilot`; the first is this computer's player). A bare
+        PlayerState is taken as that player, with *handling* (its
+        HoverHandling) for the bump flash."""
+        if not isinstance(pilots, (list, tuple)):
+            pilots = [self.local_pilot(match, pilots, now, handling)]
+        player, handling = pilots, None
         if not self.bots and not self.benched:
             return
         dt = max(0.0, min(float(dt), 0.1))
@@ -719,20 +755,30 @@ class Squad:
             with lock:
                 self._step(match, player, dt, now, handling)
 
-    def _step(self, match, player, dt, now, handling):
+    @staticmethod
+    def local_pilot(match, player, now, handling=None):
+        """This computer's player as a :class:`Pilot`."""
+        def bonk():
+            if handling is not None:
+                handling.bonk = 0.25
+        return Pilot(player, shielded=match.shield_until > now,
+                     hidden=match.phantom_until > now, bonk=bonk)
+
+    def _step(self, match, pilots, dt, now, handling):
+        self._pilots = list(pilots)
         self.seat(match, self.humans())
         live = match.finished is None
-        ppos = tuple(player.position)
-        hidden = match.phantom_until > now
+        seen = [p.position for p in pilots if not p.hidden]
         for bot in self.bots:
             if live:
-                goal = self._think(match, bot, ppos, hidden)
+                goal = self._think(match, bot, seen)
             else:
                 goal, bot.state = None, "idle"
             self._drive(bot, goal, dt)
         self._bump_craft()
         if live:
-            self._bump_player(match, player, handling)
+            for pilot in pilots:
+                self._bump_player(match, pilot)
             for bot in self.bots:
                 self._flags(match, bot)
         for bot in self.bots:
@@ -741,7 +787,7 @@ class Squad:
                 self._carry(bot)
 
     # -- deciding --------------------------------------------------------------
-    def _think(self, match, bot, ppos, hidden):
+    def _think(self, match, bot, seen):
         """Where *bot* is heading this tick, as ``(x, z, speed)``, or None."""
         if self.clock < bot.jammed_until:
             bot.state = "jammed"
@@ -760,12 +806,14 @@ class Squad:
                 bot.target, bot.state = flag, "raiding"
                 return self._follow(flag.pos[0], flag.pos[2], x, z)
         bot.target = None
-        # Defend: ram the player on sight, else patrol our own flags.
-        px, _py, pz = ppos
-        if (not hidden and math.hypot(px - x, pz - z) < SIGHT_RANGE
-                and nav.sees((x, z), (px, pz)) and nav.clear((x, z), (px, pz))):
-            bot.state = "chasing"
-            return (px, pz, BOT_SPEED * 1.08)
+        # Defend: ram the nearest pilot in sight (a phantom is not seen),
+        # else patrol our own flags.
+        for px, _py, pz in sorted(seen, key=lambda p: math.hypot(p[0] - x, p[2] - z)):
+            if math.hypot(px - x, pz - z) >= SIGHT_RANGE:
+                break
+            if nav.sees((x, z), (px, pz)) and nav.clear((x, z), (px, pz)):
+                bot.state = "chasing"
+                return (px, pz, BOT_SPEED * 1.08)
         bot.state = "patrolling"
         if bot.patrol is None or math.hypot(bot.patrol[0] - x, bot.patrol[1] - z) < 120:
             bot.patrol = self._patrol_point(match, bot)
@@ -911,19 +959,18 @@ class Squad:
                     a.actor.velocity.x, a.actor.velocity.z = hit[0][0], hit[0][2]
                     b.actor.velocity.x, b.actor.velocity.z = hit[1][0], hit[1][2]
 
-    def _bump_player(self, match, player, handling):
-        now_shielded = match.shield_until > _now()
+    def _bump_player(self, match, pilot):
         for bot in self.bots:
-            hit = self._collide(tuple(player.position), tuple(player.velocity),
+            hit = self._collide(pilot.position, pilot.velocity,
                                 tuple(bot.actor.pos), tuple(bot.actor.velocity),
-                                CRAFT_RADIUS + PLAYER_RADIUS, a_heavy=now_shielded)
+                                CRAFT_RADIUS + PLAYER_RADIUS, a_heavy=pilot.shielded)
             if hit is None:
                 continue
-            player.velocity = hit[0]
+            pilot.velocity = hit[0]
             bot.actor.velocity.x, bot.actor.velocity.z = hit[1][0], hit[1][2]
             bot.stun_until = self.clock + BUMP_STUN
-            if handling is not None and not now_shielded:
-                handling.bonk = 0.25
+            if pilot.bonk is not None and not pilot.shielded:
+                pilot.bonk()
             if bot.carrying is not None:
                 self._return_flag(match, bot)
 
@@ -943,7 +990,7 @@ class Squad:
             bot.carrying, bot.target = flag, None
             bot.base = self._base(match, bot)
             _glow(match, flag, False)
-            match.say("A RIVAL HAS YOUR FLAG  —  RAM IT TO WIN IT BACK", 3.0)
+            _announce(match, "A RIVAL HAS YOUR FLAG  —  RAM IT TO WIN IT BACK", 3.0)
 
     def _base(self, match, bot):
         """Where *bot* takes a flag it has picked up: the nearest pole of its
@@ -973,7 +1020,7 @@ class Squad:
             moved(flag)
         _glow(match, flag, True)
         if announce:
-            match.say("FLAG RECOVERED  —  IT IS BACK ON ITS POLE", 2.5)
+            _announce(match, "FLAG RECOVERED  —  IT IS BACK ON ITS POLE", 2.5)
 
     def _deliver(self, match, bot):
         from plugins.api import set_flag
@@ -984,10 +1031,10 @@ class Squad:
         bot.raid_at = self.clock + RAID_REST
         left = len(match.home_flags) - len(match.lost)
         if left:
-            match.say(f"A {match.player_team.upper()} FLAG IS LOST  —  {left} LEFT", 3.0)
+            _announce(match, f"A {match.player_team.upper()} FLAG IS LOST  —  {left} LEFT", 3.0)
         else:
             match.finished, match.finished_at = "lost", _now()
-            match.say("THE RIVALS TOOK EVERY FLAG  —  PRESS R TO RETRY", 999)
+            _announce(match, "THE RIVALS TOOK EVERY FLAG  —  PRESS R TO RETRY", 999)
 
     # -- power cells against rival craft -------------------------------------------
     def jam(self, pos):
@@ -1047,6 +1094,12 @@ class Squad:
         """``[(x, z, carrying)]`` for every craft."""
         return [(float(b.actor.pos.x), float(b.actor.pos.z), b.carrying is not None)
                 for b in self.bots]
+
+
+def _announce(match, text, seconds=2.5):
+    """Tell every pilot in the race (just :meth:`say` outside multiplayer)."""
+    announce = getattr(match, "announce", None)
+    (announce or match.say)(text, seconds)
 
 
 def _now():

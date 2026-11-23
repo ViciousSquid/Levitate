@@ -51,6 +51,7 @@ class MatchState:
         self.phantom_until = 0.0
         self.message = ""
         self.message_until = 0.0
+        self.announcement = (0, "", 0.0)   # (serial, text, seconds) for the race
         self.pad_ready = {}            # pad id -> monotonic time
         self.pickup_back = {}          # pickup id -> monotonic time it returns
         self.walls = []                # [(x0, z0, x1, z1)] for the radar
@@ -82,6 +83,12 @@ class MatchState:
         self.message = text
         self.message_until = time.monotonic() + seconds
 
+    def announce(self, text, seconds=2.5):
+        """:meth:`say` to every pilot in the race: what happens to the flags
+        and the race, as opposed to this player's own cells and pads."""
+        self.say(text, seconds)
+        self.announcement = (self.announcement[0] + 1, text, float(seconds))
+
 
 class LevitateGame:
     """The built-in Levitate layer (see :meth:`PluginManager.register_builtin_game`)."""
@@ -98,6 +105,10 @@ class LevitateGame:
         self.handling = None
         self.squad = None              # the rival craft (game/bots.py)
         self.spawns = None             # the maze's spawn points (game/spawns.py)
+        self.net = None                # a multiplayer race (game/multiplayer/session.py)
+        self._restart_asked = False
+        self._r_held = False
+        self._awaiting_host = False
         self._player2 = None           # the player-2 craft last placed
         self._hud = None
         self._view = None              # the 3D view whose stock HUD we hide
@@ -157,17 +168,37 @@ class LevitateGame:
         # Every craft starts on a spawn point at random; the player first.
         self.spawns = SpawnPoints(things)
         self._player2 = None
+        self._restart_asked = False
+        self.net = self._start_race(logic)
+        if self.net is not None and not self.net.is_host:
+            # A joiner: the host runs the rivals and says where to start.
+            self.squad = None
+            self._awaiting_host = True
+            match.say(f"{match.title.upper()}  —  WAITING FOR THE HOST", 999)
+            return
         occupied = []
         if self.spawns and self.api is not None and self.api.player.exists:
             place_player(self.api.player, self.spawns.pick())
             occupied.append(tuple(self.api.player.position))
         self.squad = self._start_rivals(logic, match, occupied)
-        match.say(f"{match.title.upper()}  —  TAKE ALL {len(match.rival_flags)} "
+        match.announce(f"{match.title.upper()}  —  TAKE ALL {len(match.rival_flags)} "
                   f"{match.rival_team.upper()} FLAGS", 4.0)
+
+    def _start_race(self, logic):
+        """The multiplayer race the launcher started, if any."""
+        try:
+            from .multiplayer import session
+            return session.start(self, logic)
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"[Levitate] multiplayer race not started: {exc}")
+            return None
 
     def bot_count(self, logic=None):
         """How many rival craft a match starts with: the launcher's
-        ``[Game] bots``, or :data:`game.bots.DEFAULT_BOTS`."""
+        ``[Game] bots`` -- or, hosting a multiplayer race, the lobby's --
+        else :data:`game.bots.DEFAULT_BOTS`."""
+        if self.net is not None and self.net.is_host:
+            return max(0, min(bots.MAX_BOTS, int(self.net.controller.lobby.bots)))
         config = self._config(logic) or self._settings_file()
         return bots.bots_from(config) if config is not None else bots.DEFAULT_BOTS
 
@@ -218,6 +249,12 @@ class LevitateGame:
         if self.squad is not None:
             self.squad.stop(self.match)
         self.squad = None
+        if self.net is not None:
+            # The race ends with play: its connections close.
+            self.net.stop()
+            from .multiplayer import lobby
+            lobby.finish()
+        self.net = None
         # Restore everything the match hid or moved, so the edited map is
         # unchanged.
         if self.match is not None:
@@ -387,6 +424,10 @@ class LevitateGame:
             return
         now = time.monotonic()
         delta = float(getattr(ctx, "delta", 1 / 60) or 1 / 60)
+        net = self.net
+        if net is not None:
+            net.poll(match, state, now)
+            match = self.match
         live = getattr(state, "object", None)
         if self.handling is not None and live is not None and live is not self.handling.player:
             # Play (re)spawned the player as a new object: the handling moves
@@ -398,7 +439,12 @@ class LevitateGame:
             self.handling.tick(state, ctx, delta)
             match.bonk = self.handling.bonk
         if self.squad is not None:
-            self.squad.tick(match, state, delta, now, self.handling)
+            pilots = [bots.Squad.local_pilot(match, state, now, self.handling)]
+            if net is not None and net.is_host:
+                remote = net.pilots()
+                self.squad.remote_humans = len(remote)
+                pilots += remote
+            self.squad.tick(match, pilots, delta, now)
             match.rivals = self.squad.radar()
             if self.handling is not None:
                 match.bonk = max(match.bonk, self.handling.bonk)
@@ -408,18 +454,77 @@ class LevitateGame:
         match.player_yaw = float(state.yaw)
         match.speed = self.handling.speed(state) if self.handling else 0.0
         self._animate(logic, match, now)
+        joiner = net is not None and not net.is_host
+        pressed = ctx.key_down("r") and not self._r_held
+        self._r_held = ctx.key_down("r")
         if match.finished is not None:
-            if ctx.key_down("r"):
+            if joiner:
+                if pressed and match.finished != "disconnected":
+                    net.request_restart()
+            elif pressed or self._restart_asked:
                 self._restart(logic, state)
+            if net is not None:
+                net.tick(self.match, state, now)
             return
-        self._collect_flags(match, pos)
         self._pads(logic, match, state, pos, now)
-        self._pickups(logic, match, pos, now)
         self._use_slots(match, ctx, now, pos)
-        remaining = match.remaining(now)
-        if remaining is not None and remaining <= 0.0:
-            match.finished, match.finished_at = "timeout", now
-            match.say("TIME UP  —  PRESS R TO RETRY", 999)
+        if not joiner:
+            # The host's rules, for its own craft and every other pilot's.
+            self._collect_flags(match, pos)
+            self._pickups(logic, match, pos, now)
+            if net is not None:
+                for craft in list(net.crafts.values()):
+                    if craft.placed and match.finished is None:
+                        self._collect_flags(match, craft.pos)
+                        self._pickups(logic, match, craft.pos, now, give=craft.give)
+            remaining = match.remaining(now)
+            if remaining is not None and remaining <= 0.0 and match.finished is None:
+                match.finished, match.finished_at = "timeout", now
+                match.announce("TIME UP  —  PRESS R TO RETRY", 999)
+        if net is not None:
+            net.tick(match, state, now)
+
+    # -- a multiplayer race ---------------------------------------------------------
+    def remote_use(self, kind, pos):
+        """The host: another pilot fired a jammer or dropped a barrier."""
+        try:
+            pos = tuple(float(v) for v in pos[:3])
+        except (TypeError, ValueError, IndexError):
+            return
+        if kind == "jammer" and self.squad is not None:
+            self.squad.jam(pos)
+        elif kind == "barrier":
+            self._drop_barrier(pos)
+
+    def request_restart(self):
+        """The host: a pilot asked for a retry once the race is over."""
+        self._restart_asked = True
+
+    def give(self, kind):
+        """A joiner: the host says this craft flew through a power cell."""
+        if self.match is not None:
+            self._give(self.match, kind)
+
+    def remote_spawn(self, at, restart=False):
+        """A joiner: the host says where to start (and, after a retry, that
+        the race has begun again)."""
+        match = self.match
+        if match is None or self.api is None:
+            return
+        if restart or self._awaiting_host:
+            self._awaiting_host = False
+            fresh = MatchState(self._rules(self.api.logic), match.player_team)
+            fresh.rival_flags, fresh.home_flags = match.rival_flags, match.home_flags
+            fresh.walls, fresh.bounds = match.walls, match.bounds
+            fresh.glows, fresh.homes = match.glows, match.homes
+            fresh.say("GO!", 1.5)
+            self.match = match = fresh
+        try:
+            point = tuple(float(v) for v in at[:4]) if at else None
+        except (TypeError, ValueError):
+            point = None
+        if point is not None and len(point) == 4:
+            place_player(self.api.player, point)
 
     def _place_player2(self, logic, state):
         """Player 2 (split-screen) joins on a spawn point at random, as every
@@ -447,11 +552,11 @@ class LevitateGame:
                 self._glow(match, flag, False)
                 left = len(match.rival_flags) - len(match.taken)
                 if left:
-                    match.say(f"FLAG TAKEN  —  {left} TO GO")
+                    match.announce(f"FLAG TAKEN  —  {left} TO GO")
                 else:
                     match.finished, match.finished_at = "win", time.monotonic()
                     secs = match.elapsed()
-                    match.say(f"MAZE CLEARED IN {int(secs // 60)}:{int(secs % 60):02d}  —  PRESS R", 999)
+                    match.announce(f"MAZE CLEARED IN {int(secs // 60)}:{int(secs % 60):02d}  —  PRESS R", 999)
 
     def _pads(self, logic, match, state, pos, now):
         for pad in self.api.entities_of_type("levitatepad"):
@@ -479,7 +584,10 @@ class LevitateGame:
             elif kind == "barrier":
                 self._give(match, "barrier")
 
-    def _pickups(self, logic, match, pos, now):
+    def _pickups(self, logic, match, pos, now, give=None):
+        """Cells come back on their stands when due; one a craft at *pos*
+        flies through goes to its first free slot (*give*: another pilot's,
+        in a multiplayer race)."""
         from plugins.api import clear_flag, set_flag
         for pickup in self.api.entities_of_type("levitatepickup"):
             key = id(pickup)
@@ -493,7 +601,9 @@ class LevitateGame:
             px, py, pz = pickup.pos
             if math.hypot(px - pos[0], pz - pos[2]) > PICKUP_REACH or abs(py - pos[1]) > 140:
                 continue
-            if self._give(match, pickup.properties.get("kind", "shield")):
+            kind = pickup.properties.get("kind", "shield")
+            if (give(kind) if give is not None and kind in POWERUPS
+                    else give is None and self._give(match, kind)):
                 set_flag(pickup, "hidden", True)
                 self._glow(match, pickup, False)
                 match.pickup_back[key] = now + float(pickup.properties.get("respawn_time", 20.0))
@@ -520,6 +630,10 @@ class LevitateGame:
                 match.shield_until = now + SHIELD_SECONDS
             elif kind == "phantom":
                 match.phantom_until = now + PHANTOM_SECONDS
+            elif kind in ("jammer", "barrier") and self.net is not None and not self.net.is_host:
+                # The host runs the rivals: it fires it.
+                self.net.use(kind, pos or match.player_pos)
+                message = "JAMMER FIRED" if kind == "jammer" else "BARRIER DROPPED"
             elif kind == "jammer":
                 caught = self.squad.jam(pos or match.player_pos) if self.squad else 0
                 message = (f"JAMMER  —  {caught} RIVAL{'S' if caught != 1 else ''} STALLED"
@@ -571,9 +685,14 @@ class LevitateGame:
             if p2 is not None and self.spawns:
                 place_player(p2, self.spawns.pick(humans))
                 humans.append(tuple(float(v) for v in p2.pos))
+            if self.net is not None and self.net.is_host:
+                humans += self.net.positions()
             self.squad.reset(self.match, humans)
             self.match.rivals = self.squad.radar()
-        self.match.say("GO!", 1.5)
+        self._restart_asked = False
+        if self.net is not None and self.net.is_host:
+            self.net.restart(state)
+        self.match.announce("GO!", 1.5)
 
     # -- HUD ---------------------------------------------------------------------
     def _hud_size_label(self):
