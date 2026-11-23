@@ -1,0 +1,99 @@
+{
+ "wall_slate": {
+  "source": "concrete",
+  "name": "Concrete",
+  "authors": [
+   "Rob Tuytel"
+  ],
+  "size_cm": [
+   400.0,
+   400.0
+  ],
+  "parallax": 1.2
+ },
+ "floor_slate": {
+  "source": "asphalt_02",
+  "name": "Asphalt 02",
+  "authors": [
+   "Rob Tuytel"
+  ],
+  "size_cm": [
+   300.0,
+   300.0
+  ],
+  "parallax": 0.8
+ },
+ "wall_sand": {
+  "source": "sandstone_blocks_05",
+  "name": "Sandstone Blocks 05",
+  "authors": [
+   "Rob Tuytel"
+  ],
+  "size_cm": [
+   300.0,
+   300.0
+  ],
+  "parallax": 4.0
+ },
+ "floor_sand": {
+  "source": "gravelly_sand",
+  "name": "Gravelly Sand",
+  "authors": [
+   "Dario Barresi"
+  ],
+  "size_cm": [
+   248.0,
+   248.0
+  ],
+  "parallax": 1.5
+ },
+ "wall_moss": {
+  "source": "castle_brick_01",
+  "name": "Castle Brick 01",
+  "authors": [
+   "Rob Tuytel"
+  ],
+  "size_cm": [
+   150.0,
+   150.0
+  ],
+  "parallax": 2.5
+ },
+ "floor_moss": {
+  "source": "mossy_cobblestone",
+  "name": "Mossy Cobblestone",
+  "authors": [
+   "S\u01a1n Nguy\u1ec5n"
+  ],
+  "size_cm": [
+   200.0,
+   200.0
+  ],
+  "parallax": 3.0
+ },
+ "cap_stone": {
+  "source": "concrete_wall_008",
+  "name": "Concrete Wall 008",
+  "authors": [
+   "Charlotte Baglioni",
+   "Dario Barresi"
+  ],
+  "size_cm": [
+   271.0,
+   271.0
+  ],
+  "parallax": 0.4
+ },
+ "trim_metal": {
+  "source": "metal_plate_02",
+  "name": "Metal Plate 02",
+  "authors": [
+   "Rob Tuytel"
+  ],
+  "size_cm": [
+   200.0,
+   200.0
+  ],
+  "parallax": 0.5
+ }
+}

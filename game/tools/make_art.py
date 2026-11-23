@@ -12,7 +12,6 @@ Outputs (committed, so a build never needs to run this):
 * ``game/assets/icons/``    power-up / pad / flag icons (64 px)
 * ``assets/sprites/levitate/``  world billboards (flags, power-up orbs)
 * ``game/assets/ui/``       launcher banner and level thumbnails frame
-* ``assets/textures/levitate/``  block-out wall, floor and pad textures
 * ``assets/splash.png``, ``assets/icon.png`` / ``icon.ico``  branding
 """
 
@@ -234,8 +233,17 @@ def icon_base(d, accent):
     bevel_rect(d, (2, 2, ICON - 2, ICON - 2), 10, (30, 34, 42), tuple(min(255, c + 40) for c in accent), GUN_DARK, 3)
 
 
-def make_icons():
+def make_icons(capture=None):
+    """Draw the 64 px icons. With *capture* (a dict), nothing is written:
+    each icon's supersampled drawing is stored there by name instead, for
+    art built from the same glyphs (the power-up models' faces)."""
     out = os.path.join(GAME, "icons")
+
+    def done(img, w, h, path):
+        if capture is None:
+            finish(img, w, h, path)
+        else:
+            capture[os.path.splitext(os.path.basename(path))[0]] = img
     # Spring: a coil on a base plate.
     img, d = canvas(ICON, ICON); icon_base(d, LIME)
     d.rectangle(sc(16, 48, 48, 53), fill=GUN_HI)
@@ -247,13 +255,13 @@ def make_icons():
         pts.append((x * S, y * S))
     d.line(pts, fill=LIME, width=3 * S, joint="curve")
     d.rectangle(sc(18, 12, 46, 16), fill=GUN_HI)
-    finish(img, ICON, ICON, os.path.join(out, "spring.png"))
+    done(img, ICON, ICON, os.path.join(out, "spring.png"))
     # Boost: stacked chevrons.
     img, d = canvas(ICON, ICON); icon_base(d, AMBER)
     for i, y in enumerate((14, 26, 38)):
         col = tuple(int(c * (0.55 + 0.15 * i)) for c in AMBER)
         d.polygon(sc(14, y + 14, 32, y, 50, y + 14, 50, y + 20, 32, y + 6, 14, y + 20), fill=col)
-    finish(img, ICON, ICON, os.path.join(out, "boost.png"))
+    done(img, ICON, ICON, os.path.join(out, "boost.png"))
     # Barrier: a short brick wall rising.
     img, d = canvas(ICON, ICON); icon_base(d, (220, 120, 60))
     for row in range(4):
@@ -265,14 +273,14 @@ def make_icons():
             if x1 - x0 > 3:
                 d.rectangle(sc(x0, y - 7, x1, y), fill=(196, 96, 52), outline=(90, 40, 20), width=S)
     d.polygon(sc(32, 4, 40, 12, 24, 12), fill=WHITE)
-    finish(img, ICON, ICON, os.path.join(out, "barrier.png"))
+    done(img, ICON, ICON, os.path.join(out, "barrier.png"))
     # Shield: a hex bubble.
     img, d = canvas(ICON, ICON); icon_base(d, TEAL)
     hexa = [(32 + 20 * math.cos(math.radians(60 * i + 30)), 32 + 20 * math.sin(math.radians(60 * i + 30)))
             for i in range(6)]
     d.polygon([(x * S, y * S) for x, y in hexa], fill=(*TEAL_DIM, 255), outline=TEAL, width=3 * S)
     d.polygon(sc(24, 22, 32, 18, 32, 30, 24, 34), fill=(*TEAL, 140))
-    finish(img, ICON, ICON, os.path.join(out, "shield.png"))
+    done(img, ICON, ICON, os.path.join(out, "shield.png"))
     # Phantom (cloak): a dashed hull outline.
     img, d = canvas(ICON, ICON); icon_base(d, (170, 120, 255))
     hull = [(14, 40), (22, 26), (42, 26), (50, 40), (44, 46), (20, 46)]
@@ -283,14 +291,14 @@ def make_icons():
             xb, yb = x0 + (x1 - x0) * (t + 0.3), y0 + (y1 - y0) * (t + 0.3)
             d.line(sc(xa, ya, xb, yb), fill=(200, 170, 255), width=3 * S)
     d.ellipse(sc(28, 30, 36, 38), fill=(200, 170, 255))
-    finish(img, ICON, ICON, os.path.join(out, "phantom.png"))
+    done(img, ICON, ICON, os.path.join(out, "phantom.png"))
     # Jammer: crossed arrows (reverses a rival's controls).
     img, d = canvas(ICON, ICON); icon_base(d, RED)
     d.line(sc(16, 20, 48, 44), fill=RED_HI, width=4 * S)
     d.line(sc(16, 44, 48, 20), fill=RED_HI, width=4 * S)
     d.polygon(sc(48, 44, 40, 44, 48, 36), fill=RED_HI)
     d.polygon(sc(16, 20, 24, 20, 16, 28), fill=RED_HI)
-    finish(img, ICON, ICON, os.path.join(out, "jammer.png"))
+    done(img, ICON, ICON, os.path.join(out, "jammer.png"))
     # Flags for the tally: filled and empty pennants per team.
     for team, col, hi in (("red", RED, RED_HI), ("blue", BLUE, BLUE_HI)):
         for state in ("full", "empty"):
@@ -302,7 +310,7 @@ def make_icons():
                 d.polygon(sc(22, 12, 34, 17, 22, 22), fill=hi)
             else:
                 d.polygon(pennant, outline=(80, 84, 94), width=2 * S)
-            finish(img, ICON, ICON, os.path.join(out, f"flag_{team}_{state}.png"))
+            done(img, ICON, ICON, os.path.join(out, f"flag_{team}_{state}.png"))
 
 
 # World sprites ---------------------------------------------------------------
@@ -342,68 +350,6 @@ def make_world_sprites():
         path = os.path.join(out, f"pickup_{name}.png")
         img.save(path)
         print("wrote", os.path.relpath(path, ROOT))
-
-
-# Textures --------------------------------------------------------------------
-def noise_tile(size, base, spread, seed):
-    rnd = random.Random(seed)
-    img = Image.new("RGB", (size, size), base)
-    px = img.load()
-    for y in range(size):
-        for x in range(size):
-            n = rnd.randint(-spread, spread)
-            px[x, y] = tuple(max(0, min(255, c + n)) for c in base)
-    return img.filter(ImageFilter.GaussianBlur(0.6))
-
-
-def make_textures():
-    out = os.path.join(ROOT, "assets", "textures", "levitate")
-    os.makedirs(out, exist_ok=True)
-    size = 256
-    # Block wall: big chunky blocks with bevels, in three colourways.
-    for name, base in (("wall_slate", (96, 104, 120)), ("wall_sand", (170, 146, 104)),
-                       ("wall_moss", (88, 118, 86))):
-        img = noise_tile(size, base, 10, hash(name) & 0xffff)
-        d = ImageDraw.Draw(img)
-        for row in range(4):
-            y0 = row * 64
-            off = 0 if row % 2 == 0 else 64
-            for col in range(-1, 3):
-                x0 = col * 128 + off
-                hi = tuple(min(255, c + 34) for c in base)
-                lo = tuple(max(0, c - 44) for c in base)
-                d.rectangle((x0, y0, x0 + 127, y0 + 63), outline=lo, width=3)
-                d.line((x0 + 3, y0 + 3, x0 + 124, y0 + 3), fill=hi, width=2)
-                d.line((x0 + 3, y0 + 3, x0 + 3, y0 + 60), fill=hi, width=2)
-        img.save(os.path.join(out, f"{name}.png")); print("wrote", f"assets/textures/levitate/{name}.png")
-    # Floor: a two-tone checker with fine grid -- the arena deck.
-    img = Image.new("RGB", (size, size))
-    d = ImageDraw.Draw(img)
-    for y in range(2):
-        for x in range(2):
-            col = (58, 62, 72) if (x + y) % 2 == 0 else (72, 78, 90)
-            d.rectangle((x * 128, y * 128, x * 128 + 127, y * 128 + 127), fill=col)
-    for i in range(0, size, 32):
-        d.line((i, 0, i, size), fill=(48, 52, 60), width=1)
-        d.line((0, i, size, i), fill=(48, 52, 60), width=1)
-    img.save(os.path.join(out, "floor_deck.png")); print("wrote assets/textures/levitate/floor_deck.png")
-    # Ceiling / sky-dark trim.
-    noise_tile(size, (30, 32, 40), 6, 3).save(os.path.join(out, "trim_dark.png"))
-    # Pads: glowing floor plates with their icon motif.
-    for name, col in (("pad_spring", LIME), ("pad_boost", AMBER), ("pad_barrier", (220, 120, 60))):
-        w = h = 128
-        img, d = canvas(w, h)
-        d.rectangle(sc(0, 0, w, h), fill=(22, 24, 30, 255))
-        d.rounded_rectangle(sc(6, 6, w - 6, h - 6), 14 * S, fill=tuple(int(c * 0.25) for c in col) + (255,),
-                            outline=col, width=4 * S)
-        for k in range(4):
-            r = 14 + k * 12
-            d.ellipse(sc(w / 2 - r, h / 2 - r, w / 2 + r, h / 2 + r),
-                      outline=tuple(int(c * (1 - k * 0.2)) for c in col) + (255,), width=2 * S)
-        if name == "pad_boost":
-            for y in (36, 60):
-                d.polygon(sc(40, y + 20, 64, y, 88, y + 20, 88, y + 28, 64, y + 8, 40, y + 28), fill=col)
-        finish(img, w, h, os.path.join(out, f"{name}.png"))
 
 
 # Branding --------------------------------------------------------------------
@@ -489,7 +435,6 @@ def main():
     make_crosshair()
     make_icons()
     make_world_sprites()
-    make_textures()
     make_branding()
     make_hovercraft_sprites()
 

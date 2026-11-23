@@ -1,17 +1,25 @@
-"""Generate Levitate's block-out mazes (original layouts, from fixed seeds).
+"""Generate Levitate's mazes (original layouts, from fixed seeds).
 
     python -m game.tools.make_mazes          # -> maps/levitate/*.json
 
 Each maze is a grid carved by a randomised depth-first search, then opened up
 for racing: a share of interior walls is knocked out to make loops, and a few
 2x2 plazas are cleared. Walls are merged into long brushes so a maze stays at
-a few dozen brushes. On top of the layout go:
+a few hundred brushes. On top of the layout go:
 
 * the player's start and three home flags in the near half,
 * three rival flags in far dead ends,
-* spring, boost and barrier pads, power-up orbs,
-* raised ledges reached by a spring pad, some holding a flag or an orb,
-* a grid of lights.
+* spring, boost and barrier pads, power cells,
+* raised ledges reached by a spring pad, some holding a flag or a cell,
+* the masonry that makes a wall a wall: a pier wherever walls meet and at
+  every corner, and coping stones along the top,
+* lights: a glow at every pad, cell and flag, and a grid of fill lights for
+  the ``classic`` renderer (a lit match hides them; see game/graphics.py).
+
+Every face is mapped at its material's real size (:data:`TILE`). The
+materials are photo-scanned surfaces from Poly Haven
+(game/tools/fetch_textures.py); the pad plates are drawn by
+game/tools/make_pads.py.
 
 The maze definitions in :data:`MAZES` are the whole of the level design; tune
 them and re-run.
@@ -25,6 +33,7 @@ import random
 import uuid
 
 from game.entities import FLAG_RAISE
+from game.graphics import FILL_LIGHT
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 OUT = os.path.join(ROOT, "maps", "levitate")
@@ -50,13 +59,67 @@ MAZES = [
 ]
 
 
+#: Wall piers and the coping along the top of the walls.
+PIER_T = WALL_T + 20                   # a pier's width and depth
+PIER_H = WALL_H + 16
+CAP_OVERHANG = 7                       # how far the coping projects each side
+CAP_H = 12
+
+def _tiles():
+    """The world size one repeat of each material covers, from the record
+    game/tools/fetch_textures.py keeps of each texture's real size."""
+    with open(os.path.join(ROOT, "assets", "textures", "levitate", "materials.json")) as f:
+        return {name: tuple(float(v) for v in entry["size_cm"])
+                for name, entry in json.load(f).items()}
+
+
+#: Material -> ``(width, height)`` of one repeat, world units (1 unit = 1 cm):
+#: every face is mapped at the size the surface was photographed at.
+TILE = _tiles()
+
+#: The colour each pad, power cell and flag glows with.
+GLOW = {
+    "spring": [140, 240, 60], "boost": [245, 166, 35], "barrier_pad": [224, 122, 48],
+    "shield": [64, 236, 200], "phantom": [170, 120, 255], "barrier": [220, 120, 60],
+    "jammer": [230, 52, 52], "red": [255, 70, 60], "blue": [70, 130, 255],
+}
+
+SIDES = ("north", "south", "east", "west")
+
+
 def tex(name):
-    return f"levitate/{name}.png"
+    """A material's texture file (pads are PNG, everything tiled is JPEG)."""
+    return f"levitate/{name}.png" if name.startswith("pad_") else f"levitate/{name}.jpg"
 
 
-def faces(side, top=None, bottom=None):
-    return {"north": side, "south": side, "east": side, "west": side,
-            "top": top or side, "down": bottom or side}
+def tile_of(name):
+    return TILE[name]
+
+
+def material(size, side, top=None, bottom=None, shift=0.0, fit_top=False):
+    """Textures and their mapping for a box of *size*: *side* on the four
+    walls, *top* and *bottom* (default: *side*) above and below, each at its
+    real-world scale. *shift* slides the side faces along the wall, so
+    neighbouring walls do not start on the same brick; *fit_top* stretches
+    the top texture over the top face once (a pad's emblem)."""
+    w, h, d = size
+    top, bottom = top or side, bottom or side
+    textures = {tag: tex(side) for tag in SIDES}
+    textures["top"], textures["down"] = tex(top), tex(bottom)
+    tw, th = tile_of(side)
+    scale = {"north": [w / tw, h / th], "south": [w / tw, h / th],
+             "east": [d / tw, h / th], "west": [d / tw, h / th]}
+    shifts = {tag: [shift, 0.0] for tag in SIDES}
+    for tag, name in (("top", top), ("down", bottom)):
+        if tag == "top" and fit_top:
+            continue
+        fw, fh = tile_of(name)
+        scale[tag] = [w / fw, d / fh]
+    # Fio's box maps its east and west faces a quarter turn round from its
+    # north and south ones: turned back, so a wall's courses run level on
+    # every side.
+    return {"textures": textures, "uv_scale": scale, "uv_shift": shifts,
+            "uv_angle": {"east": 90.0, "west": 90.0}}
 
 
 class Builder:
@@ -70,12 +133,24 @@ class Builder:
     def uid(self, name):
         return str(uuid.uuid5(NAMESPACE, f"{self.spec['file']}/{name}/{self.n}"))
 
-    def brush(self, name, pos, size, textures, trigger=False):
+    def brush(self, name, pos, size, look, trigger=False):
+        """A box brush; *look* is what :func:`material` returns."""
         self.n += 1
-        self.brushes.append({"name": name, "id": self.uid(name),
-                             "pos": [round(v, 2) for v in pos],
-                             "size": [round(v, 2) for v in size],
-                             "textures": textures, "is_trigger": trigger})
+        entry = {"name": name, "id": self.uid(name),
+                 "pos": [round(v, 2) for v in pos],
+                 "size": [round(v, 2) for v in size],
+                 "textures": look["textures"], "is_trigger": trigger}
+        for key in ("uv_scale", "uv_shift"):
+            if look.get(key):
+                entry[key] = {tag: [round(v, 4) for v in pair]
+                              for tag, pair in look[key].items()}
+        if look.get("uv_angle"):
+            entry["uv_angle"] = dict(look["uv_angle"])
+        self.brushes.append(entry)
+
+    def light(self, name, pos, colour, intensity, radius, **props):
+        self.thing("light", name, pos, intensity=intensity, radius=radius,
+                   colour=list(colour), state="on", casts_shadows=False, **props)
 
     def thing(self, etype, name, pos, **props):
         self.n += 1
@@ -168,15 +243,34 @@ def build(spec):
     def centre(c, r):
         return (x0 + (c + 0.5) * CELL, z0 + (r + 0.5) * CELL)
 
-    wall_tex = faces(tex(f"wall_{spec['theme']}"), top=tex("trim_dark"))
-    floor_tex = faces(tex("trim_dark"), top=tex("floor_deck"))
-    b.brush("Floor", (0, -32, 0), (width + WALL_T, 64, depth + WALL_T), floor_tex)
+    theme = spec["theme"]
+    wall_name, floor_name = f"wall_{theme}", f"floor_{theme}"
+    piers = set()                       # lattice points where a wall ends or turns
+
+    def wall(name, pos, size, lattice):
+        """A wall run, the coping along its top and the piers it meets."""
+        b.brush(name, pos, size, material(size, wall_name, top="cap_stone",
+                                          shift=round(rng.random(), 3)))
+        along_x = size[0] > size[2]
+        cap = ((size[0] + 2 * CAP_OVERHANG, CAP_H, WALL_T + 2 * CAP_OVERHANG) if along_x else
+               (WALL_T + 2 * CAP_OVERHANG, CAP_H, size[2] + 2 * CAP_OVERHANG))
+        b.brush("Cap_" + name[5:], (pos[0], WALL_H + CAP_H / 2, pos[2]), cap,
+                material(cap, "cap_stone", shift=round(rng.random(), 3)))
+        piers.update(lattice)
+
+    floor_size = (width + WALL_T, 64, depth + WALL_T)
+    b.brush("Floor", (0, -32, 0), floor_size,
+            material(floor_size, "trim_metal", top=floor_name))
     # Outer walls.
     y = WALL_H / 2
-    b.brush("Wall_North", (0, y, depth / 2), (width + WALL_T, WALL_H, WALL_T), wall_tex)
-    b.brush("Wall_South", (0, y, -depth / 2), (width + WALL_T, WALL_H, WALL_T), wall_tex)
-    b.brush("Wall_East", (width / 2, y, 0), (WALL_T, WALL_H, depth + WALL_T), wall_tex)
-    b.brush("Wall_West", (-width / 2, y, 0), (WALL_T, WALL_H, depth + WALL_T), wall_tex)
+    wall("Wall_North", (0, y, depth / 2), (width + WALL_T, WALL_H, WALL_T),
+         [(c, rows) for c in range(cols + 1)])
+    wall("Wall_South", (0, y, -depth / 2), (width + WALL_T, WALL_H, WALL_T),
+         [(c, 0) for c in range(cols + 1)])
+    wall("Wall_East", (width / 2, y, 0), (WALL_T, WALL_H, depth + WALL_T),
+         [(cols, r) for r in range(rows + 1)])
+    wall("Wall_West", (-width / 2, y, 0), (WALL_T, WALL_H, depth + WALL_T),
+         [(0, r) for r in range(rows + 1)])
     # Interior walls, merged into runs. An east wall of (c, r) sits on the
     # line x = x0 + (c+1)*CELL spanning row r; runs merge along z.
     for c in range(cols - 1):
@@ -188,8 +282,9 @@ def build(spec):
                     r += 1
                 x = x0 + (c + 1) * CELL
                 za, zb = z0 + start * CELL, z0 + r * CELL
-                b.brush(f"Wall_E{c}_{start}", (x, y, (za + zb) / 2),
-                        (WALL_T, WALL_H, zb - za + WALL_T), wall_tex)
+                wall(f"Wall_E{c}_{start}", (x, y, (za + zb) / 2),
+                     (WALL_T, WALL_H, zb - za + WALL_T),
+                     [(c + 1, k) for k in range(start, r + 1)])
             else:
                 r += 1
     for r in range(rows - 1):
@@ -201,10 +296,21 @@ def build(spec):
                     c += 1
                 z = z0 + (r + 1) * CELL
                 xa, xb = x0 + start * CELL, x0 + c * CELL
-                b.brush(f"Wall_N{start}_{r}", ((xa + xb) / 2, y, z),
-                        (xb - xa + WALL_T, WALL_H, WALL_T), wall_tex)
+                wall(f"Wall_N{start}_{r}", ((xa + xb) / 2, y, z),
+                     (xb - xa + WALL_T, WALL_H, WALL_T),
+                     [(k, r + 1) for k in range(start, c + 1)])
             else:
                 c += 1
+    # A pier at every lattice point a wall touches, a little taller and
+    # wider than the walls, with its own capstone.
+    for c, r in sorted(piers):
+        px, pz = x0 + c * CELL, z0 + r * CELL
+        size = (PIER_T, PIER_H, PIER_T)
+        b.brush(f"Pier_{c}_{r}", (px, PIER_H / 2, pz), size,
+                material(size, wall_name, top="cap_stone", shift=round(rng.random(), 3)))
+        cap = (PIER_T + 2 * CAP_OVERHANG, CAP_H, PIER_T + 2 * CAP_OVERHANG)
+        b.brush(f"PierCap_{c}_{r}", (px, PIER_H + CAP_H / 2, pz), cap,
+                material(cap, "cap_stone"))
 
     # -- placement --------------------------------------------------------------
     start = (0, 0)
@@ -239,41 +345,59 @@ def build(spec):
             time_limit=float(spec["time_limit"]), player_team="red",
             hover_friction=0.14, hover_accel=0.35, turn_rate=150.0, wall_bounce=0.55)
 
+    def flag(name, cell, team):
+        x, z = centre(*cell)
+        b.thing("levitateflag", name, (x, FLAG_RAISE, z), team=team,
+                rotation=[0.0, float(rng.randrange(0, 360, 15)), 0.0])
+        b.light(name + "_Glow", (x, FLAG_RAISE + 20, z), GLOW[team], 0.9, 300.0,
+                levitate_for=name)
+
+    def cell_orb(name, pos, kind, respawn):
+        b.thing("levitatepickup", name, pos, kind=kind, respawn_time=respawn)
+        b.light(name + "_Glow", pos, GLOW[kind], 1.2, 320.0, levitate_for=name)
+
+    def pad(name, kind, x, z, **props):
+        size = (112, 4, 112)
+        b.brush("Pad_" + name, (x, 2, z), size,
+                material(size, "trim_metal", top=f"pad_{kind}", fit_top=True))
+        b.thing("levitatepad", name, (x, 4, z), kind=kind, radius=56.0, **props)
+        b.light(name + "_Glow", (x, 46, z), GLOW["barrier_pad" if kind == "barrier" else kind],
+                1.0, 260.0)
+
     # Rival flags: the farthest dead ends (then far cells), spread out.
     rival = pick(dead_ends, key=lambda cell: -dist[cell], count=3)
     if len(rival) < 3:
         rival += pick(dist, key=lambda cell: -dist[cell], count=3 - len(rival))
     for i, cell in enumerate(rival):
-        x, z = centre(*cell)
-        b.thing("levitateflag", f"Flag_Blue_{i + 1}", (x, FLAG_RAISE, z), team="blue")
+        flag(f"Flag_Blue_{i + 1}", cell, "blue")
     # Home flags: dead ends in the near half.
     near = [cell for cell in dist if dist[cell] <= far * 0.5]
     home = pick([c for c in dead_ends if c in near], key=lambda cell: dist[cell], count=3)
     if len(home) < 3:
         home += pick([c for c in near if c != start], key=lambda cell: -dist[cell], count=3 - len(home))
     for i, cell in enumerate(home):
-        x, z = centre(*cell)
-        b.thing("levitateflag", f"Flag_Red_{i + 1}", (x, FLAG_RAISE, z), team="red")
+        flag(f"Flag_Red_{i + 1}", cell, "red")
 
     # Ledges: a raised block in a dead end, a spring pad in the cell before it.
-    pad_tex = {k: faces(tex("trim_dark"), top=tex(f"pad_{k}")) for k in ("spring", "boost", "barrier")}
-    ledge_tex = faces(tex(f"wall_{spec['theme']}"), top=tex("floor_deck"))
     ledges = pick(dead_ends, key=lambda cell: rng.random(), count=spec["ledges"])
     rewards = ["shield", "phantom", "jammer"]
+    lip = 10                             # the stone edge round a ledge's top
     for i, cell in enumerate(ledges):
         x, z = centre(*cell)
         size = CELL - WALL_T - round(24 * GEOMETRY_SCALE)
-        b.brush(f"Ledge_{i + 1}", (x, LEDGE_H / 2, z), (size, LEDGE_H, size), ledge_tex)
-        b.thing("levitatepickup", f"Ledge_Orb_{i + 1}", (x, LEDGE_H + 40, z),
-                kind=rewards[i % len(rewards)], respawn_time=25.0)
+        body = (size, LEDGE_H - lip, size)
+        b.brush(f"Ledge_{i + 1}", (x, (LEDGE_H - lip) / 2, z), body,
+                material(body, wall_name, top=floor_name))
+        edge = (size + 10, lip, size + 10)
+        b.brush(f"LedgeEdge_{i + 1}", (x, LEDGE_H - lip / 2, z), edge,
+                material(edge, "cap_stone", top=floor_name))
+        cell_orb(f"Ledge_Orb_{i + 1}", (x, LEDGE_H + 40, z), rewards[i % len(rewards)], 25.0)
         before = open_cells(cell, east, north, cols, rows)[0]
         used.add(before)
         bx, bz = centre(*before)
         # The pad sits on the side of the 'before' cell nearest the ledge.
-        px, pz = bx + (x - bx) * 0.25, bz + (z - bz) * 0.25
-        b.brush(f"Pad_Spring_L{i + 1}", (px, 2, pz), (112, 4, 112), pad_tex["spring"])
-        b.thing("levitatepad", f"Spring_L{i + 1}", (px, 4, pz), kind="spring",
-                radius=56.0, strength=620.0)
+        pad(f"Spring_L{i + 1}", "spring", bx + (x - bx) * 0.25, bz + (z - bz) * 0.25,
+            strength=620.0)
 
     # Boost pads on long straights: cells with exactly two opposite openings.
     def straight(cell):
@@ -281,33 +405,28 @@ def build(spec):
         return len(n) == 2 and (n[0][0] == n[1][0] or n[0][1] == n[1][1])
     boosts = pick([c for c in dist if straight(c)], key=lambda c: rng.random(), count=2 + spec["order"])
     for i, cell in enumerate(boosts):
-        x, z = centre(*cell)
-        b.brush(f"Pad_Boost_{i + 1}", (x, 2, z), (112, 4, 112), pad_tex["boost"])
-        b.thing("levitatepad", f"Boost_{i + 1}", (x, 4, z), kind="boost", radius=56.0, strength=760.0)
+        pad(f"Boost_{i + 1}", "boost", *centre(*cell), strength=760.0)
     # Free-standing springs and barrier pads.
     for i, cell in enumerate(pick(dist, key=lambda c: rng.random(), count=2)):
-        x, z = centre(*cell)
-        b.brush(f"Pad_Spring_{i + 1}", (x, 2, z), (112, 4, 112), pad_tex["spring"])
-        b.thing("levitatepad", f"Spring_{i + 1}", (x, 4, z), kind="spring", radius=56.0, strength=520.0)
+        pad(f"Spring_{i + 1}", "spring", *centre(*cell), strength=520.0)
     for i, cell in enumerate(pick(dist, key=lambda c: rng.random(), count=2)):
-        x, z = centre(*cell)
-        b.brush(f"Pad_Barrier_{i + 1}", (x, 2, z), (112, 4, 112), pad_tex["barrier"])
-        b.thing("levitatepad", f"Barrier_{i + 1}", (x, 4, z), kind="barrier", radius=56.0)
-    # Orbs: plazas get one each, plus a few in corridors.
+        pad(f"Barrier_{i + 1}", "barrier", *centre(*cell))
+    # Power cells: plazas get one each, plus a few in corridors.
     orb_kinds = ["shield", "phantom", "jammer", "barrier"]
     for i, (c, r) in enumerate(plazas):
-        x, z = x0 + (c + 1) * CELL, z0 + (r + 1) * CELL
-        b.thing("levitatepickup", f"Plaza_Orb_{i + 1}", (x, 40, z), kind=orb_kinds[i % 4], respawn_time=20.0)
+        cell_orb(f"Plaza_Orb_{i + 1}", (x0 + (c + 1) * CELL, 40, z0 + (r + 1) * CELL),
+                 orb_kinds[i % 4], 20.0)
     for i, cell in enumerate(pick(dist, key=lambda c: rng.random(), count=3)):
         x, z = centre(*cell)
-        b.thing("levitatepickup", f"Orb_{i + 1}", (x, 40, z), kind=orb_kinds[(i + 1) % 4], respawn_time=20.0)
+        cell_orb(f"Orb_{i + 1}", (x, 40, z), orb_kinds[(i + 1) % 4], 20.0)
 
-    # Lights: one per 2x2 block of cells, high above the walls.
+    # Fill lights, for the classic renderer: one per 2x2 block of cells, high
+    # above the walls. A lit match has the sun and the sky instead.
     for c in range(0, cols, 2):
         for r in range(0, rows, 2):
             x, z = x0 + (c + 1) * CELL, z0 + (r + 1) * CELL
-            b.thing("light", f"Light_{c}_{r}", (x, WALL_H + 120, z), intensity=1.5,
-                    radius=CELL * 2.6, colour=[220, 230, 255], state="on", casts_shadows=False)
+            b.light(f"Light_{c}_{r}", (x, WALL_H + 120, z), [220, 230, 255], 1.5,
+                    CELL * 2.6, **{FILL_LIGHT: True})
 
     return {"version": 3, "brushes": b.brushes, "things": b.things}
 
