@@ -10,9 +10,9 @@
     0
    ],
    "size": [
-    2848,
+    4272,
     64,
-    2848
+    4272
    ],
    "textures": {
     "north": "levitate/trim_dark.png",
@@ -29,13 +29,13 @@
    "id": "64c70eb1-d565-582d-a9a5-260d9b058b62",
    "pos": [
     0,
-    96.0,
-    1408.0
+    144.0,
+    2112.0
    ],
    "size": [
-    2848,
-    192,
-    32
+    4272,
+    288,
+    48
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -52,13 +52,13 @@
    "id": "f09c7914-5f79-5293-9b0e-3da9f2c04247",
    "pos": [
     0,
-    96.0,
-    -1408.0
+    144.0,
+    -2112.0
    ],
    "size": [
-    2848,
-    192,
-    32
+    4272,
+    288,
+    48
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -74,14 +74,14 @@
    "name": "Wall_East",
    "id": "163786f1-ca30-5dea-b8aa-7af192d8d175",
    "pos": [
-    1408.0,
-    96.0,
+    2112.0,
+    144.0,
     0
    ],
    "size": [
-    32,
-    192,
-    2848
+    48,
+    288,
+    4272
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -97,14 +97,14 @@
    "name": "Wall_West",
    "id": "19e10bf4-b3bf-5e8c-ab92-694fe231d6d6",
    "pos": [
-    -1408.0,
-    96.0,
+    -2112.0,
+    144.0,
     0
    ],
    "size": [
-    32,
-    192,
-    2848
+    48,
+    288,
+    4272
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -120,14 +120,14 @@
    "name": "Wall_E0_0",
    "id": "d8e2de07-6412-5008-b353-10d98cf3c933",
    "pos": [
-    -1056.0,
-    96.0,
-    -1056.0
+    -1584.0,
+    144.0,
+    -1584.0
    ],
    "size": [
-    32,
-    192,
-    736.0
+    48,
+    288,
+    1104.0
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -143,14 +143,14 @@
    "name": "Wall_E0_4",
    "id": "f00e10eb-9a16-5497-af75-8534ca495a0e",
    "pos": [
-    -1056.0,
-    96.0,
-    176.0
+    -1584.0,
+    144.0,
+    264.0
    ],
    "size": [
-    32,
-    192,
-    384.0
+    48,
+    288,
+    576.0
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -166,14 +166,14 @@
    "name": "Wall_E1_0",
    "id": "1379d063-fe00-5354-8b09-b3a95876d39a",
    "pos": [
-    -704.0,
-    96.0,
-    -1232.0
+    -1056.0,
+    144.0,
+    -1848.0
    ],
    "size": [
-    32,
-    192,
-    384.0
+    48,
+    288,
+    576.0
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -189,14 +189,14 @@
    "name": "Wall_E1_5",
    "id": "4970c16a-367d-5d2f-ae96-b6b2359addb8",
    "pos": [
-    -704.0,
-    96.0,
-    528.0
+    -1056.0,
+    144.0,
+    792.0
    ],
    "size": [
-    32,
-    192,
-    384.0
+    48,
+    288,
+    576.0
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -212,14 +212,14 @@
    "name": "Wall_E2_5",
    "id": "aafafc9b-1380-5c7b-b30e-f1eaa2db33c7",
    "pos": [
-    -352.0,
-    96.0,
-    528.0
+    -528.0,
+    144.0,
+    792.0
    ],
    "size": [
-    32,
-    192,
-    384.0
+    48,
+    288,
+    576.0
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -236,13 +236,13 @@
    "id": "4cea3ffc-b375-5813-acea-8065f94bcae2",
    "pos": [
     0.0,
-    96.0,
-    -528.0
+    144.0,
+    -792.0
    ],
    "size": [
-    32,
-    192,
-    384.0
+    48,
+    288,
+    576.0
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -258,14 +258,14 @@
    "name": "Wall_E4_2",
    "id": "88f98183-5799-5bc0-b153-c64ffa6bd502",
    "pos": [
-    352.0,
-    96.0,
-    -176.0
+    528.0,
+    144.0,
+    -264.0
    ],
    "size": [
-    32,
-    192,
-    1088.0
+    48,
+    288,
+    1632.0
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -281,14 +281,14 @@
    "name": "Wall_E4_7",
    "id": "0d09176e-df26-50dd-b59a-4755e51728e0",
    "pos": [
-    352.0,
-    96.0,
-    1232.0
+    528.0,
+    144.0,
+    1848.0
    ],
    "size": [
-    32,
-    192,
-    384.0
+    48,
+    288,
+    576.0
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -304,14 +304,14 @@
    "name": "Wall_E5_1",
    "id": "7c822bd8-33dd-5f7b-ad46-c7f9f5929f34",
    "pos": [
-    704.0,
-    96.0,
-    -880.0
+    1056.0,
+    144.0,
+    -1320.0
    ],
    "size": [
-    32,
-    192,
-    384.0
+    48,
+    288,
+    576.0
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -327,14 +327,14 @@
    "name": "Wall_E5_6",
    "id": "ca9ee6b7-b040-58f7-bcbd-08055180ebcc",
    "pos": [
-    704.0,
-    96.0,
-    880.0
+    1056.0,
+    144.0,
+    1320.0
    ],
    "size": [
-    32,
-    192,
-    384.0
+    48,
+    288,
+    576.0
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -350,14 +350,14 @@
    "name": "Wall_E6_0",
    "id": "de97fd4c-42e3-5874-9d9f-466ea8f1479d",
    "pos": [
-    1056.0,
-    96.0,
-    -1232.0
+    1584.0,
+    144.0,
+    -1848.0
    ],
    "size": [
-    32,
-    192,
-    384.0
+    48,
+    288,
+    576.0
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -373,14 +373,14 @@
    "name": "Wall_E6_5",
    "id": "203fe0bb-895d-535c-afa6-e5cef7cae0ef",
    "pos": [
-    1056.0,
-    96.0,
-    528.0
+    1584.0,
+    144.0,
+    792.0
    ],
    "size": [
-    32,
-    192,
-    384.0
+    48,
+    288,
+    576.0
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -396,14 +396,14 @@
    "name": "Wall_E6_7",
    "id": "e558d3c8-4cd4-5b11-bac4-071fd883cc10",
    "pos": [
-    1056.0,
-    96.0,
-    1232.0
+    1584.0,
+    144.0,
+    1848.0
    ],
    "size": [
-    32,
-    192,
-    384.0
+    48,
+    288,
+    576.0
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -420,13 +420,13 @@
    "id": "e6e8e462-c15f-5017-9239-381aade9f581",
    "pos": [
     0.0,
-    96.0,
-    -1056.0
+    144.0,
+    -1584.0
    ],
    "size": [
-    736.0,
-    192,
-    32
+    1104.0,
+    288,
+    48
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -442,14 +442,14 @@
    "name": "Wall_N2_1",
    "id": "08015fd0-3229-5690-8e8f-211ad435be57",
    "pos": [
-    -528.0,
-    96.0,
-    -704.0
+    -792.0,
+    144.0,
+    -1056.0
    ],
    "size": [
-    384.0,
-    192,
-    32
+    576.0,
+    288,
+    48
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -465,14 +465,14 @@
    "name": "Wall_N5_1",
    "id": "2013480b-283b-540c-8873-b3a85330b5e7",
    "pos": [
-    704.0,
-    96.0,
-    -704.0
+    1056.0,
+    144.0,
+    -1056.0
    ],
    "size": [
-    736.0,
-    192,
-    32
+    1104.0,
+    288,
+    48
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -488,14 +488,14 @@
    "name": "Wall_N1_2",
    "id": "f9d8eff7-4543-5924-9a20-3bb85603ef1d",
    "pos": [
-    -528.0,
-    96.0,
-    -352.0
+    -792.0,
+    144.0,
+    -528.0
    ],
    "size": [
-    1088.0,
-    192,
-    32
+    1632.0,
+    288,
+    48
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -511,14 +511,14 @@
    "name": "Wall_N0_3",
    "id": "8ef23a55-3e36-5fd3-9d6a-52a806811fbf",
    "pos": [
-    -528.0,
-    96.0,
+    -792.0,
+    144.0,
     0.0
    ],
    "size": [
-    1792.0,
-    192,
-    32
+    2688.0,
+    288,
+    48
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -534,14 +534,14 @@
    "name": "Wall_N6_3",
    "id": "e44e6fa1-017a-5d1c-a959-7d71689f937f",
    "pos": [
-    1056.0,
-    96.0,
+    1584.0,
+    144.0,
     0.0
    ],
    "size": [
-    736.0,
-    192,
-    32
+    1104.0,
+    288,
+    48
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -557,14 +557,14 @@
    "name": "Wall_N2_4",
    "id": "a17ac04b-6513-57e2-8003-26b07af122ef",
    "pos": [
-    -528.0,
-    96.0,
-    352.0
+    -792.0,
+    144.0,
+    528.0
    ],
    "size": [
-    384.0,
-    192,
-    32
+    576.0,
+    288,
+    48
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -580,14 +580,14 @@
    "name": "Wall_N4_4",
    "id": "e9cba0fd-9a85-5f8d-8cd4-1ae4871b77ab",
    "pos": [
-    176.0,
-    96.0,
-    352.0
+    264.0,
+    144.0,
+    528.0
    ],
    "size": [
-    384.0,
-    192,
-    32
+    576.0,
+    288,
+    48
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -603,14 +603,14 @@
    "name": "Wall_N1_5",
    "id": "bd5dacf7-26d5-5fc5-a4fa-454717822823",
    "pos": [
-    -880.0,
-    96.0,
-    704.0
+    -1320.0,
+    144.0,
+    1056.0
    ],
    "size": [
-    384.0,
-    192,
-    32
+    576.0,
+    288,
+    48
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -626,14 +626,14 @@
    "name": "Wall_N3_5",
    "id": "23741251-cccc-5464-85f9-4bfb2ccf5435",
    "pos": [
-    352.0,
-    96.0,
-    704.0
+    528.0,
+    144.0,
+    1056.0
    ],
    "size": [
-    1440.0,
-    192,
-    32
+    2160.0,
+    288,
+    48
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -649,14 +649,14 @@
    "name": "Wall_N0_6",
    "id": "6e632808-7a2f-54f8-aee1-3cf66c93da4a",
    "pos": [
-    -880.0,
-    96.0,
-    1056.0
+    -1320.0,
+    144.0,
+    1584.0
    ],
    "size": [
-    1088.0,
-    192,
-    32
+    1632.0,
+    288,
+    48
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -672,14 +672,14 @@
    "name": "Ledge_1",
    "id": "ec7e6392-633f-5fe1-b5ae-ecb3eb68e4b6",
    "pos": [
-    176.0,
-    48.0,
-    176.0
+    264.0,
+    72.0,
+    264.0
    ],
    "size": [
-    296,
-    96,
-    296
+    444,
+    144,
+    444
    ],
    "textures": {
     "north": "levitate/wall_slate.png",
@@ -695,9 +695,9 @@
    "name": "Pad_Spring_L1",
    "id": "61d62609-384f-50d5-9b10-a862cc94ad51",
    "pos": [
-    -88.0,
+    -132.0,
     2,
-    176.0
+    264.0
    ],
    "size": [
     112,
@@ -718,9 +718,9 @@
    "name": "Pad_Boost_1",
    "id": "077e59b2-5342-5842-9bf6-c2b3e810fbb8",
    "pos": [
-    1232.0,
+    1848.0,
     2,
-    528.0
+    792.0
    ],
    "size": [
     112,
@@ -741,9 +741,9 @@
    "name": "Pad_Boost_2",
    "id": "291de577-1506-508c-a4e7-1b83aa7a2f63",
    "pos": [
-    -528.0,
+    -792.0,
     2,
-    -176.0
+    -264.0
    ],
    "size": [
     112,
@@ -764,9 +764,9 @@
    "name": "Pad_Boost_3",
    "id": "0472be7c-7038-543d-955f-c460d81d17dc",
    "pos": [
-    -1232.0,
+    -1848.0,
     2,
-    -880.0
+    -1320.0
    ],
    "size": [
     112,
@@ -787,9 +787,9 @@
    "name": "Pad_Spring_1",
    "id": "acc9d08c-5199-52a1-9931-240ae2b8add0",
    "pos": [
-    1232.0,
+    1848.0,
     2,
-    -880.0
+    -1320.0
    ],
    "size": [
     112,
@@ -810,9 +810,9 @@
    "name": "Pad_Spring_2",
    "id": "7a35acdd-a053-51be-824e-df9d5fcb032b",
    "pos": [
-    -880.0,
+    -1320.0,
     2,
-    176.0
+    264.0
    ],
    "size": [
     112,
@@ -833,9 +833,9 @@
    "name": "Pad_Barrier_1",
    "id": "5f53e1dd-5cfb-53a1-b7f8-28813ed61acd",
    "pos": [
-    880.0,
+    1320.0,
     2,
-    -880.0
+    -1320.0
    ],
    "size": [
     112,
@@ -856,9 +856,9 @@
    "name": "Pad_Barrier_2",
    "id": "b2d229bb-0ccc-5e57-bd34-beb535ff93e6",
    "pos": [
-    176.0,
+    264.0,
     2,
-    880.0
+    1320.0
    ],
    "size": [
     112,
@@ -880,9 +880,9 @@
   {
    "type": "playerstart",
    "pos": [
-    -1232.0,
+    -1848.0,
     50,
-    -1232.0
+    -1848.0
    ],
    "properties": {
     "type": "playerstart",
@@ -896,9 +896,9 @@
   {
    "type": "levitaterules",
    "pos": [
-    -1232.0,
+    -1848.0,
     0,
-    -1337.6
+    -2006.4
    ],
    "properties": {
     "type": "levitaterules",
@@ -918,9 +918,9 @@
   {
    "type": "levitateflag",
    "pos": [
-    -1232.0,
+    -1848.0,
     0,
-    1232.0
+    1848.0
    ],
    "properties": {
     "type": "levitateflag",
@@ -932,9 +932,9 @@
   {
    "type": "levitateflag",
    "pos": [
-    -528.0,
+    -792.0,
     0,
-    528.0
+    792.0
    ],
    "properties": {
     "type": "levitateflag",
@@ -946,9 +946,9 @@
   {
    "type": "levitateflag",
    "pos": [
-    -1232.0,
+    -1848.0,
     0,
-    176.0
+    264.0
    ],
    "properties": {
     "type": "levitateflag",
@@ -960,9 +960,9 @@
   {
    "type": "levitateflag",
    "pos": [
-    -880.0,
+    -1320.0,
     0,
-    -1232.0
+    -1848.0
    ],
    "properties": {
     "type": "levitateflag",
@@ -974,9 +974,9 @@
   {
    "type": "levitateflag",
    "pos": [
-    1232.0,
+    1848.0,
     0,
-    -1232.0
+    -1848.0
    ],
    "properties": {
     "type": "levitateflag",
@@ -988,9 +988,9 @@
   {
    "type": "levitateflag",
    "pos": [
-    1232.0,
+    1848.0,
     0,
-    -176.0
+    -264.0
    ],
    "properties": {
     "type": "levitateflag",
@@ -1002,9 +1002,9 @@
   {
    "type": "levitatepickup",
    "pos": [
-    176.0,
-    136,
-    176.0
+    264.0,
+    184,
+    264.0
    ],
    "properties": {
     "type": "levitatepickup",
@@ -1017,9 +1017,9 @@
   {
    "type": "levitatepad",
    "pos": [
-    -88.0,
+    -132.0,
     4,
-    176.0
+    264.0
    ],
    "properties": {
     "type": "levitatepad",
@@ -1033,9 +1033,9 @@
   {
    "type": "levitatepad",
    "pos": [
-    1232.0,
+    1848.0,
     4,
-    528.0
+    792.0
    ],
    "properties": {
     "type": "levitatepad",
@@ -1049,9 +1049,9 @@
   {
    "type": "levitatepad",
    "pos": [
-    -528.0,
+    -792.0,
     4,
-    -176.0
+    -264.0
    ],
    "properties": {
     "type": "levitatepad",
@@ -1065,9 +1065,9 @@
   {
    "type": "levitatepad",
    "pos": [
-    -1232.0,
+    -1848.0,
     4,
-    -880.0
+    -1320.0
    ],
    "properties": {
     "type": "levitatepad",
@@ -1081,9 +1081,9 @@
   {
    "type": "levitatepad",
    "pos": [
-    1232.0,
+    1848.0,
     4,
-    -880.0
+    -1320.0
    ],
    "properties": {
     "type": "levitatepad",
@@ -1097,9 +1097,9 @@
   {
    "type": "levitatepad",
    "pos": [
-    -880.0,
+    -1320.0,
     4,
-    176.0
+    264.0
    ],
    "properties": {
     "type": "levitatepad",
@@ -1113,9 +1113,9 @@
   {
    "type": "levitatepad",
    "pos": [
-    880.0,
+    1320.0,
     4,
-    -880.0
+    -1320.0
    ],
    "properties": {
     "type": "levitatepad",
@@ -1128,9 +1128,9 @@
   {
    "type": "levitatepad",
    "pos": [
-    176.0,
+    264.0,
     4,
-    880.0
+    1320.0
    ],
    "properties": {
     "type": "levitatepad",
@@ -1143,9 +1143,9 @@
   {
    "type": "levitatepickup",
    "pos": [
-    704.0,
+    1056.0,
     40,
-    -352.0
+    -528.0
    ],
    "properties": {
     "type": "levitatepickup",
@@ -1158,9 +1158,9 @@
   {
    "type": "levitatepickup",
    "pos": [
-    -880.0,
+    -1320.0,
     40,
-    528.0
+    792.0
    ],
    "properties": {
     "type": "levitatepickup",
@@ -1173,9 +1173,9 @@
   {
    "type": "levitatepickup",
    "pos": [
-    176.0,
+    264.0,
     40,
-    -1232.0
+    -1848.0
    ],
    "properties": {
     "type": "levitatepickup",
@@ -1188,9 +1188,9 @@
   {
    "type": "levitatepickup",
    "pos": [
-    1232.0,
+    1848.0,
     40,
-    1232.0
+    1848.0
    ],
    "properties": {
     "type": "levitatepickup",
@@ -1203,16 +1203,16 @@
   {
    "type": "light",
    "pos": [
-    -1056.0,
-    312,
-    -1056.0
+    -1584.0,
+    408,
+    -1584.0
    ],
    "properties": {
     "type": "light",
     "name": "Light_0_0",
     "id": "8d8fb96c-2d31-596e-ab16-c6088d948b12",
     "intensity": 1.5,
-    "radius": 915.2,
+    "radius": 1372.8,
     "colour": [
      220,
      230,
@@ -1225,16 +1225,16 @@
   {
    "type": "light",
    "pos": [
-    -1056.0,
-    312,
-    -352.0
+    -1584.0,
+    408,
+    -528.0
    ],
    "properties": {
     "type": "light",
     "name": "Light_0_2",
     "id": "b6e7c1de-e344-59c2-9776-a6347030b0e4",
     "intensity": 1.5,
-    "radius": 915.2,
+    "radius": 1372.8,
     "colour": [
      220,
      230,
@@ -1247,16 +1247,16 @@
   {
    "type": "light",
    "pos": [
-    -1056.0,
-    312,
-    352.0
+    -1584.0,
+    408,
+    528.0
    ],
    "properties": {
     "type": "light",
     "name": "Light_0_4",
     "id": "fdc9206e-81bc-579d-bb7e-c05153eda9d5",
     "intensity": 1.5,
-    "radius": 915.2,
+    "radius": 1372.8,
     "colour": [
      220,
      230,
@@ -1269,16 +1269,16 @@
   {
    "type": "light",
    "pos": [
-    -1056.0,
-    312,
-    1056.0
+    -1584.0,
+    408,
+    1584.0
    ],
    "properties": {
     "type": "light",
     "name": "Light_0_6",
     "id": "041db2d9-e2e9-5404-8cab-1fad8fe8458b",
     "intensity": 1.5,
-    "radius": 915.2,
+    "radius": 1372.8,
     "colour": [
      220,
      230,
@@ -1291,16 +1291,16 @@
   {
    "type": "light",
    "pos": [
-    -352.0,
-    312,
-    -1056.0
+    -528.0,
+    408,
+    -1584.0
    ],
    "properties": {
     "type": "light",
     "name": "Light_2_0",
     "id": "63e1b68c-6e16-5a4d-a555-05e090e02315",
     "intensity": 1.5,
-    "radius": 915.2,
+    "radius": 1372.8,
     "colour": [
      220,
      230,
@@ -1313,16 +1313,16 @@
   {
    "type": "light",
    "pos": [
-    -352.0,
-    312,
-    -352.0
+    -528.0,
+    408,
+    -528.0
    ],
    "properties": {
     "type": "light",
     "name": "Light_2_2",
     "id": "b5a4f7a6-a17d-5c07-8843-a4a2a24c7980",
     "intensity": 1.5,
-    "radius": 915.2,
+    "radius": 1372.8,
     "colour": [
      220,
      230,
@@ -1335,16 +1335,16 @@
   {
    "type": "light",
    "pos": [
-    -352.0,
-    312,
-    352.0
+    -528.0,
+    408,
+    528.0
    ],
    "properties": {
     "type": "light",
     "name": "Light_2_4",
     "id": "2585dd32-92b0-556b-aa10-3eb6e04bd2d9",
     "intensity": 1.5,
-    "radius": 915.2,
+    "radius": 1372.8,
     "colour": [
      220,
      230,
@@ -1357,16 +1357,16 @@
   {
    "type": "light",
    "pos": [
-    -352.0,
-    312,
-    1056.0
+    -528.0,
+    408,
+    1584.0
    ],
    "properties": {
     "type": "light",
     "name": "Light_2_6",
     "id": "ddf25d51-112e-528a-b340-089460eebc49",
     "intensity": 1.5,
-    "radius": 915.2,
+    "radius": 1372.8,
     "colour": [
      220,
      230,
@@ -1379,16 +1379,16 @@
   {
    "type": "light",
    "pos": [
-    352.0,
-    312,
-    -1056.0
+    528.0,
+    408,
+    -1584.0
    ],
    "properties": {
     "type": "light",
     "name": "Light_4_0",
     "id": "6f573763-2160-5986-a866-a28c84d46feb",
     "intensity": 1.5,
-    "radius": 915.2,
+    "radius": 1372.8,
     "colour": [
      220,
      230,
@@ -1401,16 +1401,16 @@
   {
    "type": "light",
    "pos": [
-    352.0,
-    312,
-    -352.0
+    528.0,
+    408,
+    -528.0
    ],
    "properties": {
     "type": "light",
     "name": "Light_4_2",
     "id": "3bf4fd4a-d0cb-56d5-a8fa-ff84b410c0a7",
     "intensity": 1.5,
-    "radius": 915.2,
+    "radius": 1372.8,
     "colour": [
      220,
      230,
@@ -1423,16 +1423,16 @@
   {
    "type": "light",
    "pos": [
-    352.0,
-    312,
-    352.0
+    528.0,
+    408,
+    528.0
    ],
    "properties": {
     "type": "light",
     "name": "Light_4_4",
     "id": "ef863db0-b83d-5103-93d5-5bcc3f6db151",
     "intensity": 1.5,
-    "radius": 915.2,
+    "radius": 1372.8,
     "colour": [
      220,
      230,
@@ -1445,16 +1445,16 @@
   {
    "type": "light",
    "pos": [
-    352.0,
-    312,
-    1056.0
+    528.0,
+    408,
+    1584.0
    ],
    "properties": {
     "type": "light",
     "name": "Light_4_6",
     "id": "f58137a2-3d4a-5232-8fac-fabf2a3cd3d2",
     "intensity": 1.5,
-    "radius": 915.2,
+    "radius": 1372.8,
     "colour": [
      220,
      230,
@@ -1467,16 +1467,16 @@
   {
    "type": "light",
    "pos": [
-    1056.0,
-    312,
-    -1056.0
+    1584.0,
+    408,
+    -1584.0
    ],
    "properties": {
     "type": "light",
     "name": "Light_6_0",
     "id": "09e26255-ec7e-5955-afde-0cd4bf53bfcb",
     "intensity": 1.5,
-    "radius": 915.2,
+    "radius": 1372.8,
     "colour": [
      220,
      230,
@@ -1489,16 +1489,16 @@
   {
    "type": "light",
    "pos": [
-    1056.0,
-    312,
-    -352.0
+    1584.0,
+    408,
+    -528.0
    ],
    "properties": {
     "type": "light",
     "name": "Light_6_2",
     "id": "6e830bcf-8ece-5bcf-9722-1ec04c1bdcb1",
     "intensity": 1.5,
-    "radius": 915.2,
+    "radius": 1372.8,
     "colour": [
      220,
      230,
@@ -1511,16 +1511,16 @@
   {
    "type": "light",
    "pos": [
-    1056.0,
-    312,
-    352.0
+    1584.0,
+    408,
+    528.0
    ],
    "properties": {
     "type": "light",
     "name": "Light_6_4",
     "id": "6236efc3-a461-5838-ba2e-e523f87273f7",
     "intensity": 1.5,
-    "radius": 915.2,
+    "radius": 1372.8,
     "colour": [
      220,
      230,
@@ -1533,16 +1533,16 @@
   {
    "type": "light",
    "pos": [
-    1056.0,
-    312,
-    1056.0
+    1584.0,
+    408,
+    1584.0
    ],
    "properties": {
     "type": "light",
     "name": "Light_6_6",
     "id": "22329b6d-636b-5506-b6fb-97d726753825",
     "intensity": 1.5,
-    "radius": 915.2,
+    "radius": 1372.8,
     "colour": [
      220,
      230,

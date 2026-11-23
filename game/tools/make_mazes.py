@@ -27,10 +27,15 @@ import uuid
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 OUT = os.path.join(ROOT, "maps", "levitate")
 
-CELL = 352            # corridor pitch (wall centre to wall centre)
-WALL_T = 32           # wall thickness
-WALL_H = 192          # wall height
-LEDGE_H = 96          # raised ledge top
+#: How large the mazes' geometry is built: corridors, walls, wall height, the
+#: floor and ledges all scale by it. What sits in the maze -- pads, orbs,
+#: flags, lights -- keeps its own size and only moves with the layout.
+GEOMETRY_SCALE = 1.5
+
+CELL = round(352 * GEOMETRY_SCALE)     # corridor pitch (wall centre to wall centre)
+WALL_T = round(32 * GEOMETRY_SCALE)    # wall thickness
+WALL_H = round(192 * GEOMETRY_SCALE)   # wall height
+LEDGE_H = round(96 * GEOMETRY_SCALE)   # raised ledge top (a ledge spring reaches 240)
 NAMESPACE = uuid.UUID("6c1f7f2e-5d0e-4b8e-9a51-1e7a7a1e0001")
 
 MAZES = [
@@ -255,7 +260,7 @@ def build(spec):
     rewards = ["shield", "phantom", "jammer"]
     for i, cell in enumerate(ledges):
         x, z = centre(*cell)
-        size = CELL - WALL_T - 24
+        size = CELL - WALL_T - round(24 * GEOMETRY_SCALE)
         b.brush(f"Ledge_{i + 1}", (x, LEDGE_H / 2, z), (size, LEDGE_H, size), ledge_tex)
         b.thing("levitatepickup", f"Ledge_Orb_{i + 1}", (x, LEDGE_H + 40, z),
                 kind=rewards[i % len(rewards)], respawn_time=25.0)

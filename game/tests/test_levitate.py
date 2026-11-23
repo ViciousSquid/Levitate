@@ -170,3 +170,35 @@ def test_hud_size_setting_in_launcher_and_pause_menu(tmp_path):
     assert window.config.get("Display", "hud_size") == "large" and window.saved == 1
     host._cycle_hud_size(window, None)
     assert item() == "HUD Size: Compact"
+
+
+@pytest.mark.parametrize("maze", MAZES)
+def test_geometry_scales_but_pads_and_orbs_do_not(maze):
+    from game.tools import make_mazes
+    data = json.load(open(os.path.join(ROOT, maze)))
+    brushes = {b["name"]: b for b in data["brushes"]}
+    assert brushes["Wall_North"]["size"][1] == make_mazes.WALL_H
+    for name, brush in brushes.items():
+        if name.startswith("Pad_"):
+            assert brush["size"] == [112, 4, 112], name
+
+
+def test_a_ledge_spring_clears_the_scaled_ledge(fio_session):
+    from game.tools import make_mazes
+    host = _game()
+    editor = fio_session(MAZES[0])
+    editor.start_play().step(10)
+    player = host.api.player
+    spring = next(p for p in host.api.entities_of_type("levitatepad")
+                  if p.properties["name"].startswith("Spring_L"))
+    x, y, z = spring.pos
+    player.teleport((x, y + 26, z))
+    floor_y = None
+    peak = -1e9
+    for _ in range(60):
+        editor.step(1)
+        feet = player.position[1] - player.size[1] / 2
+        floor_y = feet if floor_y is None else min(floor_y, feet)
+        peak = max(peak, feet)
+    assert peak - floor_y > make_mazes.LEDGE_H, (peak, floor_y)
+    editor.stop_play()
