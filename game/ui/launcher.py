@@ -662,6 +662,22 @@ class Launcher(QDialog):
         body.addLayout(buttons)
         self._button_spacing = buttons.spacing()
 
+        # Racing with friends: friend codes and a lobby (game/ui/multiplayer.py).
+        self.multiplayer_button = QPushButton("MULTIPLAYER")
+        self.multiplayer_button.setToolTip(
+            "Race with friends: host a race and send them its friend code, or\n"
+            "paste a friend's code to join. Rival craft fill the empty seats.")
+        self.multiplayer_button.setStyleSheet(
+            f"QPushButton {{ background-color:{_VIOLET}; color:white; border:1px solid {_CYAN};"
+            f" font-weight:bold; letter-spacing:2px; }}"
+            f"QPushButton:hover {{ background-color:#9460FF; }}"
+            f"QPushButton:pressed {{ background-color:#5A2AC0; }}")
+        self.multiplayer_button.clicked.connect(self._multiplayer)
+        multiplayer_row = QHBoxLayout()
+        multiplayer_row.addStretch(1)
+        multiplayer_row.addWidget(self.multiplayer_button)
+        body.addLayout(multiplayer_row)
+
         footer = QHBoxLayout()
         footer.setSpacing(int(unit * 0.7))
 
@@ -720,6 +736,7 @@ class Launcher(QDialog):
         size = self._button_size()
         self.play_button.setMinimumSize(size)
         self.edit_button.setMinimumSize(size)
+        self.multiplayer_button.setMinimumSize(size.width() * 2 + self._button_spacing, size.height())
         self.banner.refresh_metrics(unit)
         self.adjustSize()
 
@@ -823,6 +840,17 @@ class Launcher(QDialog):
         self._loading = False
 
     # -- finishing ---------------------------------------------------------
+    def _multiplayer(self):
+        """Host or join a race; when it starts, straight into PLAY on its maze."""
+        global _maze
+        from .multiplayer import MultiplayerDialog
+        self._save()
+        dialog = MultiplayerDialog(self.root_dir, self.settings.path, self)
+        if dialog.exec_() == QDialog.Accepted and dialog.handed_off:
+            self.choice = PLAY
+            _maze = dialog.race_map()
+            self.accept()
+
     def _finish(self, choice: str):
         global _maze
         _maze = self.maze_combo.currentData() if choice == PLAY else None
