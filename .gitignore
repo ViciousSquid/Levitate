@@ -21,3 +21,6 @@ logs/
 # The launcher's Random maze, rebuilt every time it is played
 # (game/random_maze.py).
 maps/levitate/_random.json
+
+# Each computer's own multiplayer reconnect identity (game/multiplayer/lobby.py).
+.levitate-identity
