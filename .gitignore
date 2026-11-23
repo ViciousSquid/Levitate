@@ -17,3 +17,7 @@ maps/*_autosave.json
 
 # Console dumps written by the debug console's `condump` command.
 logs/
+
+# The launcher's Random maze, rebuilt every time it is played
+# (game/random_maze.py).
+maps/levitate/_random.json

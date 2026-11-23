@@ -22,11 +22,22 @@ def sprite(name):
     return f"assets/sprites/levitate/{name}"
 
 
-#: A flag billboard's size, ``[width, height]``. Fio draws a billboard centred
-#: on its position, so a flag stands on the floor at ``FLAG_SIZE[1] / 2``
-#: above it (:data:`FLAG_RAISE`).
+def model(name):
+    """A world model (game/tools/make_models.py)."""
+    return f"assets/models/levitate/{name}"
+
+
+#: A flag's size, ``[width, height]``. The model is centred on its origin, as
+#: Fio centres a billboard on its position, so a flag stands on the floor at
+#: ``FLAG_SIZE[1] / 2`` above it (:data:`FLAG_RAISE`).
 FLAG_SIZE = [96, 144]
 FLAG_RAISE = FLAG_SIZE[1] / 2
+
+#: What a flag and a power-up are as Props: scenery the match itself collects
+#: (host.py), drawn as a model. Nothing here is solid or simulated.
+_MODEL_PROP = dict(render_mode="model", collect_enabled=False, carry_enabled=False,
+                   no_collision=True, physics_enabled=False, gravity=False,
+                   collision_shape="aabb", topples=False)
 
 #: The power-ups a pickup can hold, in the HUD's slot order.
 POWERUPS = ("shield", "phantom", "barrier", "jammer")
@@ -51,38 +62,50 @@ class LevitateRules(Thing):
 class LevitateFlag(Prop):
     """A team's flag. Collect every rival flag to win.
 
-    The billboard is centred on the flag's position: place it
+    The model is centred on the flag's position: place it
     :data:`FLAG_RAISE` (72) above the floor for the pole to stand on it."""
 
     def __init__(self, pos=None, properties=None):
         super().__init__(pos, properties)
         self.properties["type"] = "levitateflag"
         self.properties.setdefault("team", "blue")
-        self.properties.update(render_mode="billboard", sprite_path=self.get_sprite_path(),
-                               sprite_size=list(FLAG_SIZE), collect_enabled=False,
-                               carry_enabled=False, no_collision=True)
+        self.properties.setdefault("rotation", [0.0, 0.0, 0.0])
+        self.properties.update(_MODEL_PROP, model_path=self.get_model_path(),
+                               sprite_path=self.get_sprite_path(),
+                               sprite_size=list(FLAG_SIZE), scale=[1.0, 1.0, 1.0])
+
+    def _team(self):
+        return "blue" if self.properties.get("team") == "blue" else "red"
 
     def get_sprite_path(self):
-        team = "blue" if self.properties.get("team") == "blue" else "red"
-        return sprite(f"flag_{team}.png")
+        return sprite(f"flag_{self._team()}.png")
+
+    def get_model_path(self):
+        return model(f"flag_{self._team()}.obj")
 
 
 class LevitatePickup(Prop):
-    """A floating power-up orb; it goes into the first free dashboard slot."""
+    """A floating power cell; it goes into the first free dashboard slot."""
 
     def __init__(self, pos=None, properties=None):
         super().__init__(pos, properties)
         self.properties["type"] = "levitatepickup"
         self.properties.setdefault("kind", "shield")
         self.properties.setdefault("respawn_time", 20.0)
-        self.properties.update(render_mode="billboard", sprite_path=self.get_sprite_path(),
-                               sprite_size=[56, 56], collect_enabled=False,
-                               carry_enabled=False, no_collision=True)
+        self.properties.setdefault("rotation", [0.0, 0.0, 0.0])
+        self.properties.update(_MODEL_PROP, model_path=self.get_model_path(),
+                               sprite_path=self.get_sprite_path(),
+                               sprite_size=[56, 56], scale=[1.0, 1.0, 1.0])
+
+    def _kind(self):
+        kind = self.properties.get("kind")
+        return kind if kind in POWERUPS else "shield"
 
     def get_sprite_path(self):
-        kind = self.properties.get("kind")
-        kind = kind if kind in POWERUPS else "shield"
-        return sprite(f"pickup_{kind}.png")
+        return sprite(f"pickup_{self._kind()}.png")
+
+    def get_model_path(self):
+        return model(f"orb_{self._kind()}.obj")
 
 
 class LevitatePad(Thing):

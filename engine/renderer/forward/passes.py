@@ -136,6 +136,7 @@ class PassesMixin:
                 gl.glBindTexture(gl.GL_TEXTURE_2D, tex_id)
                 current_tex = tex_id
                 self.render_stats.batched_draws += 1
+                self._bind_material_maps(program_name, tex_id)
             self._point_brush_instances_at(begin)
             gl.glDrawArraysInstanced(gl.GL_TRIANGLES, int(run_first[run]),
                                      vertex_count, length)
@@ -472,8 +473,10 @@ class PassesMixin:
                     continue
                 u = self.uniforms[shader_name]
                 _set_model_emissive(u, group.emissive)
+                self._model_surface(shader_name, group.surface)
                 if shader_kind == 'textured':
                     gl.glBindTexture(gl.GL_TEXTURE_2D, group.texture)
+                    self._bind_material_maps(shader_name, group.texture)
                     if tint:
                         _set_model_tint(u, tint)
                 else:

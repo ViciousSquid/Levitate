@@ -23,8 +23,8 @@
 | `monster_customise_dialog.py` | The monster sprite dialog. |
 | `package_dialog.py` | The package export dialog. |
 | `package_exporter.py` | Builds `.fiopak` packages. |
-| `procedural_generator.py` | The procedural level generator and its dialog. |
-| `procedural_map_gen.py` | Command-line procedural level generator. |
+| `procedural_generator.py` | The random level generator and its panel: Levitate! mazes (`game/random_maze.py`). |
+| `procedural_map_gen.py` | Command-line random maze generator. |
 | `project_overview.py` | The Project Overview window. |
 | `property_editor.py` | The Properties panel. |
 | `scene_hierarchy.py` | The Scene Hierarchy panel. |

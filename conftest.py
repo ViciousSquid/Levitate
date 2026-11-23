@@ -98,6 +98,40 @@ def pytest_collection_modifyitems(config, items):
         for item in items:
             if keyword in item.keywords:
                 item.add_marker(skip)
+    _skip_stock_content_tests(config, items)
+
+
+def _skip_stock_content_tests(config, items):
+    """Skip the tests of Fio's own suite that need Fio's stock content.
+
+    Levitate! ships its own assets and none of Fio's sample maps, sounds,
+    models, monster and weapon sprites or textures. The tests that load that
+    content are listed in ``tests/stock_content.txt`` (one node id, or a
+    whole file, per line) and skipped with the reason, rather than left
+    failing or deleted: they are right about the engine and run again
+    wherever the content is restored."""
+    listed = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "tests", "stock_content.txt")
+    try:
+        with open(listed, encoding="utf-8") as handle:
+            wanted = {line.strip() for line in handle
+                      if line.strip() and not line.startswith("#")}
+    except OSError:
+        return
+    if not wanted:
+        return
+    skip = pytest.mark.skip(
+        reason="needs Fio's stock content, which Levitate! does not ship "
+               "(tests/stock_content.txt)")
+    root = str(config.rootpath)
+    for item in items:
+        node = item.nodeid
+        if os.path.isabs(node) and node.startswith(root):
+            node = os.path.relpath(node, root)
+        node = node.replace(os.sep, "/")
+        base = node.split("[", 1)[0]
+        if node in wanted or base in wanted or node.split("::", 1)[0] in wanted:
+            item.add_marker(skip)
 
 
 # ---------------------------------------------------------------------------

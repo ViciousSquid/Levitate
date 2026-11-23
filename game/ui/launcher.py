@@ -64,6 +64,7 @@ DEFAULTS = {
     "vsync": True,
     "high_dpi_scaling": False,
     "hud_size": "compact",
+    "graphics": "high",
 }
 
 #: Where the launcher looks for mazes, relative to the install folder.
@@ -78,7 +79,9 @@ def maze_choices(root_dir: str = "."):
     folder = os.path.join(root_dir, MAZE_DIR)
     found = []
     try:
-        names = sorted(n for n in os.listdir(folder) if n.lower().endswith(".json"))
+        # A leading underscore is not a maze to list: the random maze's file.
+        names = sorted(n for n in os.listdir(folder)
+                       if n.lower().endswith(".json") and not n.startswith("_"))
     except OSError:
         return []
     for name in names:
@@ -99,6 +102,9 @@ def maze_choices(root_dir: str = "."):
     return [(rel, title) for _order, _name, rel, title in sorted(found)]
 
 
+#: The maze picker's entry for a maze made on the spot (game/random_maze.py).
+RANDOM_MAZE = "random"
+
 #: The maze PLAY chose (relative path), for the bootstrap to open
 #: (game.launched_map).
 _maze = None
@@ -109,14 +115,20 @@ def chosen_map():
     return _maze
 
 
-_ACCENT = "#40ECC8"   # Levitate's radar teal
-_PLAY_GREEN = "#C62828"   # Levitate red, the hull colour
-#: The maze picker's very dark red, with hover, selected-row and border shades.
-#: White text on it keeps a contrast ratio above 15:1.
-_MAZE_RED = "#3A0A0C"
-_MAZE_RED_HOVER = "#4E1014"
-_MAZE_RED_SELECTED = "#7A1A20"
-_MAZE_RED_BORDER = "#6B1C20"
+# The launcher's look: 1990s synthwave -- hot pink and cyan neon on deep
+# violet -- standing on a blacklight bowling-alley carpet
+# (game/assets/ui/carpet.png; game/tools/make_art.py draws it and the banner).
+_PINK = "#FF2EA0"
+_CYAN = "#28F0FF"
+_YELLOW = "#FFE83C"
+_ORANGE = "#FF8C28"
+_VIOLET = "#7A3CFF"
+_NIGHT = "#090514"          # the carpet's own ground
+_PANEL = "rgba(16, 6, 36, 238)"
+_FIELD = "#1C0B3A"
+_TEXT = "#F0E4FF"
+_MUTED = "#A58BD6"
+_ACCENT = _CYAN
 # --- sizing ---------------------------------------------------------------
 # Every dimension in the launcher is a multiple of one text line, measured from
 # the application font. That is what makes it DPI-aware the same way the rest of
@@ -268,12 +280,15 @@ class DisplaySettings:
 
     # -- write -----------------------------------------------------------
     def save(self, mode: str, width: int, height: int, vsync: bool,
-             high_dpi: bool = None, maze: str = None, hud_size: str = None) -> None:
-        for section in ("Kiosk", "Display"):
+             high_dpi: bool = None, maze: str = None, hud_size: str = None,
+             graphics: str = None) -> None:
+        for section in ("Kiosk", "Display", "Renderer"):
             if not self.config.has_section(section):
                 self.config.add_section(section)
         if hud_size:
             self.config.set("Display", "hud_size", str(hud_size))
+        if graphics:
+            self.config.set("Renderer", "graphics", str(graphics))
         if maze:
             if not self.config.has_section("Startup"):
                 self.config.add_section("Startup")
@@ -293,7 +308,13 @@ class DisplaySettings:
     def reset(self) -> None:
         self.save(DEFAULTS["window_mode"], DEFAULTS["res_width"],
                   DEFAULTS["res_height"], DEFAULTS["vsync"],
-                  DEFAULTS["high_dpi_scaling"], hud_size=DEFAULTS["hud_size"])
+                  DEFAULTS["high_dpi_scaling"], hud_size=DEFAULTS["hud_size"],
+                  graphics=DEFAULTS["graphics"])
+
+    @property
+    def graphics(self) -> str:
+        from ..graphics import quality_from
+        return quality_from(self.config)
 
     @property
     def hud_size(self) -> str:
@@ -441,6 +462,7 @@ class Launcher(QDialog):
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
         self.setWindowTitle("Levitate!")
         self.setModal(True)
+        self.root_dir = root_dir
         self.settings = DisplaySettings(
             settings_path or os.path.join(root_dir, "settings.ini"))
         self.choice = EDIT
@@ -453,16 +475,26 @@ class Launcher(QDialog):
         # inherited application font), so the launcher honours OS display
         # scaling and the user's own font_size setting — the same rule the
         # logic wizard's stylesheet follows.
-        self.setStyleSheet("""
-            QDialog { background-color: #17181d; border: 1px solid #34363f; }
-            QLabel { color: #d8d8dc; }
-            QComboBox { background-color: #23252c; border: 1px solid #3a3d47;
-                        padding: 0.3em 0.5em; color: #e4e4e8; }
-            QComboBox:disabled { color: #6a6c74; }
-            QCheckBox { color: #d8d8dc; }
-            QPushButton { background-color: #2a2d35; border: 1px solid #3a3d47;
-                          padding: 0.4em 0.9em; color: #e4e4e8; }
-            QPushButton:hover { background-color: #343841; }
+        carpet = os.path.join(os.path.abspath(root_dir), "game", "assets", "ui",
+                              "carpet.png").replace(os.sep, "/")
+        carpet_rule = f"background-image: url({carpet});" if os.path.isfile(carpet) else ""
+        self.setStyleSheet(f"""
+            QDialog {{ background-color: {_NIGHT}; {carpet_rule}
+                       border: 2px solid {_PINK}; }}
+            QFrame#panel {{ background-color: {_PANEL}; border: 1px solid {_CYAN};
+                            border-radius: 0.6em; }}
+            QLabel {{ color: {_TEXT}; background: transparent; }}
+            QComboBox {{ background-color: {_FIELD}; border: 1px solid {_VIOLET};
+                         border-radius: 0.25em; padding: 0.3em 0.5em; color: {_TEXT}; }}
+            QComboBox:hover {{ border-color: {_CYAN}; }}
+            QComboBox:disabled {{ color: #6f5c96; border-color: #3a2466; }}
+            QComboBox QAbstractItemView {{ background-color: #160830; color: {_TEXT};
+                         selection-background-color: {_PINK}; selection-color: white;
+                         border: 1px solid {_CYAN}; }}
+            QCheckBox {{ color: {_TEXT}; background: transparent; }}
+            QPushButton {{ background-color: {_FIELD}; border: 1px solid {_CYAN};
+                           border-radius: 0.25em; padding: 0.4em 0.9em; color: #BFF8FF; }}
+            QPushButton:hover {{ background-color: #2A1260; color: white; }}
         """)
 
         unit = text_unit(self)
@@ -473,11 +505,19 @@ class Launcher(QDialog):
         self.banner = Banner(root_dir, self)
         outer.addWidget(self.banner)
 
-        body = QVBoxLayout()
-        body.setContentsMargins(int(unit * 1.5), int(unit * 1.1),
-                                int(unit * 1.5), int(unit * 1.2))
+        # The settings sit on a dark panel with a neon edge; the carpet shows
+        # round it.
+        surround = QVBoxLayout()
+        surround.setContentsMargins(int(unit * 0.9), int(unit * 0.9),
+                                    int(unit * 0.9), int(unit * 0.9))
+        outer.addLayout(surround)
+        panel = QFrame()
+        panel.setObjectName("panel")
+        surround.addWidget(panel)
+        body = QVBoxLayout(panel)
+        body.setContentsMargins(int(unit * 1.2), int(unit * 1.0),
+                                int(unit * 1.2), int(unit * 1.0))
         body.setSpacing(int(unit * 0.8))
-        outer.addLayout(body)
 
         form = QFormLayout()
         form.setSpacing(int(unit * 0.5))
@@ -495,17 +535,19 @@ class Launcher(QDialog):
         self._mazes = maze_choices(root_dir)
         for rel, title in self._mazes:
             self.maze_combo.addItem(title, rel)
-        self.maze_combo.setToolTip("The maze PLAY starts in.")
-        # The maze picker stands out in very dark red, closed and open alike.
+        self.maze_combo.addItem("Random maze", RANDOM_MAZE)
+        self.maze_combo.setToolTip(
+            "The maze PLAY starts in. Random maze builds a new one each time:\n"
+            "any world, any layout.")
+        # The maze picker stands out in hot pink, closed and open alike.
         self.maze_combo.setStyleSheet(
-            f"QComboBox {{ background-color:{_MAZE_RED}; color:white;"
-            f" border:1px solid {_MAZE_RED_BORDER}; font-weight:bold; }}"
-            f"QComboBox:hover {{ background-color:{_MAZE_RED_HOVER}; }}"
-            f"QComboBox:disabled {{ background-color:#2a2226; color:#8a7c80; }}"
-            f"QComboBox QAbstractItemView {{ background-color:{_MAZE_RED}; color:white;"
-            f" selection-background-color:{_MAZE_RED_SELECTED}; selection-color:white;"
-            f" border:1px solid {_MAZE_RED_BORDER}; }}")
-        self.maze_combo.setEnabled(bool(self._mazes))
+            f"QComboBox {{ background-color:#5A0E48; color:white;"
+            f" border:1px solid {_PINK}; font-weight:bold; }}"
+            f"QComboBox:hover {{ background-color:#7A1460; border-color:{_YELLOW}; }}"
+            f"QComboBox QAbstractItemView {{ background-color:#3A0A30; color:white;"
+            f" selection-background-color:{_PINK}; selection-color:white;"
+            f" border:1px solid {_PINK}; }}")
+        self.maze_combo.setEnabled(True)
         self.maze_combo.currentIndexChanged.connect(self._save)
         form.addRow("Maze", self.maze_combo)
 
@@ -519,11 +561,22 @@ class Launcher(QDialog):
             "Also in the pause menu, where it changes at once.")
         self.hud_combo.currentIndexChanged.connect(self._save)
         form.addRow("HUD size", self.hud_combo)
+
+        from ..graphics import QUALITIES
+        self.graphics_combo = QComboBox()
+        for value, label in QUALITIES.items():
+            self.graphics_combo.addItem(label, value)
+        self.graphics_combo.setToolTip(
+            "How the mazes are lit and drawn: sun and sky, shadows, reflections,\n"
+            "relief on the walls. Lower it if the game does not run smoothly;\n"
+            "Classic is Fio's plain renderer.")
+        self.graphics_combo.currentIndexChanged.connect(self._save)
+        form.addRow("Graphics", self.graphics_combo)
         body.addLayout(form)
 
         self.mode_help = QLabel()
         self.mode_help.setWordWrap(True)
-        self.mode_help.setStyleSheet("color:#7d7f88;")
+        self.mode_help.setStyleSheet(f"color:{_MUTED};")
         body.addWidget(self.mode_help)
 
         self.vsync_check = QCheckBox("Vertical sync")
@@ -542,13 +595,13 @@ class Launcher(QDialog):
         body.addWidget(self.high_dpi_check)
 
         self.high_dpi_note = QLabel("Takes effect next launch.")
-        self.high_dpi_note.setStyleSheet("color:#8a7c3f;")
+        self.high_dpi_note.setStyleSheet(f"color:{_YELLOW};")
         self.high_dpi_note.setVisible(False)
         body.addWidget(self.high_dpi_note)
 
         rule = QFrame()
         rule.setFrameShape(QFrame.HLine)
-        rule.setStyleSheet("color:#2a2c33;")
+        rule.setStyleSheet(f"color:{_VIOLET};")
         body.addWidget(rule)
 
         buttons = QHBoxLayout()
@@ -564,17 +617,19 @@ class Launcher(QDialog):
         self.play_button = QPushButton("PLAY")
         self.play_button.setDefault(True)
         self.play_button.setStyleSheet(
-            f"QPushButton {{ background-color:{_PLAY_GREEN}; color:white;"
-            f" border:1px solid #7F1414; font-weight:bold; letter-spacing:1px; }}"
-            f"QPushButton:hover {{ background-color:#E53935; }}"
-            f"QPushButton:pressed {{ background-color:#8E1B1B; }}")
+            f"QPushButton {{ background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,"
+            f" stop:0 {_PINK}, stop:1 {_ORANGE}); color:white;"
+            f" border:1px solid {_YELLOW}; font-weight:bold; letter-spacing:2px; }}"
+            f"QPushButton:hover {{ background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,"
+            f" stop:0 #FF5CB8, stop:1 #FFA550); }}"
+            f"QPushButton:pressed {{ background-color:#B81C72; }}")
         self.play_button.clicked.connect(lambda: self._finish(PLAY))
         buttons.addWidget(self.play_button)
 
         self.edit_button = QPushButton("EDIT")
         self.edit_button.setStyleSheet(
-            "QPushButton { font-weight:bold; letter-spacing:1px; }"
-            "QPushButton:hover { background-color:#343841; }")
+            f"QPushButton {{ font-weight:bold; letter-spacing:2px; color:{_CYAN}; }}"
+            "QPushButton:hover { background-color:#2A1260; color:white; }")
         self.edit_button.clicked.connect(lambda: self._finish(EDIT))
         buttons.addWidget(self.edit_button)
         body.addLayout(buttons)
@@ -588,7 +643,7 @@ class Launcher(QDialog):
         self.version_label = QLabel(version_line(root_dir))
         self.version_label.setTextFormat(Qt.PlainText)
         self.version_label.setStyleSheet(
-            "color:#5f6169; background:transparent; border:none;")
+            f"color:{_MUTED}; background:transparent; border:none;")
         self.version_label.setFrameStyle(QFrame.NoFrame)
         self.version_label.setAutoFillBackground(False)
         self.version_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -602,9 +657,9 @@ class Launcher(QDialog):
         quit_link = QPushButton("Quit")
         quit_link.setFlat(True)
         quit_link.setStyleSheet(
-            "QPushButton { border:none; background:transparent; color:#6f7179;"
-            " padding:0.15em 0.3em; }"
-            "QPushButton:hover { color:#c8c9cf; }")
+            f"QPushButton {{ border:none; background:transparent; color:{_MUTED};"
+            f" padding:0.15em 0.3em; }}"
+            f"QPushButton:hover {{ color:{_PINK}; }}")
         quit_link.clicked.connect(lambda: self._finish(QUIT))
         footer.addWidget(quit_link)
         body.addLayout(footer)
@@ -676,6 +731,8 @@ class Launcher(QDialog):
         index = self.maze_combo.findData(last) if last else -1
         self.maze_combo.setCurrentIndex(max(0, index))
         self.hud_combo.setCurrentIndex(max(0, self.hud_combo.findData(self.settings.hud_size)))
+        self.graphics_combo.setCurrentIndex(
+            max(0, self.graphics_combo.findData(self.settings.graphics)))
         self.high_dpi_note.setVisible(False)
         self._update_mode_help()
 
@@ -726,7 +783,8 @@ class Launcher(QDialog):
                            self.vsync_check.isChecked(),
                            self.high_dpi_check.isChecked(),
                            self.maze_combo.currentData(),
-                           self.hud_combo.currentData())
+                           self.hud_combo.currentData(),
+                           self.graphics_combo.currentData())
 
     def _reset(self):
         self.settings.reset()
@@ -738,9 +796,21 @@ class Launcher(QDialog):
     def _finish(self, choice: str):
         global _maze
         _maze = self.maze_combo.currentData() if choice == PLAY else None
+        if _maze == RANDOM_MAZE:
+            _maze = self._random_maze()
         self.choice = choice
         self._save()
         self.accept() if choice != QUIT else self.reject()
+
+    def _random_maze(self):
+        """Build a maze nobody has played and return its path; the first
+        shipped maze if it cannot be built (never no maze at all)."""
+        try:
+            from .. import random_maze
+            return random_maze.write(self.root_dir)
+        except Exception as exc:
+            print(f"[Levitate] no random maze: {exc}")
+            return self._mazes[0][0] if self._mazes else None
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:

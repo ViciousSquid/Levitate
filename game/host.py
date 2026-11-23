@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 import time
 
+from . import graphics
 from .entities import ENTITIES, POWERUPS
 from .hover import HoverHandling
 
@@ -56,6 +57,9 @@ class MatchState:
         self.player_yaw = 0.0
         self.speed = 0.0
         self.bonk = 0.0
+        self.theme = str(props.get("theme", graphics.DEFAULT_THEME))
+        self.glows = {}                # entity name -> its glow light
+        self.homes = {}                # id(entity) -> (authored pos, yaw, phase)
 
     # -- derived -------------------------------------------------------------
     def elapsed(self, now=None):
@@ -91,6 +95,9 @@ class LevitateGame:
         self.handling = None
         self._hud = None
         self._view = None              # the 3D view whose stock HUD we hide
+        self._quality = graphics.DEFAULT_QUALITY
+        self._lit = None               # (renderer, theme, quality) now lit
+        self._dimmed = []              # fill lights a lit match hid
 
     # -- registration ----------------------------------------------------------
     def register(self, api):
@@ -111,6 +118,7 @@ class LevitateGame:
     def connect(self, host):
         self.host = host
         host.on("render.overlay", self._draw_overlay)
+        host.on("render.pre_scene", self._light_scene)
 
     # -- play lifecycle ----------------------------------------------------------
     def _rules(self, logic):
@@ -133,6 +141,7 @@ class LevitateGame:
                 team = thing.properties.get("team", "blue")
                 (match.rival_flags if team == match.rival_team else match.home_flags).append(thing)
         match.walls, match.bounds = self._radar_walls(logic)
+        self._dress(logic, match, things)
         player = self._player_object(logic)
         if player is not None:
             self.handling = HoverHandling(
@@ -150,14 +159,116 @@ class LevitateGame:
         if self.handling is not None:
             self.handling.remove()
         self.handling = None
-        # Restore everything the match hid, so the edited map is unchanged.
+        # Restore everything the match hid or moved, so the edited map is
+        # unchanged.
         if self.match is not None:
             from plugins.api import clear_flag
             for thing in getattr(logic.editor_state, "things", []):
                 kind = str(thing.properties.get("type", "")).lower()
                 if kind in ("levitateflag", "levitatepickup") and thing.properties.get("hidden"):
                     clear_flag(thing, "hidden")
+            for light in list(self.match.glows.values()) + self._dimmed:
+                if light.properties.get("hidden"):
+                    clear_flag(light, "hidden")
+            self._settle(logic, self.match)
+        self._dimmed = []
         self.match = None
+
+    # -- the look of a match ----------------------------------------------------
+    def _config(self):
+        return getattr(getattr(self.host, "editor", None), "config", None)
+
+    def _dress(self, logic, match, things):
+        """What a match changes about how the maze looks: its fill lights go
+        out when the sun and sky light it (game/graphics.py), each cell and
+        flag is paired with its glow, and their resting places are noted for
+        the bob and spin."""
+        from plugins.api import set_flag
+        config = self._config()
+        self._quality = graphics.quality_from(config) if config is not None else graphics.DEFAULT_QUALITY
+        renderer = getattr(getattr(getattr(self.host, "editor", None), "view_3d", None),
+                           "renderer", None)
+        lit = graphics.lit(self._quality) and getattr(renderer, "surface_shading", True)
+        self._dimmed = []
+        named = {}
+        for thing in things:
+            props = thing.properties
+            kind = str(props.get("type", "")).lower()
+            if kind == "light":
+                if props.get(graphics.FILL_LIGHT) and lit:
+                    set_flag(thing, "hidden", True)
+                    self._dimmed.append(thing)
+                if props.get("levitate_for"):
+                    match.glows[str(props["levitate_for"])] = thing
+            elif kind in ("levitateflag", "levitatepickup"):
+                named[id(thing)] = thing
+                rotation = props.get("rotation") or [0.0, 0.0, 0.0]
+                match.homes[id(thing)] = (tuple(thing.pos), float(rotation[1]),
+                                          (len(match.homes) * 1.7) % 6.283)
+
+    @staticmethod
+    def _glow(match, thing, on):
+        """A cell's or flag's light goes out with it and comes back with it."""
+        from plugins.api import clear_flag, set_flag
+        light = match.glows.get(str(thing.properties.get("name", "")))
+        if light is None:
+            return
+        if on:
+            clear_flag(light, "hidden")
+        else:
+            set_flag(light, "hidden", True)
+
+    def _animate(self, logic, match, now):
+        """Cells turn and bob; a flag stirs on its pole."""
+        from engine.change_journal import touch
+        t = now - match.started
+        for thing in logic.editor_state.things:
+            home = match.homes.get(id(thing))
+            if home is None or thing.properties.get("hidden"):
+                continue
+            (x, y, z), yaw, phase = home
+            if str(thing.properties.get("type", "")).lower() == "levitatepickup":
+                thing.pos = (x, y + math.sin(t * 2.1 + phase) * 5.0, z)
+                thing.properties["rotation"] = [0.0, (yaw + t * 70.0) % 360.0, 0.0]
+            else:
+                thing.properties["rotation"] = [0.0, yaw + math.sin(t * 0.9 + phase) * 7.0, 0.0]
+            touch(thing)
+
+    @staticmethod
+    def _settle(logic, match):
+        """Put every animated cell and flag back where the map has it."""
+        from engine.change_journal import touch
+        for thing in getattr(logic.editor_state, "things", []):
+            home = match.homes.get(id(thing))
+            if home is None:
+                continue
+            thing.pos = home[0]
+            thing.properties["rotation"] = [0.0, home[1], 0.0]
+            touch(thing)
+
+    def _light_scene(self, event):
+        """Before each frame: light the match's world (the theme's sun, sky
+        and finish, at the chosen quality), and anything else as Fio does."""
+        renderer = event.get("renderer")
+        if renderer is None:
+            return
+        match = self.match
+        want = None
+        if event.get("play_mode", False) and match is not None:
+            want = (match.theme, self._quality)
+        lit = self._lit
+        if lit is not None and lit[0]() is renderer and lit[1] == want:
+            return
+        import weakref
+        if want is None:
+            graphics.clear(renderer)
+        else:
+            # The sun's shadow map is spent on the maze, not on its scenery.
+            graphics.apply(renderer, *want, focus=match.bounds)
+        try:
+            self._lit = (weakref.ref(renderer), want)
+        except TypeError:
+            self._lit = None
 
     @staticmethod
     def _player_object(logic):
@@ -172,7 +283,8 @@ class LevitateGame:
         xs, zs = [], []
         for brush in getattr(logic.editor_state, "brushes", []) or []:
             try:
-                if brush.get("is_trigger"):
+                # Not triggers, and not the scenery beyond the walls.
+                if brush.get("is_trigger") or str(brush.get("name", "")).startswith("Scenery_"):
                     continue
                 (x, y, z), (w, h, d) = brush["pos"], brush["size"]
             except (KeyError, TypeError, ValueError):
@@ -210,6 +322,7 @@ class LevitateGame:
         match.player_pos = pos
         match.player_yaw = float(state.yaw)
         match.speed = self.handling.speed(state) if self.handling else 0.0
+        self._animate(logic, match, now)
         if match.finished is not None:
             if ctx.key_down("r"):
                 self._restart(logic, state)
@@ -232,6 +345,7 @@ class LevitateGame:
             if math.hypot(fx - pos[0], fz - pos[2]) <= FLAG_REACH and abs(fy - pos[1]) < 160:
                 match.taken.add(id(flag))
                 set_flag(flag, "hidden", True)
+                self._glow(match, flag, False)
                 left = len(match.rival_flags) - len(match.taken)
                 if left:
                     match.say(f"FLAG TAKEN  —  {left} TO GO")
@@ -274,6 +388,7 @@ class LevitateGame:
             if back is not None:
                 if now >= back:
                     clear_flag(pickup, "hidden")
+                    self._glow(match, pickup, True)
                     match.pickup_back.pop(key, None)
                 continue
             px, py, pz = pickup.pos
@@ -281,6 +396,7 @@ class LevitateGame:
                 continue
             if self._give(match, pickup.properties.get("kind", "shield")):
                 set_flag(pickup, "hidden", True)
+                self._glow(match, pickup, False)
                 match.pickup_back[key] = now + float(pickup.properties.get("respawn_time", 20.0))
 
     @staticmethod
@@ -314,6 +430,7 @@ class LevitateGame:
             kind = str(thing.properties.get("type", "")).lower()
             if kind in ("levitateflag", "levitatepickup") and thing.properties.get("hidden"):
                 clear_flag(thing, "hidden")
+                self._glow(self.match, thing, True)
         start = None
         for thing in logic.editor_state.things:
             if str(thing.properties.get("type", "")).lower() == "playerstart":
@@ -327,6 +444,7 @@ class LevitateGame:
         self.match = MatchState(self._rules(logic), old.player_team)
         self.match.rival_flags, self.match.home_flags = old.rival_flags, old.home_flags
         self.match.walls, self.match.bounds = old.walls, old.bounds
+        self.match.glows, self.match.homes = old.glows, old.homes
         self.match.say("GO!", 1.5)
 
     # -- HUD ---------------------------------------------------------------------

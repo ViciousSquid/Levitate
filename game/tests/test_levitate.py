@@ -14,7 +14,7 @@ from plugins.manager import get_manager
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 MAZES = sorted(f"maps/levitate/{n}" for n in os.listdir(os.path.join(ROOT, "maps", "levitate"))
-               if n.endswith(".json"))
+               if n.endswith(".json") and not n.startswith("_"))
 KEY_W = 0x57
 
 
@@ -25,7 +25,7 @@ def _game():
 
 def test_mazes_are_listed_in_order():
     titles = [title for _rel, title in launcher.maze_choices(ROOT)]
-    assert titles == ["Breakwater", "Sandglass", "Mossgarden"]
+    assert titles == ["Breakwater", "Sandglass", "Mossgarden", "Frostline", "Emberworks"]
 
 
 @pytest.mark.parametrize("maze", MAZES)
@@ -238,3 +238,170 @@ def test_hovercraft_monster_has_eight_views_per_team():
     assert blue.properties["variant"] == "blue"
     idle, _dead, _shoot = Monster._get_default_paths("hovercraft", "blue")
     assert idle == "assets/sprites/monsters/hovercraft/blue/idle.png"
+
+
+# -- worlds, lighting and materials ---------------------------------------------
+def test_every_world_has_its_own_look_and_materials():
+    """Five worlds: each maze's theme has a lighting preset of its own, its
+    own walls and floor, and every material comes with the maps a physically
+    shaded frame reads."""
+    from game import graphics, random_maze
+    themes = []
+    for maze in MAZES:
+        data = json.load(open(os.path.join(ROOT, maze)))
+        rules = next(t for t in data["things"] if t["type"] == "levitaterules")
+        themes.append(rules["properties"]["theme"])
+    assert sorted(themes) == sorted(graphics.THEMES) == sorted(random_maze.WORLDS)
+    looks = [tuple(sorted(graphics.THEMES[t].items())) for t in themes]
+    assert len(set(looks)) == len(looks)
+    folder = os.path.join(ROOT, "assets", "textures", "levitate")
+    for theme in themes:
+        for name in (f"wall_{theme}", f"floor_{theme}"):
+            for suffix in ("", "_n", "_m", "_h"):
+                assert os.path.isfile(os.path.join(folder, f"{name}{suffix}.jpg")), name + suffix
+
+
+def test_a_match_lights_its_world_and_puts_fio_back():
+    """The match switches the renderer's environment on with the maze's
+    theme; outside play, and at the classic quality, it is Fio's own."""
+    from engine.renderer.forward.environment import Environment
+    from game import graphics
+
+    class Renderer:
+        surface_shading = True
+
+        def __init__(self):
+            self.environment = Environment()
+
+    renderer = Renderer()
+    assert graphics.apply(renderer, "ember", "high", focus=(-10, -10, 10, 10))
+    env = renderer.environment
+    assert env.enabled and env.shadow_focus == (-10.0, -10.0, 10.0, 10.0)
+    assert env.sky_intensity == graphics.THEMES["ember"]["sky_intensity"]
+    low = Renderer()
+    graphics.apply(low, "ember", "low")
+    assert low.environment.enabled and not low.environment.reflections
+    assert low.environment.shadow_size < env.shadow_size
+    assert not graphics.apply(renderer, "ember", "classic") and not env.enabled
+    graphics.apply(renderer, "slate", "ultra")
+    graphics.clear(renderer)
+    assert not env.enabled
+
+    host = _game()
+    host.match = None
+    host._lit = None
+    host._light_scene({"renderer": renderer, "play_mode": True})
+    assert not env.enabled                      # no match: nothing to light
+
+
+def test_fill_lights_go_out_in_a_lit_match_and_come_back(fio_session):
+    from game import graphics
+    host = _game()
+    editor = fio_session(MAZES[0])
+    fills = [t for t in editor.state.things if t.properties.get(graphics.FILL_LIGHT)]
+    assert fills
+    editor.start_play().step(3)
+    assert host._quality != "classic"
+    assert all(t.properties.get("hidden") for t in fills)
+    editor.stop_play()
+    assert not any(t.properties.get("hidden") for t in fills)
+
+
+def test_cells_spin_and_their_glow_follows_them(fio_session):
+    host = _game()
+    editor = fio_session(MAZES[0])
+    cell = next(t for t in editor.state.things
+                if str(t.properties.get("type")) == "levitatepickup")
+    home, yaw = tuple(cell.pos), cell.properties["rotation"][1]
+    editor.start_play().step(20)
+    assert cell.properties["rotation"][1] != yaw
+    glow = host.match.glows[cell.properties["name"]]
+    player = host.api.player
+    player.teleport(tuple(cell.pos))
+    editor.step(3)
+    assert cell.properties.get("hidden") and glow.properties.get("hidden")
+    editor.stop_play()
+    assert tuple(cell.pos) == home and cell.properties["rotation"][1] == yaw
+    assert not glow.properties.get("hidden")
+
+
+def test_scenery_stands_outside_the_maze_and_off_the_radar(fio_session):
+    host = _game()
+    editor = fio_session(MAZES[0])
+    editor.start_play().step(2)
+    x0, z0, x1, z1 = host.match.bounds
+    scenery = [b for b in editor.state.brushes if str(b.get("name", "")).startswith("Scenery_")]
+    assert scenery
+    for brush in scenery:
+        x, _y, z = brush["pos"]
+        assert not (x0 < x < x1 and z0 < z < z1), brush["name"]
+    editor.stop_play()
+
+
+# -- random mazes -----------------------------------------------------------------
+def test_random_mazes_are_complete_in_every_world_and_size():
+    import random
+    from game import random_maze
+    rng = random.Random(11)
+    for index in range(40):
+        params = dict(world=list(random_maze.WORLDS)[index % 5], cols=rng.randint(5, 16),
+                      rows=rng.randint(5, 16), loops=rng.randint(0, 40),
+                      plazas=rng.randint(0, 6), ledges=rng.randint(0, 5),
+                      seed=rng.randint(1, 999999))
+        data = random_maze.generate(params)
+        kinds = [t["type"] for t in data["things"]]
+        assert kinds.count("levitaterules") == 1 and kinds.count("playerstart") == 1
+        teams = [t["properties"]["team"] for t in data["things"] if t["type"] == "levitateflag"]
+        assert teams.count("red") == 3 and teams.count("blue") == 3, params
+        rules = next(t for t in data["things"] if t["type"] == "levitaterules")
+        assert rules["properties"]["theme"] == params["world"]
+        assert data == random_maze.generate(params), "the same seed is the same maze"
+
+
+def test_the_editors_generator_makes_levitate_mazes(fio_session):
+    """Fio's random level generator, repurposed: its settings are a maze's,
+    out-of-range values from map data are brought into range, and what it
+    makes plays as a match."""
+    import random
+    from editor.procedural_generator import PARAM_LIMITS, create_map_data, sanitize_params
+    clean = sanitize_params({"cols": 999, "rows": "junk", "world": "nowhere", "loops": -5})
+    assert clean["cols"] == PARAM_LIMITS["cols"][1] and clean["loops"] == 0
+    assert clean["world"] == "random" and clean["rows"] == 9
+    random.seed(5)
+    first = create_map_data({"world": "frost", "cols": 6, "rows": 5})
+    random.seed(5)
+    assert first == create_map_data({"world": "frost", "cols": 6, "rows": 5})
+    host = _game()
+    editor = fio_session(first)
+    editor.start_play().step(5)
+    assert host.match is not None and len(host.match.rival_flags) == 3
+    assert host.match.theme == "frost"
+    editor.stop_play()
+
+
+def test_the_launcher_offers_a_random_maze_and_a_graphics_setting(tmp_path):
+    import configparser
+    import shutil
+    from game import graphics, random_maze
+    root = tmp_path / "install"
+    shutil.copytree(os.path.join(ROOT, "maps", "levitate"), root / "maps" / "levitate",
+                    ignore=shutil.ignore_patterns("_*"))
+    shutil.copytree(os.path.join(ROOT, "assets", "textures", "levitate"),
+                    root / "assets" / "textures" / "levitate",
+                    ignore=shutil.ignore_patterns("*.jpg", "*.png"))
+    settings = tmp_path / "settings.ini"
+    settings.write_text("[Display]\nhud_size = compact\n")
+    dialog = launcher.Launcher(str(root), str(settings))
+    assert dialog.graphics_combo.currentData() == graphics.DEFAULT_QUALITY
+    dialog.graphics_combo.setCurrentIndex(dialog.graphics_combo.findData("classic"))
+    config = configparser.ConfigParser()
+    config.read(settings)
+    assert graphics.quality_from(config) == "classic"
+    dialog.maze_combo.setCurrentIndex(dialog.maze_combo.findData(launcher.RANDOM_MAZE))
+    dialog._finish(launcher.PLAY)
+    chosen = launcher.chosen_map()
+    assert chosen == random_maze.RANDOM_FILE.replace(os.sep, "/")
+    data = json.load(open(root / chosen))
+    assert [t["type"] for t in data["things"]].count("levitaterules") == 1
+    # The random maze's own file is not one of the mazes to choose from.
+    assert len(launcher.maze_choices(str(root))) == 5
