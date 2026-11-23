@@ -105,11 +105,14 @@ def test_allowlisted_rpg_mentions_are_prose_only():
 
 
 def test_no_module_imports_a_game_package():
-    """Nothing in Fio may import MiniWind's `game` package."""
+    """Nothing in Fio may import the built-in game's `game` package (it is
+    loaded by name from [Startup] game_module). The game's own modules,
+    under game/, may of course import each other."""
     pattern = re.compile(r"^\s*(from\s+game[\s.]|import\s+game\b)", re.M)
     offenders = [str(p.relative_to(ROOT))
-                 for p in _iter_source() if pattern.search(
-                     p.read_text(encoding="utf-8", errors="replace"))]
+                 for p in _iter_source()
+                 if p.relative_to(ROOT).parts[:1] != ("game",)
+                 and pattern.search(p.read_text(encoding="utf-8", errors="replace"))]
     assert not offenders, f"game/ imports found: {offenders}"
 
 
