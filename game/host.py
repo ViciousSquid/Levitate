@@ -5,9 +5,10 @@ so it has a plugin's lifecycle -- register, register_runtime, connect,
 on_play_start, on_tick, on_play_stop -- without appearing in the Plugins menu.
 
 The match: every maze has a :class:`~game.entities.LevitateRules`. The player
-races to collect every rival-team flag before the clock runs out. Floor pads
-launch (spring), boost or raise a barrier; power-up orbs fill the dashboard's
-three system slots (1/2/3 to use).
+races to collect every rival-team flag before the clock runs out, while rival
+craft (game/bots.py; how many is the launcher's choice) try to carry off the
+player's own. Floor pads launch (spring), boost or load a barrier; power-up
+orbs fill the dashboard's three system slots (1/2/3 to use).
 """
 
 from __future__ import annotations
@@ -15,8 +16,9 @@ from __future__ import annotations
 import math
 import time
 
-from . import graphics
-from .entities import ENTITIES, POWERUPS
+from . import bots, graphics
+from .entities import ENTITIES, POWERUPS, LevitateBarrier
+from .spawns import SpawnPoints, place_player
 from .hover import HoverHandling
 
 FLAG_REACH = 72.0          # how close the craft must come to take a flag
@@ -38,12 +40,12 @@ class MatchState:
         self.player_team = "blue" if player_team == "blue" else "red"
         self.rival_team = "red" if self.player_team == "blue" else "blue"
         self.started = time.monotonic()
-        self.finished = None           # "win" / "timeout"
+        self.finished = None           # "win" / "timeout" / "lost"
         self.finished_at = None
         self.rival_flags = []          # [entity]
         self.home_flags = []
         self.taken = set()             # ids of rival flags collected
-        self.lost = set()              # ids of home flags lost (bots, later)
+        self.lost = set()              # ids of home flags the rivals delivered
         self.slots = [None] * SLOT_COUNT
         self.shield_until = 0.0
         self.phantom_until = 0.0
@@ -60,6 +62,7 @@ class MatchState:
         self.theme = str(props.get("theme", graphics.DEFAULT_THEME))
         self.glows = {}                # entity name -> its glow light
         self.homes = {}                # id(entity) -> (authored pos, yaw, phase)
+        self.rivals = []               # [(x, z, carrying a flag)] for the radar
 
     # -- derived -------------------------------------------------------------
     def elapsed(self, now=None):
@@ -93,6 +96,9 @@ class LevitateGame:
         self.host = None
         self.match = None
         self.handling = None
+        self.squad = None              # the rival craft (game/bots.py)
+        self.spawns = None             # the maze's spawn points (game/spawns.py)
+        self._player2 = None           # the player-2 craft last placed
         self._hud = None
         self._view = None              # the 3D view whose stock HUD we hide
         self._quality = graphics.DEFAULT_QUALITY
@@ -148,8 +154,58 @@ class LevitateGame:
                 player, props.get("hover_friction", 0.14), props.get("hover_accel", 0.35),
                 props.get("turn_rate", 150.0), props.get("wall_bounce", 0.55))
             self.handling.install()
+        # Every craft starts on a spawn point at random; the player first.
+        self.spawns = SpawnPoints(things)
+        self._player2 = None
+        occupied = []
+        if self.spawns and self.api is not None and self.api.player.exists:
+            place_player(self.api.player, self.spawns.pick())
+            occupied.append(tuple(self.api.player.position))
+        self.squad = self._start_rivals(logic, match, occupied)
         match.say(f"{match.title.upper()}  —  TAKE ALL {len(match.rival_flags)} "
                   f"{match.rival_team.upper()} FLAGS", 4.0)
+
+    def bot_count(self, logic=None):
+        """How many rival craft a match starts with: the launcher's
+        ``[Game] bots``, or :data:`game.bots.DEFAULT_BOTS`."""
+        config = self._config(logic) or self._settings_file()
+        return bots.bots_from(config) if config is not None else bots.DEFAULT_BOTS
+
+    @staticmethod
+    def _settings_file():
+        """settings.ini as the launcher wrote it, for when no editor window
+        can be asked (so a 0 chosen there is never taken for the default)."""
+        import configparser
+        import os
+        try:
+            from editor.user_paths import settings_path
+            path = settings_path(os.getcwd())
+        except Exception:
+            path = os.path.join(os.getcwd(), "settings.ini")
+        config = configparser.ConfigParser(interpolation=None)
+        try:
+            return config if config.read(path) else None
+        except (configparser.Error, OSError):
+            return None
+
+    def _start_rivals(self, logic, match, occupied=()):
+        """Put the rival craft into the maze. A failure here costs the match
+        its rivals, never the match."""
+        count = self.bot_count(logic)
+        if count <= 0:
+            return None
+        squad = bots.Squad(logic, count)
+        try:
+            if squad.start(match, self.spawns, occupied):
+                match.rivals = squad.radar()
+                return squad
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"[Levitate] no rival craft: {exc}")
+            try:
+                squad.stop(match)
+            except Exception:
+                pass
+        return None
 
     def on_play_stop(self, logic):
         if self._view is not None:
@@ -159,6 +215,9 @@ class LevitateGame:
         if self.handling is not None:
             self.handling.remove()
         self.handling = None
+        if self.squad is not None:
+            self.squad.stop(self.match)
+        self.squad = None
         # Restore everything the match hid or moved, so the edited map is
         # unchanged.
         if self.match is not None:
@@ -175,8 +234,28 @@ class LevitateGame:
         self.match = None
 
     # -- the look of a match ----------------------------------------------------
-    def _config(self):
-        return getattr(getattr(self.host, "editor", None), "config", None)
+    def _config(self, logic=None):
+        """The editor window's settings (settings.ini as the launcher left
+        it). The plugin host knows no window during play, so the window
+        showing *logic*'s scene is looked for among the application's."""
+        window = getattr(self.host, "editor", None) or self._window_for(logic)
+        return getattr(window, "config", None)
+
+    @staticmethod
+    def _window_for(logic):
+        state = getattr(logic, "editor_state", None)
+        if state is None:
+            return None
+        try:
+            from PyQt5.QtWidgets import QApplication
+            app = QApplication.instance()
+            widgets = app.topLevelWidgets() if app is not None else []
+        except Exception:  # pragma: no cover - the Qt-free player
+            return None
+        for widget in widgets:
+            if getattr(widget, "state", None) is state and hasattr(widget, "config"):
+                return widget
+        return None
 
     def _dress(self, logic, match, things):
         """What a match changes about how the maze looks: its fill lights go
@@ -184,7 +263,7 @@ class LevitateGame:
         flag is paired with its glow, and their resting places are noted for
         the bob and spin."""
         from plugins.api import set_flag
-        config = self._config()
+        config = self._config(logic)
         self._quality = graphics.quality_from(config) if config is not None else graphics.DEFAULT_QUALITY
         renderer = getattr(getattr(getattr(self.host, "editor", None), "view_3d", None),
                            "renderer", None)
@@ -318,6 +397,12 @@ class LevitateGame:
         if self.handling is not None and match.finished is None:
             self.handling.tick(state, ctx, delta)
             match.bonk = self.handling.bonk
+        if self.squad is not None:
+            self.squad.tick(match, state, delta, now, self.handling)
+            match.rivals = self.squad.radar()
+            if self.handling is not None:
+                match.bonk = max(match.bonk, self.handling.bonk)
+        self._place_player2(logic, state)
         pos = tuple(state.position)
         match.player_pos = pos
         match.player_yaw = float(state.yaw)
@@ -330,11 +415,25 @@ class LevitateGame:
         self._collect_flags(match, pos)
         self._pads(logic, match, state, pos, now)
         self._pickups(logic, match, pos, now)
-        self._use_slots(match, ctx, now)
+        self._use_slots(match, ctx, now, pos)
         remaining = match.remaining(now)
         if remaining is not None and remaining <= 0.0:
             match.finished, match.finished_at = "timeout", now
             match.say("TIME UP  —  PRESS R TO RETRY", 999)
+
+    def _place_player2(self, logic, state):
+        """Player 2 (split-screen) joins on a spawn point at random, as every
+        craft does, once a rival has made room."""
+        runtime = getattr(logic, "player_runtime", None)
+        p2 = getattr(runtime, "player2", None)
+        if p2 is self._player2:
+            return
+        self._player2 = p2
+        if p2 is None or not self.spawns:
+            return
+        humans = [tuple(state.position)]
+        taken = self.squad.occupied(humans) if self.squad is not None else humans
+        place_player(p2, self.spawns.pick(taken))
 
     def _collect_flags(self, match, pos):
         from plugins.api import set_flag
@@ -410,18 +509,37 @@ class LevitateGame:
                 return True
         return False
 
-    def _use_slots(self, match, ctx, now):
+    def _use_slots(self, match, ctx, now, pos=None):
         for i in range(SLOT_COUNT):
             kind = match.slots[i]
             if kind is None or not ctx.key_down(str(i + 1)):
                 continue
             match.slots[i] = None
+            message = f"{kind.upper()} ENGAGED"
             if kind == "shield":
                 match.shield_until = now + SHIELD_SECONDS
             elif kind == "phantom":
                 match.phantom_until = now + PHANTOM_SECONDS
-            # barrier and jammer act on rival craft, which arrive with the bots.
-            match.say(f"{kind.upper()} ENGAGED", 1.4)
+            elif kind == "jammer":
+                caught = self.squad.jam(pos or match.player_pos) if self.squad else 0
+                message = (f"JAMMER  —  {caught} RIVAL{'S' if caught != 1 else ''} STALLED"
+                           if caught else "JAMMER  —  NO RIVALS IN RANGE")
+            elif kind == "barrier":
+                self._drop_barrier(pos or match.player_pos)
+                message = "BARRIER DROPPED"
+            match.say(message, 1.4)
+
+    def _drop_barrier(self, pos):
+        """A barrier where the craft is: rival craft cannot cross it."""
+        if self.squad is None:
+            return
+        x, y, z = pos
+        prop = None
+        try:
+            prop = self.api.spawn(LevitateBarrier, (x, y + 20.0, z))
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"[Levitate] barrier not drawn: {exc}")
+        self.squad.drop_barrier(pos, prop)
 
     def _restart(self, logic, state):
         """Back to the start: flags and orbs return, the clock restarts."""
@@ -436,7 +554,9 @@ class LevitateGame:
             if str(thing.properties.get("type", "")).lower() == "playerstart":
                 start = thing
                 break
-        if start is not None:
+        if self.spawns:
+            place_player(state, self.spawns.pick())
+        elif start is not None:
             x, y, z = start.pos
             state.teleport((x, y + 30, z))
             state.yaw = math.radians(float(start.properties.get("angle", 0.0)))
@@ -445,6 +565,14 @@ class LevitateGame:
         self.match.rival_flags, self.match.home_flags = old.rival_flags, old.home_flags
         self.match.walls, self.match.bounds = old.walls, old.bounds
         self.match.glows, self.match.homes = old.glows, old.homes
+        if self.squad is not None:
+            humans = [tuple(state.position)]
+            p2 = getattr(logic.player_runtime, "player2", None)
+            if p2 is not None and self.spawns:
+                place_player(p2, self.spawns.pick(humans))
+                humans.append(tuple(float(v) for v in p2.pos))
+            self.squad.reset(self.match, humans)
+            self.match.rivals = self.squad.radar()
         self.match.say("GO!", 1.5)
 
     # -- HUD ---------------------------------------------------------------------

@@ -13,9 +13,9 @@ Fio is the engine powering a total conversion here: Levitate! is built in and
 always on, not an optional plugin. The editor that builds the mazes is one
 click away in the launcher.
 
-> **Status.** Five worlds, random mazes and the full rule set for a solo
-> time trial, drawn with a sun, a sky, shadows and photo-scanned materials.
-> Sound and rival hovercraft (bots) are next.
+> **Status.** Five worlds, random mazes, rival hovercraft (bots) and the
+> full rule set, drawn with a sun, a sky, shadows and photo-scanned
+> materials. Sound is next.
 
 ## Play it
 
@@ -36,7 +36,8 @@ The launcher offers **PLAY**, **EDIT** or **Quit**:
   **Levitate!** in the entity menus.
 
 The launcher also chooses the **maze** (any of the five worlds, or **Random
-maze**: a new one every time), the **graphics** quality (below) and the **HUD
+maze**: a new one every time), how many **rival craft** each match starts
+with (0–7, default 3; `[Game] bots`), the **graphics** quality (below) and the **HUD
 size** (Compact, the default, or the original full-width Large; also in the
 pause menu). Everything is written back to `settings.ini`, the same keys the
 editor's Settings window uses.
@@ -62,6 +63,36 @@ over a rival flag to take it; take all three before the clock runs out.
 | <img src="assets/textures/levitate/pad_barrier.png" width="40"> Barrier | Loads a barrier into a free slot | <img src="game/assets/icons/barrier.png" width="32"> Barrier · <img src="game/assets/icons/jammer.png" width="32"> Jammer | Act on rival craft (with the bots) |
 
 Cells fill the dashboard's three **system** slots; use them with **1–3**.
+
+### Rival craft
+
+Every match starts with rival hovercraft on the other team (the launcher's
+**Rival craft**, default 3; **None** means no rivals spawn at all: a solo time
+trial).
+
+* **Raiders** go for your red flags, pick one up and carry it to the nearest
+  blue flag. **Ram a carrier** to knock the flag loose: it goes straight back
+  to its pole. If they deliver all three, the match is lost.
+* **Defenders** patrol their own flags and ram you on sight.
+* **Phantom** hides you from them, **Jammer** stalls every rival nearby for
+  6 s, and **Barrier** drops a wall of force behind you that they cannot cross
+  for 15 s.
+
+**Spawn points.** Every maze has eight (`levitatespawn`), one per seat, spread
+over the whole maze. Nobody owns one: at the start of a match and on every
+retry, you and each rival start on one chosen at random, never one another
+craft is on, and player 2 (split-screen, F9) joins on a free one too.
+
+**Seats.** A match has eight seats, human and rival craft together. When it is
+full and another human joins, a rival leaves to make room: one not carrying a
+flag, a defender before a raider. It comes back when the seat is free again.
+
+They find their way over the maze's **navigation nodes** (`levitatenode`, one
+per open cell, linked to its open neighbours), which `make_mazes.py` and the
+random maze generator place in every maze, with the spawn points. In EDIT
+they are under **Levitate! ▸ Navigation Node** and **Spawn Point**; a
+hand-built maze without nodes still works, steered by its walls alone, and
+one without spawn points starts you at its PlayerStart. Tuning is at the top of `game/bots.py`.
 
 ## The worlds
 
@@ -156,6 +187,8 @@ The launcher is 1990s synthwave on blacklight bowling-alley carpet.
 | `game/host.py` | Rules, flags, pads, cells, the match's lighting and the HUD hook (a Fio *built-in game*) |
 | `game/graphics.py` | The look of each world and the graphics qualities |
 | `game/random_maze.py` | Random mazes: settings, the maze, the launcher's entry |
+| `game/bots.py` | The rival craft: navigation over the maze's nodes, raiding, ramming, seats, power cells |
+| `game/spawns.py` | Spawn points: every craft starts on one at random |
 | `game/hover.py` | Glide, steering and wall bounce on top of Fio's player physics |
 | `game/ui/hud.py`, `hud_layout.py` | The cockpit HUD, painted through `render.overlay` |
 | `maps/levitate/` | The mazes |

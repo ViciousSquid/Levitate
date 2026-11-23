@@ -121,9 +121,55 @@ class LevitatePad(Thing):
         self.properties.setdefault("strength", 520.0)
 
 
+class LevitateNode(Thing):
+    """A navigation node: where rival craft can drive (game/bots.py).
+
+    Nodes stand on the floor of the maze; ``links`` names, comma-separated,
+    the nodes a craft can drive to from this one in a straight line (a link
+    goes both ways when either end names it). The mazes have one per open
+    cell, made by game/tools/make_mazes.py; a hand-built maze without any
+    still plays, its rivals steering by the walls alone."""
+    pixmap_path = "assets/sprites/levitate/nav_node.png"
+    editor_sprite_path = pixmap_path
+
+    def __init__(self, pos=None, properties=None):
+        super().__init__(pos, properties)
+        self.properties["type"] = "levitatenode"
+        self.properties.setdefault("links", "")
+
+
+class LevitateSpawn(Thing):
+    """A spawn point (game/spawns.py). Every maze has eight, one per seat;
+    each craft in a match -- player or rival -- starts on one chosen at
+    random. Stands on the floor; ``angle`` is the heading, in degrees, as a
+    PlayerStart's."""
+    pixmap_path = "assets/sprites/player.png"
+
+    def __init__(self, pos=None, properties=None):
+        super().__init__(pos, properties)
+        self.properties["type"] = "levitatespawn"
+        self.properties.setdefault("angle", 0.0)
+
+
+class LevitateBarrier(Prop):
+    """A barrier a craft has dropped: a wall of force rival craft cannot
+    cross (game/bots.py). Made in play from a power cell, never placed in a
+    map, so it is not in :data:`ENTITIES`."""
+
+    def __init__(self, pos=None, properties=None):
+        super().__init__(pos, properties)
+        self.properties["type"] = "levitatebarrier"
+        self.properties.setdefault("rotation", [0.0, 0.0, 0.0])
+        self.properties.update(_MODEL_PROP, model_path=model("orb_barrier.obj"),
+                               sprite_path=sprite("pickup_barrier.png"),
+                               sprite_size=[160, 160], scale=[2.8, 2.8, 2.8])
+
+
 ENTITIES = (
     (LevitateRules, "Maze Rules"),
     (LevitateFlag, "Flag"),
     (LevitatePickup, "Power-up"),
     (LevitatePad, "Pad"),
+    (LevitateNode, "Navigation Node"),
+    (LevitateSpawn, "Spawn Point"),
 )

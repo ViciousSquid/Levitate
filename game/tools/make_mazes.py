@@ -14,7 +14,11 @@ a few hundred brushes. On top of the layout go:
 * the masonry that makes a wall a wall: a pier wherever walls meet and at
   every corner, and coping stones along the top,
 * lights: a glow at every pad, cell and flag, and a grid of fill lights for
-  the ``classic`` renderer (a lit match hides them; see game/graphics.py).
+  the ``classic`` renderer (a lit match hides them; see game/graphics.py),
+* navigation nodes for the rival craft: one in every open cell, linked to
+  the cells it opens onto (ledge tops are left out: craft stay on the floor),
+* eight spawn points spread over the whole maze, one per seat; every craft
+  starts a match on one chosen at random (game/spawns.py).
 
 Every face is mapped at its material's real size (:data:`TILE`). The
 materials are photo-scanned surfaces from Poly Haven
@@ -28,6 +32,7 @@ them and re-run.
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import uuid
@@ -496,7 +501,69 @@ def build(spec):
                     CELL * 2.6, **{FILL_LIGHT: True})
 
     scenery(b, world, wall_name, cap_name, width, depth)
+    # Last, so everything above keeps the ids and the layout it always had.
+    navigation(b, cols, rows, east, north, centre, set(ledges))
+    flags = set(rival) | set(home)
+    spawn_points(b, cols, rows, east, north, centre, start, used, plaza_cells,
+                 blocked=flags | set(ledges))
     return {"version": 3, "brushes": b.brushes, "things": b.things}
+
+
+#: Spawn points in a maze (game.spawns.SPAWN_COUNT): one per seat.
+SPAWNS = 8
+
+
+def spawn_points(b, cols, rows, east, north, centre, start, used, plaza_cells, blocked):
+    """:data:`SPAWNS` spawn points (``levitatespawn``), spread over the maze
+    as far from each other as they can be: the start cell first, then each
+    next the cell farthest from those already chosen. Empty cells come first;
+    in a maze too small for that, a cell holding a pad or a cell goes, off
+    to one side of it. Never a flag's cell or a ledge, or the cell before a
+    ledge (its spring)."""
+    def heading(cell):
+        nxt = open_cells(cell, east, north, cols, rows)
+        if not nxt:
+            return 0.0
+        dc, dr = nxt[0][0] - cell[0], nxt[0][1] - cell[1]
+        return {(1, 0): 90.0, (-1, 0): 270.0, (0, 1): 0.0, (0, -1): 180.0}[(dc, dr)]
+
+    cells = [(c, r) for r in range(rows) for c in range(cols)
+             if (c, r) not in blocked and (c, r) != start]
+    clear = {cell for cell in cells if cell not in used or cell in plaza_cells}
+    chosen = [start]
+    while len(chosen) < min(SPAWNS, len(cells) + 1):
+        def score(cell):
+            nearest = min(math.hypot(cell[0] - o[0], cell[1] - o[1]) for o in chosen)
+            return nearest - (0.0 if cell in clear else 1.5)
+        best = max((cell for cell in cells if cell not in chosen), key=score)
+        chosen.append(best)
+    for i, cell in enumerate(chosen):
+        x, z = centre(*cell)
+        if cell in used and cell not in plaza_cells and cell != start:
+            # Beside what is in the middle of the cell, not on it.
+            x, z = x + CELL * 0.27, z + CELL * 0.27
+        b.thing("levitatespawn", f"Spawn_{i + 1}", (x, 0, z), angle=heading(cell))
+
+
+#: How high a navigation node stands: on the floor, under a craft's hull.
+NODE_Y = 16
+
+
+def navigation(b, cols, rows, east, north, centre, ledges=()):
+    """The rival craft's navigation nodes (``levitatenode``): one at the
+    centre of every cell, linked to each neighbour it opens onto. A ledge's
+    top is not on the floor, so it has none and nothing links to it."""
+    def name(cell):
+        return f"Nav_{cell[0]}_{cell[1]}"
+
+    for r in range(rows):
+        for c in range(cols):
+            if (c, r) in ledges:
+                continue
+            links = [name(n) for n in open_cells((c, r), east, north, cols, rows)
+                     if n not in ledges]
+            x, z = centre(c, r)
+            b.thing("levitatenode", name((c, r)), (x, NODE_Y, z), links=",".join(links))
 
 
 def scenery(b, world, wall_name, cap_name, width, depth):

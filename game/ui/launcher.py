@@ -31,6 +31,8 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                              QFormLayout, QFrame, QHBoxLayout, QLabel,
                              QPushButton, QSizePolicy, QVBoxLayout, QWidget)
 
+from ..bots import DEFAULT_BOTS
+
 PLAY = "play"
 EDIT = "edit"
 QUIT = "quit"
@@ -65,6 +67,7 @@ DEFAULTS = {
     "high_dpi_scaling": False,
     "hud_size": "compact",
     "graphics": "high",
+    "bots": DEFAULT_BOTS,
 }
 
 #: Where the launcher looks for mazes, relative to the install folder.
@@ -281,10 +284,15 @@ class DisplaySettings:
     # -- write -----------------------------------------------------------
     def save(self, mode: str, width: int, height: int, vsync: bool,
              high_dpi: bool = None, maze: str = None, hud_size: str = None,
-             graphics: str = None) -> None:
+             graphics: str = None, bots: int = None) -> None:
         for section in ("Kiosk", "Display", "Renderer"):
             if not self.config.has_section(section):
                 self.config.add_section(section)
+        if bots is not None:
+            from ..bots import SETTINGS_KEY, SETTINGS_SECTION
+            if not self.config.has_section(SETTINGS_SECTION):
+                self.config.add_section(SETTINGS_SECTION)
+            self.config.set(SETTINGS_SECTION, SETTINGS_KEY, str(int(bots)))
         if hud_size:
             self.config.set("Display", "hud_size", str(hud_size))
         if graphics:
@@ -309,12 +317,18 @@ class DisplaySettings:
         self.save(DEFAULTS["window_mode"], DEFAULTS["res_width"],
                   DEFAULTS["res_height"], DEFAULTS["vsync"],
                   DEFAULTS["high_dpi_scaling"], hud_size=DEFAULTS["hud_size"],
-                  graphics=DEFAULTS["graphics"])
+                  graphics=DEFAULTS["graphics"], bots=DEFAULTS["bots"])
 
     @property
     def graphics(self) -> str:
         from ..graphics import quality_from
         return quality_from(self.config)
+
+    @property
+    def bots(self) -> int:
+        """How many rival craft a match starts with (``[Game] bots``)."""
+        from ..bots import bots_from
+        return bots_from(self.config)
 
     @property
     def hud_size(self) -> str:
@@ -551,6 +565,18 @@ class Launcher(QDialog):
         self.maze_combo.currentIndexChanged.connect(self._save)
         form.addRow("Maze", self.maze_combo)
 
+        from ..bots import MAX_BOTS
+        self.bots_combo = QComboBox()
+        self.bots_combo.addItem("None  (time trial)", 0)
+        for count in range(1, MAX_BOTS + 1):
+            self.bots_combo.addItem(str(count), count)
+        self.bots_combo.setToolTip(
+            "How many rival hovercraft each match starts with. Raiders try to\n"
+            "carry off your flags (ram a carrier to win the flag back);\n"
+            "defenders guard their own. None is a solo time trial.")
+        self.bots_combo.currentIndexChanged.connect(self._save)
+        form.addRow("Rival craft", self.bots_combo)
+
         from .hud import HUD_SIZES
         self.hud_combo = QComboBox()
         for value, (label, _share, _cap) in HUD_SIZES.items():
@@ -609,7 +635,8 @@ class Launcher(QDialog):
         self.reset_button = QPushButton("Reset to defaults")
         self.reset_button.setToolTip(
             f"Back to {DEFAULTS['window_mode']}, "
-            f"{DEFAULTS['res_width']}×{DEFAULTS['res_height']}, vsync on, compact HUD.")
+            f"{DEFAULTS['res_width']}×{DEFAULTS['res_height']}, vsync on, compact HUD, "
+            f"{DEFAULTS['bots']} rival craft.")
         self.reset_button.clicked.connect(self._reset)
         buttons.addWidget(self.reset_button)
         buttons.addStretch(1)
@@ -731,6 +758,8 @@ class Launcher(QDialog):
         index = self.maze_combo.findData(last) if last else -1
         self.maze_combo.setCurrentIndex(max(0, index))
         self.hud_combo.setCurrentIndex(max(0, self.hud_combo.findData(self.settings.hud_size)))
+        self.bots_combo.setCurrentIndex(
+            max(0, self.bots_combo.findData(self.settings.bots)))
         self.graphics_combo.setCurrentIndex(
             max(0, self.graphics_combo.findData(self.settings.graphics)))
         self.high_dpi_note.setVisible(False)
@@ -784,7 +813,8 @@ class Launcher(QDialog):
                            self.high_dpi_check.isChecked(),
                            self.maze_combo.currentData(),
                            self.hud_combo.currentData(),
-                           self.graphics_combo.currentData())
+                           self.graphics_combo.currentData(),
+                           self.bots_combo.currentData())
 
     def _reset(self):
         self.settings.reset()
