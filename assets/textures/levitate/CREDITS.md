@@ -13,6 +13,10 @@ Fetched at 1k by `game/tools/fetch_textures.py`.
 | `floor_sand` | [Gravelly Sand](https://polyhaven.com/a/gravelly_sand) | Dario Barresi |
 | `wall_moss` | [Castle Brick 01](https://polyhaven.com/a/castle_brick_01) | Rob Tuytel |
 | `floor_moss` | [Mossy Cobblestone](https://polyhaven.com/a/mossy_cobblestone) | Sơn Nguyễn |
+| `wall_frost` | [Rock Wall 08](https://polyhaven.com/a/rock_wall_08) | Amal Kumar |
+| `floor_frost` | [Snow 02](https://polyhaven.com/a/snow_02) | Rob Tuytel |
+| `wall_ember` | [Rusty Corrugated Iron](https://polyhaven.com/a/rusty_corrugated_iron) | Charlotte Baglioni |
+| `floor_ember` | [Metal Plate](https://polyhaven.com/a/metal_plate) | Rob Tuytel |
 | `cap_stone` | [Concrete Wall 008](https://polyhaven.com/a/concrete_wall_008) | Charlotte Baglioni, Dario Barresi |
 | `trim_metal` | [Metal Plate 02](https://polyhaven.com/a/metal_plate_02) | Rob Tuytel |
 

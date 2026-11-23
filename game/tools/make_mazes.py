@@ -56,7 +56,40 @@ MAZES = [
          loops=0.12, plazas=2, ledges=2, theme="sand", time_limit=300),
     dict(file="Mossgarden", title="Mossgarden", order=3, seed=3313, cols=11, rows=9,
          loops=0.18, plazas=3, ledges=3, theme="moss", time_limit=330),
+    dict(file="Frostline", title="Frostline", order=4, seed=4421, cols=12, rows=10,
+         loops=0.16, plazas=3, ledges=3, theme="frost", time_limit=360),
+    dict(file="Emberworks", title="Emberworks", order=5, seed=5519, cols=12, rows=11,
+         loops=0.14, plazas=4, ledges=3, theme="ember", time_limit=390),
 ]
+
+#: What each world is built of and stands among. A world has its own walls
+#: and floor (``wall_<theme>`` / ``floor_<theme>``); here are the material of
+#: its coping, the lamps on its piers (``None``: daylight needs none) and the
+#: scenery beyond its walls -- ``(count, tiers, top)`` per kind, each tier a
+#: ``(width, height)`` box stacked on the last, *top* an optional glow colour.
+WORLDS = {
+    # A harbour: a lighthouse and the concrete pylons of the breakwater.
+    "slate": dict(cap="cap_stone", lamps=None, scenery=[
+        (1, [(300, 520), (250, 460), (200, 420), (230, 26)], [255, 244, 200]),
+        (6, [(420, 430), (300, 150)], None)]),
+    # Desert ruins: stepped temples and obelisks.
+    "sand": dict(cap="cap_stone", lamps=None, scenery=[
+        (2, [(980, 400), (740, 190), (500, 190), (280, 170)], None),
+        (5, [(150, 760), (110, 420), (60, 130)], None)]),
+    # A walled garden: the brick towers of the old house.
+    "moss": dict(cap="cap_stone", lamps=None, scenery=[
+        (3, [(380, 640), (430, 34), (240, 260), (280, 30)], None),
+        (4, [(260, 520), (300, 30)], None)]),
+    # High country: crags under snow.
+    "frost": dict(cap="floor_frost", lamps=None, scenery=[
+        (8, [(620, 420), (460, 330), (300, 300), (150, 230)], None)]),
+    # A foundry at night: chimney stacks with warning lights, lamps on
+    # every other pier.
+    "ember": dict(cap="trim_metal", lamps=[255, 168, 84], scenery=[
+        (6, [(240, 560), (200, 520), (165, 480)], [255, 40, 30]),
+        (2, [(900, 460), (700, 60)], [255, 150, 70])]),
+}
+SCENERY = "Scenery_"                   # brushes beyond the walls: not on the radar
 
 
 #: Wall piers and the coping along the top of the walls.
@@ -94,6 +127,15 @@ def tex(name):
 
 def tile_of(name):
     return TILE[name]
+
+
+def glow_box(colour, intensity=3.0, radius=0.0):
+    """How a brush glows: a lamp's glass, a warning light. With *radius* it
+    lights its surroundings too."""
+    look = {"shader": "Glow", "colour": list(colour), "glow_intensity": intensity}
+    if radius:
+        look.update(emissive=True, emissive_intensity=1.4, emissive_radius=radius)
+    return look
 
 
 def material(size, side, top=None, bottom=None, shift=0.0, fit_top=False):
@@ -146,6 +188,10 @@ class Builder:
                               for tag, pair in look[key].items()}
         if look.get("uv_angle"):
             entry["uv_angle"] = dict(look["uv_angle"])
+        for key in ("shader", "colour", "glow_intensity", "emissive",
+                    "emissive_intensity", "emissive_radius"):
+            if key in look:
+                entry[key] = look[key]
         self.brushes.append(entry)
 
     def light(self, name, pos, colour, intensity, radius, **props):
@@ -232,7 +278,7 @@ def build(spec):
     plazas = []
     for _ in range(spec["plazas"]):
         c = rng.randrange(1, cols - 2)
-        r = rng.randrange(cols // 3 if rows > 4 else 1, rows - 2)
+        r = rng.randrange(min(cols // 3 if rows > 4 else 1, rows - 3), rows - 2)
         east.discard((c, r)); east.discard((c, r + 1))
         north.discard((c, r)); north.discard((c + 1, r))
         plazas.append((c, r))
@@ -244,18 +290,19 @@ def build(spec):
         return (x0 + (c + 0.5) * CELL, z0 + (r + 0.5) * CELL)
 
     theme = spec["theme"]
-    wall_name, floor_name = f"wall_{theme}", f"floor_{theme}"
+    world = WORLDS[theme]
+    wall_name, floor_name, cap_name = f"wall_{theme}", f"floor_{theme}", world["cap"]
     piers = set()                       # lattice points where a wall ends or turns
 
     def wall(name, pos, size, lattice):
         """A wall run, the coping along its top and the piers it meets."""
-        b.brush(name, pos, size, material(size, wall_name, top="cap_stone",
+        b.brush(name, pos, size, material(size, wall_name, top=cap_name,
                                           shift=round(rng.random(), 3)))
         along_x = size[0] > size[2]
         cap = ((size[0] + 2 * CAP_OVERHANG, CAP_H, WALL_T + 2 * CAP_OVERHANG) if along_x else
                (WALL_T + 2 * CAP_OVERHANG, CAP_H, size[2] + 2 * CAP_OVERHANG))
         b.brush("Cap_" + name[5:], (pos[0], WALL_H + CAP_H / 2, pos[2]), cap,
-                material(cap, "cap_stone", shift=round(rng.random(), 3)))
+                material(cap, cap_name, shift=round(rng.random(), 3)))
         piers.update(lattice)
 
     floor_size = (width + WALL_T, 64, depth + WALL_T)
@@ -307,10 +354,21 @@ def build(spec):
         px, pz = x0 + c * CELL, z0 + r * CELL
         size = (PIER_T, PIER_H, PIER_T)
         b.brush(f"Pier_{c}_{r}", (px, PIER_H / 2, pz), size,
-                material(size, wall_name, top="cap_stone", shift=round(rng.random(), 3)))
+                material(size, wall_name, top=cap_name, shift=round(rng.random(), 3)))
         cap = (PIER_T + 2 * CAP_OVERHANG, CAP_H, PIER_T + 2 * CAP_OVERHANG)
         b.brush(f"PierCap_{c}_{r}", (px, PIER_H + CAP_H / 2, pz), cap,
-                material(cap, "cap_stone"))
+                material(cap, cap_name))
+        if world["lamps"] and (c + r) % 2 == 0:
+            # A lamp on the pier: a caged glass over a steel foot, and the
+            # light it throws down into the corridors, shadows and all.
+            top = PIER_H + CAP_H
+            foot, glass = (30, 10, 30), (22, 26, 22)
+            b.brush(f"LampFoot_{c}_{r}", (px, top + 5, pz), foot, material(foot, "trim_metal"))
+            b.brush(f"Lamp_{c}_{r}", (px, top + 23, pz), glass,
+                    dict(material(glass, "trim_metal"), **glow_box(world["lamps"], 3.2)))
+            b.thing("light", f"LampLight_{c}_{r}", (px, top + 52, pz), intensity=1.5,
+                    radius=CELL * 1.9, colour=list(world["lamps"]), state="on",
+                    casts_shadows=True, shadow_softness=2.5)
 
     # -- placement --------------------------------------------------------------
     start = (0, 0)
@@ -332,6 +390,13 @@ def build(spec):
             used.add(cell)
             if len(chosen) == count:
                 break
+        return chosen
+
+    def spare(count, key):
+        """*count* more cells where the rules above found too few (a very
+        small maze): any cell not yet taken, however close to the others."""
+        chosen = [cell for cell in sorted(dist, key=key) if cell not in used][:max(count, 0)]
+        used.update(chosen)
         return chosen
 
     sx, sz = centre(*start)
@@ -368,6 +433,7 @@ def build(spec):
     rival = pick(dead_ends, key=lambda cell: -dist[cell], count=3)
     if len(rival) < 3:
         rival += pick(dist, key=lambda cell: -dist[cell], count=3 - len(rival))
+    rival += spare(3 - len(rival), key=lambda cell: -dist[cell])
     for i, cell in enumerate(rival):
         flag(f"Flag_Blue_{i + 1}", cell, "blue")
     # Home flags: dead ends in the near half.
@@ -375,6 +441,7 @@ def build(spec):
     home = pick([c for c in dead_ends if c in near], key=lambda cell: dist[cell], count=3)
     if len(home) < 3:
         home += pick([c for c in near if c != start], key=lambda cell: -dist[cell], count=3 - len(home))
+    home += spare(3 - len(home), key=lambda cell: dist[cell])
     for i, cell in enumerate(home):
         flag(f"Flag_Red_{i + 1}", cell, "red")
 
@@ -390,7 +457,7 @@ def build(spec):
                 material(body, wall_name, top=floor_name))
         edge = (size + 10, lip, size + 10)
         b.brush(f"LedgeEdge_{i + 1}", (x, LEDGE_H - lip / 2, z), edge,
-                material(edge, "cap_stone", top=floor_name))
+                material(edge, cap_name, top=floor_name))
         cell_orb(f"Ledge_Orb_{i + 1}", (x, LEDGE_H + 40, z), rewards[i % len(rewards)], 25.0)
         before = open_cells(cell, east, north, cols, rows)[0]
         used.add(before)
@@ -428,7 +495,41 @@ def build(spec):
             b.light(f"Light_{c}_{r}", (x, WALL_H + 120, z), [220, 230, 255], 1.5,
                     CELL * 2.6, **{FILL_LIGHT: True})
 
+    scenery(b, world, wall_name, cap_name, width, depth)
     return {"version": 3, "brushes": b.brushes, "things": b.things}
+
+
+def scenery(b, world, wall_name, cap_name, width, depth):
+    """What stands beyond the walls and rises above them: each world's own
+    skyline, set round the maze. Nothing here can be reached; it is there to
+    be seen over the walls, and to throw long shadows."""
+    rng = b.rng
+    pieces = [(tiers, glow) for count, tiers, glow in world["scenery"] for _ in range(count)]
+    rng.shuffle(pieces)
+    # Spread round the perimeter, a jittered share of it each.
+    perimeter = 2 * (width + depth)
+    for i, (tiers, glow) in enumerate(pieces):
+        along = (i + 0.2 + 0.6 * rng.random()) / len(pieces) * perimeter
+        out = WALL_T + tiers[0][0] / 2 + rng.uniform(140, 620)
+        if along < width:
+            x, z = -width / 2 + along, depth / 2 + out
+        elif along < width + depth:
+            x, z = width / 2 + out, depth / 2 - (along - width)
+        elif along < 2 * width + depth:
+            x, z = width / 2 - (along - width - depth), -depth / 2 - out
+        else:
+            x, z = -width / 2 - out, -depth / 2 + (along - 2 * width - depth)
+        y = -64.0
+        for tier, (wide, high) in enumerate(tiers):
+            high = high + (64 if tier == 0 else 0)
+            size = (wide, high, wide)
+            b.brush(f"{SCENERY}{i}_{tier}", (x, y + high / 2, z), size,
+                    material(size, wall_name, top=cap_name, shift=round(rng.random(), 3)))
+            y += high
+        if glow:
+            lamp = (tiers[-1][0] * 0.62, 46, tiers[-1][0] * 0.62)
+            b.brush(f"{SCENERY}{i}_light", (x, y + lamp[1] / 2, z), lamp,
+                    dict(material(lamp, "trim_metal"), **glow_box(glow, 3.0)))
 
 
 def main():

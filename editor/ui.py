@@ -811,7 +811,7 @@ class Ui_MainWindow(object):
         MainWindow.terrain_action.setToolTip('Open the terrain editor (low‑poly terrain generator)')
         MainWindow.terrain_action.triggered.connect(MainWindow.open_terrain_editor)
 
-        MainWindow.procedural_action = QAction('Procedural Map Generator…', MainWindow)
+        MainWindow.procedural_action = QAction('Random Maze Generator…', MainWindow)
         MainWindow.procedural_action.triggered.connect(MainWindow.show_procedural_map_generator)
         
         MainWindow.item_editor_action = QAction('Custom Items…', MainWindow)

@@ -64,6 +64,7 @@ DEFAULTS = {
     "vsync": True,
     "high_dpi_scaling": False,
     "hud_size": "compact",
+    "graphics": "high",
 }
 
 #: Where the launcher looks for mazes, relative to the install folder.
@@ -78,7 +79,9 @@ def maze_choices(root_dir: str = "."):
     folder = os.path.join(root_dir, MAZE_DIR)
     found = []
     try:
-        names = sorted(n for n in os.listdir(folder) if n.lower().endswith(".json"))
+        # A leading underscore is not a maze to list: the random maze's file.
+        names = sorted(n for n in os.listdir(folder)
+                       if n.lower().endswith(".json") and not n.startswith("_"))
     except OSError:
         return []
     for name in names:
@@ -98,6 +101,9 @@ def maze_choices(root_dir: str = "."):
         found.append((order, name, rel, title))
     return [(rel, title) for _order, _name, rel, title in sorted(found)]
 
+
+#: The maze picker's entry for a maze made on the spot (game/random_maze.py).
+RANDOM_MAZE = "random"
 
 #: The maze PLAY chose (relative path), for the bootstrap to open
 #: (game.launched_map).
@@ -268,12 +274,15 @@ class DisplaySettings:
 
     # -- write -----------------------------------------------------------
     def save(self, mode: str, width: int, height: int, vsync: bool,
-             high_dpi: bool = None, maze: str = None, hud_size: str = None) -> None:
-        for section in ("Kiosk", "Display"):
+             high_dpi: bool = None, maze: str = None, hud_size: str = None,
+             graphics: str = None) -> None:
+        for section in ("Kiosk", "Display", "Renderer"):
             if not self.config.has_section(section):
                 self.config.add_section(section)
         if hud_size:
             self.config.set("Display", "hud_size", str(hud_size))
+        if graphics:
+            self.config.set("Renderer", "graphics", str(graphics))
         if maze:
             if not self.config.has_section("Startup"):
                 self.config.add_section("Startup")
@@ -293,7 +302,13 @@ class DisplaySettings:
     def reset(self) -> None:
         self.save(DEFAULTS["window_mode"], DEFAULTS["res_width"],
                   DEFAULTS["res_height"], DEFAULTS["vsync"],
-                  DEFAULTS["high_dpi_scaling"], hud_size=DEFAULTS["hud_size"])
+                  DEFAULTS["high_dpi_scaling"], hud_size=DEFAULTS["hud_size"],
+                  graphics=DEFAULTS["graphics"])
+
+    @property
+    def graphics(self) -> str:
+        from ..graphics import quality_from
+        return quality_from(self.config)
 
     @property
     def hud_size(self) -> str:
@@ -441,6 +456,7 @@ class Launcher(QDialog):
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
         self.setWindowTitle("Levitate!")
         self.setModal(True)
+        self.root_dir = root_dir
         self.settings = DisplaySettings(
             settings_path or os.path.join(root_dir, "settings.ini"))
         self.choice = EDIT
@@ -495,7 +511,10 @@ class Launcher(QDialog):
         self._mazes = maze_choices(root_dir)
         for rel, title in self._mazes:
             self.maze_combo.addItem(title, rel)
-        self.maze_combo.setToolTip("The maze PLAY starts in.")
+        self.maze_combo.addItem("Random maze", RANDOM_MAZE)
+        self.maze_combo.setToolTip(
+            "The maze PLAY starts in. Random maze builds a new one each time:\n"
+            "any world, any layout.")
         # The maze picker stands out in very dark red, closed and open alike.
         self.maze_combo.setStyleSheet(
             f"QComboBox {{ background-color:{_MAZE_RED}; color:white;"
@@ -505,7 +524,7 @@ class Launcher(QDialog):
             f"QComboBox QAbstractItemView {{ background-color:{_MAZE_RED}; color:white;"
             f" selection-background-color:{_MAZE_RED_SELECTED}; selection-color:white;"
             f" border:1px solid {_MAZE_RED_BORDER}; }}")
-        self.maze_combo.setEnabled(bool(self._mazes))
+        self.maze_combo.setEnabled(True)
         self.maze_combo.currentIndexChanged.connect(self._save)
         form.addRow("Maze", self.maze_combo)
 
@@ -519,6 +538,17 @@ class Launcher(QDialog):
             "Also in the pause menu, where it changes at once.")
         self.hud_combo.currentIndexChanged.connect(self._save)
         form.addRow("HUD size", self.hud_combo)
+
+        from ..graphics import QUALITIES
+        self.graphics_combo = QComboBox()
+        for value, label in QUALITIES.items():
+            self.graphics_combo.addItem(label, value)
+        self.graphics_combo.setToolTip(
+            "How the mazes are lit and drawn: sun and sky, shadows, reflections,\n"
+            "relief on the walls. Lower it if the game does not run smoothly;\n"
+            "Classic is Fio's plain renderer.")
+        self.graphics_combo.currentIndexChanged.connect(self._save)
+        form.addRow("Graphics", self.graphics_combo)
         body.addLayout(form)
 
         self.mode_help = QLabel()
@@ -676,6 +706,8 @@ class Launcher(QDialog):
         index = self.maze_combo.findData(last) if last else -1
         self.maze_combo.setCurrentIndex(max(0, index))
         self.hud_combo.setCurrentIndex(max(0, self.hud_combo.findData(self.settings.hud_size)))
+        self.graphics_combo.setCurrentIndex(
+            max(0, self.graphics_combo.findData(self.settings.graphics)))
         self.high_dpi_note.setVisible(False)
         self._update_mode_help()
 
@@ -726,7 +758,8 @@ class Launcher(QDialog):
                            self.vsync_check.isChecked(),
                            self.high_dpi_check.isChecked(),
                            self.maze_combo.currentData(),
-                           self.hud_combo.currentData())
+                           self.hud_combo.currentData(),
+                           self.graphics_combo.currentData())
 
     def _reset(self):
         self.settings.reset()
@@ -738,9 +771,21 @@ class Launcher(QDialog):
     def _finish(self, choice: str):
         global _maze
         _maze = self.maze_combo.currentData() if choice == PLAY else None
+        if _maze == RANDOM_MAZE:
+            _maze = self._random_maze()
         self.choice = choice
         self._save()
         self.accept() if choice != QUIT else self.reject()
+
+    def _random_maze(self):
+        """Build a maze nobody has played and return its path; the first
+        shipped maze if it cannot be built (never no maze at all)."""
+        try:
+            from .. import random_maze
+            return random_maze.write(self.root_dir)
+        except Exception as exc:
+            print(f"[Levitate] no random maze: {exc}")
+            return self._mazes[0][0] if self._mazes else None
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:

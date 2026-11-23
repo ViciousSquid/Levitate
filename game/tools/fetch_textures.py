@@ -50,6 +50,12 @@ MATERIALS = {
     # Mossgarden: old mossy brick on moss-jointed cobbles.
     "wall_moss": dict(asset="castle_brick_01", parallax=2.5),
     "floor_moss": dict(asset="mossy_cobblestone", parallax=3.0),
+    # Frostline: dark dry-stone walls in deep snow.
+    "wall_frost": dict(asset="rock_wall_08", parallax=3.5),
+    "floor_frost": dict(asset="snow_02", parallax=2.0),
+    # Emberworks: rusted corrugated iron over steel tread plate.
+    "wall_ember": dict(asset="rusty_corrugated_iron", parallax=1.5),
+    "floor_ember": dict(asset="metal_plate", parallax=0.4),
     # Shared: the coping along the walls, and worn steel plate.
     "cap_stone": dict(asset="concrete_wall_008", parallax=0.4),
     "trim_metal": dict(asset="metal_plate_02", parallax=0.5),
@@ -65,8 +71,17 @@ def _get(url):
         return response.read()
 
 
-def fetch(name, spec):
+def fetch(name, spec, kept=None):
+    """Download material *name*; *kept* is its record from the last run,
+    reused (nothing downloaded) while it names the same texture and the
+    files are still there."""
     asset = spec["asset"]
+    if (kept and kept.get("source") == asset and all(
+            os.path.exists(os.path.join(OUT, f"{name}{suffix}.jpg")) for _map, suffix in MAPS)):
+        with open(os.path.join(OUT, f"{name}.mat.json"), "w") as f:
+            json.dump({"parallax": spec["parallax"]}, f)
+            f.write("\n")
+        return dict(kept, parallax=spec["parallax"])
     info = json.loads(_get(f"{API}/info/{asset}"))
     files = json.loads(_get(f"{API}/files/{asset}"))
     for source, suffix in MAPS:
@@ -94,7 +109,12 @@ def fetch(name, spec):
 
 def main():
     os.makedirs(OUT, exist_ok=True)
-    manifest = {name: fetch(name, spec) for name, spec in MATERIALS.items()}
+    try:
+        with open(os.path.join(OUT, "materials.json")) as f:
+            kept = json.load(f)
+    except (OSError, ValueError):
+        kept = {}
+    manifest = {name: fetch(name, spec, kept.get(name)) for name, spec in MATERIALS.items()}
     with open(os.path.join(OUT, "materials.json"), "w") as f:
         json.dump(manifest, f, indent=1)
         f.write("\n")

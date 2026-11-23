@@ -74,6 +74,26 @@ THEMES = {
         ground_color=(0.10, 0.13, 0.08), haze=0.00006,
         exposure=0.82, saturation=1.08, contrast=1.05, tint=(1.0, 1.01, 0.98),
         bloom=0.09, sun_shafts=0.32),
+    # Frostline: high country in deep snow; a low, clear winter sun.
+    "frost": dict(
+        sun_azimuth=236.0, sun_elevation=24.0, sun_intensity=3.6,
+        sun_color=(1.0, 0.90, 0.76),
+        turbidity=2.0, rayleigh=1.1, mie=0.003, sky_intensity=0.90,
+        cloud_cover=0.30, cloud_softness=0.30, cloud_shadows=0.35, wind=(22.0, 8.0),
+        ground_color=(0.62, 0.66, 0.72), haze=0.00007,
+        exposure=0.70, saturation=1.0, contrast=1.07, tint=(0.97, 1.0, 1.05),
+        bloom=0.13, sun_shafts=0.42),
+    # Emberworks: a foundry at night. The "sun" is the moon; the light that
+    # matters is the lamps'.
+    "ember": dict(
+        sun_azimuth=64.0, sun_elevation=38.0, sun_intensity=0.42,
+        sun_color=(0.62, 0.74, 1.0), sun_disc=26.0,
+        turbidity=2.2, rayleigh=1.0, mie=0.004, sky_intensity=0.045,
+        cloud_cover=0.45, cloud_softness=0.30, cloud_shadows=0.3, cloud_brightness=1.6,
+        wind=(16.0, 10.0), ground_color=(0.05, 0.05, 0.06), haze=0.00010,
+        point_light_gain=4.2, emissive_gain=6.0, roughness=0.6,
+        exposure=1.55, saturation=1.10, contrast=1.08, tint=(1.0, 0.99, 1.02),
+        bloom=0.22, sun_shafts=0.0, vignette=0.32),
 }
 DEFAULT_THEME = "slate"
 
@@ -93,10 +113,11 @@ def lit(quality) -> bool:
     return quality != "classic"
 
 
-def apply(renderer, theme, quality) -> bool:
-    """Light *renderer*'s world as maze *theme* at *quality*. Returns whether
-    the environment is now on (False for ``classic`` and for a renderer that
-    has none)."""
+def apply(renderer, theme, quality, focus=None) -> bool:
+    """Light *renderer*'s world as maze *theme* at *quality*. *focus* is the
+    maze's footprint ``(x0, z0, x1, z1)``: where the sun's shadow map spends
+    its resolution. Returns whether the environment is now on (False for
+    ``classic`` and for a renderer that has none)."""
     environment = getattr(renderer, "environment", None)
     if environment is None:
         return False
@@ -116,6 +137,7 @@ def apply(renderer, theme, quality) -> bool:
     fresh.sun_shafts = fresh.sun_shafts * level["sun_shafts"]
     fresh.fxaa = level["fxaa"]
     fresh.cloud_shadows = fresh.cloud_shadows * level["cloud_shadows"]
+    fresh.shadow_focus = tuple(float(v) for v in focus) if focus else None
     fresh.enabled = True
     # One assignment per field, so a frame in progress never sees half a look.
     for name, value in vars(fresh).items():

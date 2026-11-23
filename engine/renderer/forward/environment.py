@@ -159,6 +159,9 @@ class Environment:
         #: How far around the view point the shadow map reaches when the
         #: world is larger than this (world units).
         self.shadow_range = 9000.0
+        #: ``(x0, z0, x1, z1)``: the part of the world the shadow map covers
+        #: (casters outside still shadow it); None covers every caster.
+        self.shadow_focus = None
         # -- the sky -----------------------------------------------------
         self.turbidity = 3.5
         self.rayleigh = 1.4
@@ -692,6 +695,14 @@ class EnvironmentMixin:
         half = table.half[casters]
         low = (centre - half).min(axis=0).astype(np.float64)
         high = (centre + half).max(axis=0).astype(np.float64)
+        all_low, all_high = low.copy(), high.copy()
+        focus = env.shadow_focus
+        if focus:
+            # What receives shadows: the focus, from the ground to a wall or
+            # so above it. Taller and farther casters only add depth.
+            low[0], low[2] = max(low[0], focus[0]), max(low[2], focus[1])
+            high[0], high[2] = min(high[0], focus[2]), min(high[2], focus[3])
+            high[1] = min(high[1], low[1] + 520.0)
         reach = float(env.shadow_range)
         size = int(self._env_shadow_size)
         follow = max(high[0] - low[0], high[2] - low[2]) > 2.0 * reach
@@ -707,6 +718,12 @@ class EnvironmentMixin:
         in_light = corners @ matrix.T
         lo = in_light[:, :3].min(axis=0)
         hi = in_light[:, :3].max(axis=0)
+        # Depth takes in every caster, wherever it stands.
+        everything = np.array([[x, y, z, 1.0] for x in (all_low[0], all_high[0])
+                               for y in (all_low[1], all_high[1])
+                               for z in (all_low[2], all_high[2])]) @ matrix.T
+        lo[2] = min(lo[2], everything[:, 2].min())
+        hi[2] = max(hi[2], everything[:, 2].max())
         span = max(hi[0] - lo[0], hi[1] - lo[1]) * 1.02
         texel = span / size
         mid_x = (lo[0] + hi[0]) * 0.5

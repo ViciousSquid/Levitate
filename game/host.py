@@ -263,7 +263,8 @@ class LevitateGame:
         if want is None:
             graphics.clear(renderer)
         else:
-            graphics.apply(renderer, *want)
+            # The sun's shadow map is spent on the maze, not on its scenery.
+            graphics.apply(renderer, *want, focus=match.bounds)
         try:
             self._lit = (weakref.ref(renderer), want)
         except TypeError:
@@ -282,7 +283,8 @@ class LevitateGame:
         xs, zs = [], []
         for brush in getattr(logic.editor_state, "brushes", []) or []:
             try:
-                if brush.get("is_trigger"):
+                # Not triggers, and not the scenery beyond the walls.
+                if brush.get("is_trigger") or str(brush.get("name", "")).startswith("Scenery_"):
                     continue
                 (x, y, z), (w, h, d) = brush["pos"], brush["size"]
             except (KeyError, TypeError, ValueError):

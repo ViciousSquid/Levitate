@@ -71,6 +71,54 @@
   ],
   "parallax": 3.0
  },
+ "wall_frost": {
+  "source": "rock_wall_08",
+  "name": "Rock Wall 08",
+  "authors": [
+   "Amal Kumar"
+  ],
+  "size_cm": [
+   180.0,
+   180.0
+  ],
+  "parallax": 3.5
+ },
+ "floor_frost": {
+  "source": "snow_02",
+  "name": "Snow 02",
+  "authors": [
+   "Rob Tuytel"
+  ],
+  "size_cm": [
+   200.0,
+   200.0
+  ],
+  "parallax": 2.0
+ },
+ "wall_ember": {
+  "source": "rusty_corrugated_iron",
+  "name": "Rusty Corrugated Iron",
+  "authors": [
+   "Charlotte Baglioni"
+  ],
+  "size_cm": [
+   200.0,
+   200.0
+  ],
+  "parallax": 1.5
+ },
+ "floor_ember": {
+  "source": "metal_plate",
+  "name": "Metal Plate",
+  "authors": [
+   "Rob Tuytel"
+  ],
+  "size_cm": [
+   50.0,
+   50.0
+  ],
+  "parallax": 0.4
+ },
  "cap_stone": {
   "source": "concrete_wall_008",
   "name": "Concrete Wall 008",

@@ -23394,6 +23394,1639 @@
     "east": 90.0,
     "west": 90.0
    }
+  },
+  {
+   "name": "Scenery_0_0",
+   "id": "81a6124b-0030-578e-9aef-c12248f47fb8",
+   "pos": [
+    -1542.03,
+    348.0,
+    3346.73
+   ],
+   "size": [
+    150,
+    824,
+    150
+   ],
+   "textures": {
+    "north": "levitate/wall_sand.jpg",
+    "south": "levitate/wall_sand.jpg",
+    "east": "levitate/wall_sand.jpg",
+    "west": "levitate/wall_sand.jpg",
+    "top": "levitate/cap_stone.jpg",
+    "down": "levitate/wall_sand.jpg"
+   },
+   "is_trigger": false,
+   "uv_scale": {
+    "north": [
+     0.5,
+     2.7467
+    ],
+    "south": [
+     0.5,
+     2.7467
+    ],
+    "east": [
+     0.5,
+     2.7467
+    ],
+    "west": [
+     0.5,
+     2.7467
+    ],
+    "top": [
+     0.5535,
+     0.5535
+    ],
+    "down": [
+     0.5,
+     0.5
+    ]
+   },
+   "uv_shift": {
+    "north": [
+     0.742,
+     0.0
+    ],
+    "south": [
+     0.742,
+     0.0
+    ],
+    "east": [
+     0.742,
+     0.0
+    ],
+    "west": [
+     0.742,
+     0.0
+    ]
+   },
+   "uv_angle": {
+    "east": 90.0,
+    "west": 90.0
+   }
+  },
+  {
+   "name": "Scenery_0_1",
+   "id": "e482d815-cf21-5063-8a76-a711b20117ca",
+   "pos": [
+    -1542.03,
+    970.0,
+    3346.73
+   ],
+   "size": [
+    110,
+    420,
+    110
+   ],
+   "textures": {
+    "north": "levitate/wall_sand.jpg",
+    "south": "levitate/wall_sand.jpg",
+    "east": "levitate/wall_sand.jpg",
+    "west": "levitate/wall_sand.jpg",
+    "top": "levitate/cap_stone.jpg",
+    "down": "levitate/wall_sand.jpg"
+   },
+   "is_trigger": false,
+   "uv_scale": {
+    "north": [
+     0.3667,
+     1.4
+    ],
+    "south": [
+     0.3667,
+     1.4
+    ],
+    "east": [
+     0.3667,
+     1.4
+    ],
+    "west": [
+     0.3667,
+     1.4
+    ],
+    "top": [
+     0.4059,
+     0.4059
+    ],
+    "down": [
+     0.3667,
+     0.3667
+    ]
+   },
+   "uv_shift": {
+    "north": [
+     0.78,
+     0.0
+    ],
+    "south": [
+     0.78,
+     0.0
+    ],
+    "east": [
+     0.78,
+     0.0
+    ],
+    "west": [
+     0.78,
+     0.0
+    ]
+   },
+   "uv_angle": {
+    "east": 90.0,
+    "west": 90.0
+   }
+  },
+  {
+   "name": "Scenery_0_2",
+   "id": "1b6ea25d-1ffc-54e5-9caf-b9240931118d",
+   "pos": [
+    -1542.03,
+    1245.0,
+    3346.73
+   ],
+   "size": [
+    60,
+    130,
+    60
+   ],
+   "textures": {
+    "north": "levitate/wall_sand.jpg",
+    "south": "levitate/wall_sand.jpg",
+    "east": "levitate/wall_sand.jpg",
+    "west": "levitate/wall_sand.jpg",
+    "top": "levitate/cap_stone.jpg",
+    "down": "levitate/wall_sand.jpg"
+   },
+   "is_trigger": false,
+   "uv_scale": {
+    "north": [
+     0.2,
+     0.4333
+    ],
+    "south": [
+     0.2,
+     0.4333
+    ],
+    "east": [
+     0.2,
+     0.4333
+    ],
+    "west": [
+     0.2,
+     0.4333
+    ],
+    "top": [
+     0.2214,
+     0.2214
+    ],
+    "down": [
+     0.2,
+     0.2
+    ]
+   },
+   "uv_shift": {
+    "north": [
+     0.808,
+     0.0
+    ],
+    "south": [
+     0.808,
+     0.0
+    ],
+    "east": [
+     0.808,
+     0.0
+    ],
+    "west": [
+     0.808,
+     0.0
+    ]
+   },
+   "uv_angle": {
+    "east": 90.0,
+    "west": 90.0
+   }
+  },
+  {
+   "name": "Scenery_1_0",
+   "id": "02985505-cb36-529d-812f-51668af53f2b",
+   "pos": [
+    2280.38,
+    348.0,
+    3327.15
+   ],
+   "size": [
+    150,
+    824,
+    150
+   ],
+   "textures": {
+    "north": "levitate/wall_sand.jpg",
+    "south": "levitate/wall_sand.jpg",
+    "east": "levitate/wall_sand.jpg",
+    "west": "levitate/wall_sand.jpg",
+    "top": "levitate/cap_stone.jpg",
+    "down": "levitate/wall_sand.jpg"
+   },
+   "is_trigger": false,
+   "uv_scale": {
+    "north": [
+     0.5,
+     2.7467
+    ],
+    "south": [
+     0.5,
+     2.7467
+    ],
+    "east": [
+     0.5,
+     2.7467
+    ],
+    "west": [
+     0.5,
+     2.7467
+    ],
+    "top": [
+     0.5535,
+     0.5535
+    ],
+    "down": [
+     0.5,
+     0.5
+    ]
+   },
+   "uv_shift": {
+    "north": [
+     0.432,
+     0.0
+    ],
+    "south": [
+     0.432,
+     0.0
+    ],
+    "east": [
+     0.432,
+     0.0
+    ],
+    "west": [
+     0.432,
+     0.0
+    ]
+   },
+   "uv_angle": {
+    "east": 90.0,
+    "west": 90.0
+   }
+  },
+  {
+   "name": "Scenery_1_1",
+   "id": "4914a77e-d50f-5a7d-b1df-2a95bedc7c4d",
+   "pos": [
+    2280.38,
+    970.0,
+    3327.15
+   ],
+   "size": [
+    110,
+    420,
+    110
+   ],
+   "textures": {
+    "north": "levitate/wall_sand.jpg",
+    "south": "levitate/wall_sand.jpg",
+    "east": "levitate/wall_sand.jpg",
+    "west": "levitate/wall_sand.jpg",
+    "top": "levitate/cap_stone.jpg",
+    "down": "levitate/wall_sand.jpg"
+   },
+   "is_trigger": false,
+   "uv_scale": {
+    "north": [
+     0.3667,
+     1.4
+    ],
+    "south": [
+     0.3667,
+     1.4
+    ],
+    "east": [
+     0.3667,
+     1.4
+    ],
+    "west": [
+     0.3667,
+     1.4
+    ],
+    "top": [
+     0.4059,
+     0.4059
+    ],
+    "down": [
+     0.3667,
+     0.3667
+    ]
+   },
+   "uv_shift": {
+    "north": [
+     0.718,
+     0.0
+    ],
+    "south": [
+     0.718,
+     0.0
+    ],
+    "east": [
+     0.718,
+     0.0
+    ],
+    "west": [
+     0.718,
+     0.0
+    ]
+   },
+   "uv_angle": {
+    "east": 90.0,
+    "west": 90.0
+   }
+  },
+  {
+   "name": "Scenery_1_2",
+   "id": "e134ae2d-9dc7-5461-8130-72487f6da521",
+   "pos": [
+    2280.38,
+    1245.0,
+    3327.15
+   ],
+   "size": [
+    60,
+    130,
+    60
+   ],
+   "textures": {
+    "north": "levitate/wall_sand.jpg",
+    "south": "levitate/wall_sand.jpg",
+    "east": "levitate/wall_sand.jpg",
+    "west": "levitate/wall_sand.jpg",
+    "top": "levitate/cap_stone.jpg",
+    "down": "levitate/wall_sand.jpg"
+   },
+   "is_trigger": false,
+   "uv_scale": {
+    "north": [
+     0.2,
+     0.4333
+    ],
+    "south": [
+     0.2,
+     0.4333
+    ],
+    "east": [
+     0.2,
+     0.4333
+    ],
+    "west": [
+     0.2,
+     0.4333
+    ],
+    "top": [
+     0.2214,
+     0.2214
+    ],
+    "down": [
+     0.2,
+     0.2
+    ]
+   },
+   "uv_shift": {
+    "north": [
+     0.653,
+     0.0
+    ],
+    "south": [
+     0.653,
+     0.0
+    ],
+    "east": [
+     0.653,
+     0.0
+    ],
+    "west": [
+     0.653,
+     0.0
+    ]
+   },
+   "uv_angle": {
+    "east": 90.0,
+    "west": 90.0
+   }
+  },
+  {
+   "name": "Scenery_2_0",
+   "id": "2d3fe229-a8ab-51c4-becb-222033e80c89",
+   "pos": [
+    3682.76,
+    168.0,
+    -347.9
+   ],
+   "size": [
+    980,
+    464,
+    980
+   ],
+   "textures": {
+    "north": "levitate/wall_sand.jpg",
+    "south": "levitate/wall_sand.jpg",
+    "east": "levitate/wall_sand.jpg",
+    "west": "levitate/wall_sand.jpg",
+    "top": "levitate/cap_stone.jpg",
+    "down": "levitate/wall_sand.jpg"
+   },
+   "is_trigger": false,
+   "uv_scale": {
+    "north": [
+     3.2667,
+     1.5467
+    ],
+    "south": [
+     3.2667,
+     1.5467
+    ],
+    "east": [
+     3.2667,
+     1.5467
+    ],
+    "west": [
+     3.2667,
+     1.5467
+    ],
+    "top": [
+     3.6162,
+     3.6162
+    ],
+    "down": [
+     3.2667,
+     3.2667
+    ]
+   },
+   "uv_shift": {
+    "north": [
+     0.068,
+     0.0
+    ],
+    "south": [
+     0.068,
+     0.0
+    ],
+    "east": [
+     0.068,
+     0.0
+    ],
+    "west": [
+     0.068,
+     0.0
+    ]
+   },
+   "uv_angle": {
+    "east": 90.0,
+    "west": 90.0
+   }
+  },
+  {
+   "name": "Scenery_2_1",
+   "id": "1aeabb08-67c6-5d87-8348-08f093cd54b9",
+   "pos": [
+    3682.76,
+    495.0,
+    -347.9
+   ],
+   "size": [
+    740,
+    190,
+    740
+   ],
+   "textures": {
+    "north": "levitate/wall_sand.jpg",
+    "south": "levitate/wall_sand.jpg",
+    "east": "levitate/wall_sand.jpg",
+    "west": "levitate/wall_sand.jpg",
+    "top": "levitate/cap_stone.jpg",
+    "down": "levitate/wall_sand.jpg"
+   },
+   "is_trigger": false,
+   "uv_scale": {
+    "north": [
+     2.4667,
+     0.6333
+    ],
+    "south": [
+     2.4667,
+     0.6333
+    ],
+    "east": [
+     2.4667,
+     0.6333
+    ],
+    "west": [
+     2.4667,
+     0.6333
+    ],
+    "top": [
+     2.7306,
+     2.7306
+    ],
+    "down": [
+     2.4667,
+     2.4667
+    ]
+   },
+   "uv_shift": {
+    "north": [
+     0.785,
+     0.0
+    ],
+    "south": [
+     0.785,
+     0.0
+    ],
+    "east": [
+     0.785,
+     0.0
+    ],
+    "west": [
+     0.785,
+     0.0
+    ]
+   },
+   "uv_angle": {
+    "east": 90.0,
+    "west": 90.0
+   }
+  },
+  {
+   "name": "Scenery_2_2",
+   "id": "6f92ef48-2ff1-5d2c-927f-1e73714eb5b2",
+   "pos": [
+    3682.76,
+    685.0,
+    -347.9
+   ],
+   "size": [
+    500,
+    190,
+    500
+   ],
+   "textures": {
+    "north": "levitate/wall_sand.jpg",
+    "south": "levitate/wall_sand.jpg",
+    "east": "levitate/wall_sand.jpg",
+    "west": "levitate/wall_sand.jpg",
+    "top": "levitate/cap_stone.jpg",
+    "down": "levitate/wall_sand.jpg"
+   },
+   "is_trigger": false,
+   "uv_scale": {
+    "north": [
+     1.6667,
+     0.6333
+    ],
+    "south": [
+     1.6667,
+     0.6333
+    ],
+    "east": [
+     1.6667,
+     0.6333
+    ],
+    "west": [
+     1.6667,
+     0.6333
+    ],
+    "top": [
+     1.845,
+     1.845
+    ],
+    "down": [
+     1.6667,
+     1.6667
+    ]
+   },
+   "uv_shift": {
+    "north": [
+     0.249,
+     0.0
+    ],
+    "south": [
+     0.249,
+     0.0
+    ],
+    "east": [
+     0.249,
+     0.0
+    ],
+    "west": [
+     0.249,
+     0.0
+    ]
+   },
+   "uv_angle": {
+    "east": 90.0,
+    "west": 90.0
+   }
+  },
+  {
+   "name": "Scenery_2_3",
+   "id": "6014245d-1087-54a3-8417-a54f60c003ba",
+   "pos": [
+    3682.76,
+    865.0,
+    -347.9
+   ],
+   "size": [
+    280,
+    170,
+    280
+   ],
+   "textures": {
+    "north": "levitate/wall_sand.jpg",
+    "south": "levitate/wall_sand.jpg",
+    "east": "levitate/wall_sand.jpg",
+    "west": "levitate/wall_sand.jpg",
+    "top": "levitate/cap_stone.jpg",
+    "down": "levitate/wall_sand.jpg"
+   },
+   "is_trigger": false,
+   "uv_scale": {
+    "north": [
+     0.9333,
+     0.5667
+    ],
+    "south": [
+     0.9333,
+     0.5667
+    ],
+    "east": [
+     0.9333,
+     0.5667
+    ],
+    "west": [
+     0.9333,
+     0.5667
+    ],
+    "top": [
+     1.0332,
+     1.0332
+    ],
+    "down": [
+     0.9333,
+     0.9333
+    ]
+   },
+   "uv_shift": {
+    "north": [
+     0.045,
+     0.0
+    ],
+    "south": [
+     0.045,
+     0.0
+    ],
+    "east": [
+     0.045,
+     0.0
+    ],
+    "west": [
+     0.045,
+     0.0
+    ]
+   },
+   "uv_angle": {
+    "east": 90.0,
+    "west": 90.0
+   }
+  },
+  {
+   "name": "Scenery_3_0",
+   "id": "e2e8a894-77b9-57ab-a972-382f90635747",
+   "pos": [
+    2256.87,
+    348.0,
+    -3179.35
+   ],
+   "size": [
+    150,
+    824,
+    150
+   ],
+   "textures": {
+    "north": "levitate/wall_sand.jpg",
+    "south": "levitate/wall_sand.jpg",
+    "east": "levitate/wall_sand.jpg",
+    "west": "levitate/wall_sand.jpg",
+    "top": "levitate/cap_stone.jpg",
+    "down": "levitate/wall_sand.jpg"
+   },
+   "is_trigger": false,
+   "uv_scale": {
+    "north": [
+     0.5,
+     2.7467
+    ],
+    "south": [
+     0.5,
+     2.7467
+    ],
+    "east": [
+     0.5,
+     2.7467
+    ],
+    "west": [
+     0.5,
+     2.7467
+    ],
+    "top": [
+     0.5535,
+     0.5535
+    ],
+    "down": [
+     0.5,
+     0.5
+    ]
+   },
+   "uv_shift": {
+    "north": [
+     0.966,
+     0.0
+    ],
+    "south": [
+     0.966,
+     0.0
+    ],
+    "east": [
+     0.966,
+     0.0
+    ],
+    "west": [
+     0.966,
+     0.0
+    ]
+   },
+   "uv_angle": {
+    "east": 90.0,
+    "west": 90.0
+   }
+  },
+  {
+   "name": "Scenery_3_1",
+   "id": "6686af8e-4cfd-55fb-ab5c-c5c37976c31b",
+   "pos": [
+    2256.87,
+    970.0,
+    -3179.35
+   ],
+   "size": [
+    110,
+    420,
+    110
+   ],
+   "textures": {
+    "north": "levitate/wall_sand.jpg",
+    "south": "levitate/wall_sand.jpg",
+    "east": "levitate/wall_sand.jpg",
+    "west": "levitate/wall_sand.jpg",
+    "top": "levitate/cap_stone.jpg",
+    "down": "levitate/wall_sand.jpg"
+   },
+   "is_trigger": false,
+   "uv_scale": {
+    "north": [
+     0.3667,
+     1.4
+    ],
+    "south": [
+     0.3667,
+     1.4
+    ],
+    "east": [
+     0.3667,
+     1.4
+    ],
+    "west": [
+     0.3667,
+     1.4
+    ],
+    "top": [
+     0.4059,
+     0.4059
+    ],
+    "down": [
+     0.3667,
+     0.3667
+    ]
+   },
+   "uv_shift": {
+    "north": [
+     0.267,
+     0.0
+    ],
+    "south": [
+     0.267,
+     0.0
+    ],
+    "east": [
+     0.267,
+     0.0
+    ],
+    "west": [
+     0.267,
+     0.0
+    ]
+   },
+   "uv_angle": {
+    "east": 90.0,
+    "west": 90.0
+   }
+  },
+  {
+   "name": "Scenery_3_2",
+   "id": "85e46429-4122-5bc0-863b-32060160be47",
+   "pos": [
+    2256.87,
+    1245.0,
+    -3179.35
+   ],
+   "size": [
+    60,
+    130,
+    60
+   ],
+   "textures": {
+    "north": "levitate/wall_sand.jpg",
+    "south": "levitate/wall_sand.jpg",
+    "east": "levitate/wall_sand.jpg",
+    "west": "levitate/wall_sand.jpg",
+    "top": "levitate/cap_stone.jpg",
+    "down": "levitate/wall_sand.jpg"
+   },
+   "is_trigger": false,
+   "uv_scale": {
+    "north": [
+     0.2,
+     0.4333
+    ],
+    "south": [
+     0.2,
+     0.4333
+    ],
+    "east": [
+     0.2,
+     0.4333
+    ],
+    "west": [
+     0.2,
+     0.4333
+    ],
+    "top": [
+     0.2214,
+     0.2214
+    ],
+    "down": [
+     0.2,
+     0.2
+    ]
+   },
+   "uv_shift": {
+    "north": [
+     0.82,
+     0.0
+    ],
+    "south": [
+     0.82,
+     0.0
+    ],
+    "east": [
+     0.82,
+     0.0
+    ],
+    "west": [
+     0.82,
+     0.0
+    ]
+   },
+   "uv_angle": {
+    "east": 90.0,
+    "west": 90.0
+   }
+  },
+  {
+   "name": "Scenery_4_0",
+   "id": "a393e926-4ed1-5edf-a0a8-2a8228cf4d89",
+   "pos": [
+    -451.78,
+    348.0,
+    -3289.85
+   ],
+   "size": [
+    150,
+    824,
+    150
+   ],
+   "textures": {
+    "north": "levitate/wall_sand.jpg",
+    "south": "levitate/wall_sand.jpg",
+    "east": "levitate/wall_sand.jpg",
+    "west": "levitate/wall_sand.jpg",
+    "top": "levitate/cap_stone.jpg",
+    "down": "levitate/wall_sand.jpg"
+   },
+   "is_trigger": false,
+   "uv_scale": {
+    "north": [
+     0.5,
+     2.7467
+    ],
+    "south": [
+     0.5,
+     2.7467
+    ],
+    "east": [
+     0.5,
+     2.7467
+    ],
+    "west": [
+     0.5,
+     2.7467
+    ],
+    "top": [
+     0.5535,
+     0.5535
+    ],
+    "down": [
+     0.5,
+     0.5
+    ]
+   },
+   "uv_shift": {
+    "north": [
+     0.298,
+     0.0
+    ],
+    "south": [
+     0.298,
+     0.0
+    ],
+    "east": [
+     0.298,
+     0.0
+    ],
+    "west": [
+     0.298,
+     0.0
+    ]
+   },
+   "uv_angle": {
+    "east": 90.0,
+    "west": 90.0
+   }
+  },
+  {
+   "name": "Scenery_4_1",
+   "id": "1f39fdc5-3bf0-5497-b646-0689d79b0fd6",
+   "pos": [
+    -451.78,
+    970.0,
+    -3289.85
+   ],
+   "size": [
+    110,
+    420,
+    110
+   ],
+   "textures": {
+    "north": "levitate/wall_sand.jpg",
+    "south": "levitate/wall_sand.jpg",
+    "east": "levitate/wall_sand.jpg",
+    "west": "levitate/wall_sand.jpg",
+    "top": "levitate/cap_stone.jpg",
+    "down": "levitate/wall_sand.jpg"
+   },
+   "is_trigger": false,
+   "uv_scale": {
+    "north": [
+     0.3667,
+     1.4
+    ],
+    "south": [
+     0.3667,
+     1.4
+    ],
+    "east": [
+     0.3667,
+     1.4
+    ],
+    "west": [
+     0.3667,
+     1.4
+    ],
+    "top": [
+     0.4059,
+     0.4059
+    ],
+    "down": [
+     0.3667,
+     0.3667
+    ]
+   },
+   "uv_shift": {
+    "north": [
+     0.242,
+     0.0
+    ],
+    "south": [
+     0.242,
+     0.0
+    ],
+    "east": [
+     0.242,
+     0.0
+    ],
+    "west": [
+     0.242,
+     0.0
+    ]
+   },
+   "uv_angle": {
+    "east": 90.0,
+    "west": 90.0
+   }
+  },
+  {
+   "name": "Scenery_4_2",
+   "id": "99a4402a-ded4-5783-a64d-b6e8884b770e",
+   "pos": [
+    -451.78,
+    1245.0,
+    -3289.85
+   ],
+   "size": [
+    60,
+    130,
+    60
+   ],
+   "textures": {
+    "north": "levitate/wall_sand.jpg",
+    "south": "levitate/wall_sand.jpg",
+    "east": "levitate/wall_sand.jpg",
+    "west": "levitate/wall_sand.jpg",
+    "top": "levitate/cap_stone.jpg",
+    "down": "levitate/wall_sand.jpg"
+   },
+   "is_trigger": false,
+   "uv_scale": {
+    "north": [
+     0.2,
+     0.4333
+    ],
+    "south": [
+     0.2,
+     0.4333
+    ],
+    "east": [
+     0.2,
+     0.4333
+    ],
+    "west": [
+     0.2,
+     0.4333
+    ],
+    "top": [
+     0.2214,
+     0.2214
+    ],
+    "down": [
+     0.2,
+     0.2
+    ]
+   },
+   "uv_shift": {
+    "north": [
+     0.425,
+     0.0
+    ],
+    "south": [
+     0.425,
+     0.0
+    ],
+    "east": [
+     0.425,
+     0.0
+    ],
+    "west": [
+     0.425,
+     0.0
+    ]
+   },
+   "uv_angle": {
+    "east": 90.0,
+    "west": 90.0
+   }
+  },
+  {
+   "name": "Scenery_5_0",
+   "id": "c916c2e8-aab6-5aae-97aa-f311fbaebd2c",
+   "pos": [
+    -3009.58,
+    348.0,
+    -1253.43
+   ],
+   "size": [
+    150,
+    824,
+    150
+   ],
+   "textures": {
+    "north": "levitate/wall_sand.jpg",
+    "south": "levitate/wall_sand.jpg",
+    "east": "levitate/wall_sand.jpg",
+    "west": "levitate/wall_sand.jpg",
+    "top": "levitate/cap_stone.jpg",
+    "down": "levitate/wall_sand.jpg"
+   },
+   "is_trigger": false,
+   "uv_scale": {
+    "north": [
+     0.5,
+     2.7467
+    ],
+    "south": [
+     0.5,
+     2.7467
+    ],
+    "east": [
+     0.5,
+     2.7467
+    ],
+    "west": [
+     0.5,
+     2.7467
+    ],
+    "top": [
+     0.5535,
+     0.5535
+    ],
+    "down": [
+     0.5,
+     0.5
+    ]
+   },
+   "uv_shift": {
+    "north": [
+     0.422,
+     0.0
+    ],
+    "south": [
+     0.422,
+     0.0
+    ],
+    "east": [
+     0.422,
+     0.0
+    ],
+    "west": [
+     0.422,
+     0.0
+    ]
+   },
+   "uv_angle": {
+    "east": 90.0,
+    "west": 90.0
+   }
+  },
+  {
+   "name": "Scenery_5_1",
+   "id": "950912b6-c31a-56d0-a62a-38ddda61bcab",
+   "pos": [
+    -3009.58,
+    970.0,
+    -1253.43
+   ],
+   "size": [
+    110,
+    420,
+    110
+   ],
+   "textures": {
+    "north": "levitate/wall_sand.jpg",
+    "south": "levitate/wall_sand.jpg",
+    "east": "levitate/wall_sand.jpg",
+    "west": "levitate/wall_sand.jpg",
+    "top": "levitate/cap_stone.jpg",
+    "down": "levitate/wall_sand.jpg"
+   },
+   "is_trigger": false,
+   "uv_scale": {
+    "north": [
+     0.3667,
+     1.4
+    ],
+    "south": [
+     0.3667,
+     1.4
+    ],
+    "east": [
+     0.3667,
+     1.4
+    ],
+    "west": [
+     0.3667,
+     1.4
+    ],
+    "top": [
+     0.4059,
+     0.4059
+    ],
+    "down": [
+     0.3667,
+     0.3667
+    ]
+   },
+   "uv_shift": {
+    "north": [
+     0.876,
+     0.0
+    ],
+    "south": [
+     0.876,
+     0.0
+    ],
+    "east": [
+     0.876,
+     0.0
+    ],
+    "west": [
+     0.876,
+     0.0
+    ]
+   },
+   "uv_angle": {
+    "east": 90.0,
+    "west": 90.0
+   }
+  },
+  {
+   "name": "Scenery_5_2",
+   "id": "add6b2fc-8ebe-57d7-8018-7ab676f1c5d1",
+   "pos": [
+    -3009.58,
+    1245.0,
+    -1253.43
+   ],
+   "size": [
+    60,
+    130,
+    60
+   ],
+   "textures": {
+    "north": "levitate/wall_sand.jpg",
+    "south": "levitate/wall_sand.jpg",
+    "east": "levitate/wall_sand.jpg",
+    "west": "levitate/wall_sand.jpg",
+    "top": "levitate/cap_stone.jpg",
+    "down": "levitate/wall_sand.jpg"
+   },
+   "is_trigger": false,
+   "uv_scale": {
+    "north": [
+     0.2,
+     0.4333
+    ],
+    "south": [
+     0.2,
+     0.4333
+    ],
+    "east": [
+     0.2,
+     0.4333
+    ],
+    "west": [
+     0.2,
+     0.4333
+    ],
+    "top": [
+     0.2214,
+     0.2214
+    ],
+    "down": [
+     0.2,
+     0.2
+    ]
+   },
+   "uv_shift": {
+    "north": [
+     0.265,
+     0.0
+    ],
+    "south": [
+     0.265,
+     0.0
+    ],
+    "east": [
+     0.265,
+     0.0
+    ],
+    "west": [
+     0.265,
+     0.0
+    ]
+   },
+   "uv_angle": {
+    "east": 90.0,
+    "west": 90.0
+   }
+  },
+  {
+   "name": "Scenery_6_0",
+   "id": "0477c163-8c5e-577b-b7a7-88a5ff68c631",
+   "pos": [
+    -3638.18,
+    168.0,
+    454.32
+   ],
+   "size": [
+    980,
+    464,
+    980
+   ],
+   "textures": {
+    "north": "levitate/wall_sand.jpg",
+    "south": "levitate/wall_sand.jpg",
+    "east": "levitate/wall_sand.jpg",
+    "west": "levitate/wall_sand.jpg",
+    "top": "levitate/cap_stone.jpg",
+    "down": "levitate/wall_sand.jpg"
+   },
+   "is_trigger": false,
+   "uv_scale": {
+    "north": [
+     3.2667,
+     1.5467
+    ],
+    "south": [
+     3.2667,
+     1.5467
+    ],
+    "east": [
+     3.2667,
+     1.5467
+    ],
+    "west": [
+     3.2667,
+     1.5467
+    ],
+    "top": [
+     3.6162,
+     3.6162
+    ],
+    "down": [
+     3.2667,
+     3.2667
+    ]
+   },
+   "uv_shift": {
+    "north": [
+     0.984,
+     0.0
+    ],
+    "south": [
+     0.984,
+     0.0
+    ],
+    "east": [
+     0.984,
+     0.0
+    ],
+    "west": [
+     0.984,
+     0.0
+    ]
+   },
+   "uv_angle": {
+    "east": 90.0,
+    "west": 90.0
+   }
+  },
+  {
+   "name": "Scenery_6_1",
+   "id": "ee46d3ad-739a-5a93-8506-40ed914d9a27",
+   "pos": [
+    -3638.18,
+    495.0,
+    454.32
+   ],
+   "size": [
+    740,
+    190,
+    740
+   ],
+   "textures": {
+    "north": "levitate/wall_sand.jpg",
+    "south": "levitate/wall_sand.jpg",
+    "east": "levitate/wall_sand.jpg",
+    "west": "levitate/wall_sand.jpg",
+    "top": "levitate/cap_stone.jpg",
+    "down": "levitate/wall_sand.jpg"
+   },
+   "is_trigger": false,
+   "uv_scale": {
+    "north": [
+     2.4667,
+     0.6333
+    ],
+    "south": [
+     2.4667,
+     0.6333
+    ],
+    "east": [
+     2.4667,
+     0.6333
+    ],
+    "west": [
+     2.4667,
+     0.6333
+    ],
+    "top": [
+     2.7306,
+     2.7306
+    ],
+    "down": [
+     2.4667,
+     2.4667
+    ]
+   },
+   "uv_shift": {
+    "north": [
+     0.875,
+     0.0
+    ],
+    "south": [
+     0.875,
+     0.0
+    ],
+    "east": [
+     0.875,
+     0.0
+    ],
+    "west": [
+     0.875,
+     0.0
+    ]
+   },
+   "uv_angle": {
+    "east": 90.0,
+    "west": 90.0
+   }
+  },
+  {
+   "name": "Scenery_6_2",
+   "id": "5e16d368-5cdd-5ffe-85bb-ff48433d61aa",
+   "pos": [
+    -3638.18,
+    685.0,
+    454.32
+   ],
+   "size": [
+    500,
+    190,
+    500
+   ],
+   "textures": {
+    "north": "levitate/wall_sand.jpg",
+    "south": "levitate/wall_sand.jpg",
+    "east": "levitate/wall_sand.jpg",
+    "west": "levitate/wall_sand.jpg",
+    "top": "levitate/cap_stone.jpg",
+    "down": "levitate/wall_sand.jpg"
+   },
+   "is_trigger": false,
+   "uv_scale": {
+    "north": [
+     1.6667,
+     0.6333
+    ],
+    "south": [
+     1.6667,
+     0.6333
+    ],
+    "east": [
+     1.6667,
+     0.6333
+    ],
+    "west": [
+     1.6667,
+     0.6333
+    ],
+    "top": [
+     1.845,
+     1.845
+    ],
+    "down": [
+     1.6667,
+     1.6667
+    ]
+   },
+   "uv_shift": {
+    "north": [
+     0.485,
+     0.0
+    ],
+    "south": [
+     0.485,
+     0.0
+    ],
+    "east": [
+     0.485,
+     0.0
+    ],
+    "west": [
+     0.485,
+     0.0
+    ]
+   },
+   "uv_angle": {
+    "east": 90.0,
+    "west": 90.0
+   }
+  },
+  {
+   "name": "Scenery_6_3",
+   "id": "fe3b9231-1bca-5319-89ad-2af5c42cfbf2",
+   "pos": [
+    -3638.18,
+    865.0,
+    454.32
+   ],
+   "size": [
+    280,
+    170,
+    280
+   ],
+   "textures": {
+    "north": "levitate/wall_sand.jpg",
+    "south": "levitate/wall_sand.jpg",
+    "east": "levitate/wall_sand.jpg",
+    "west": "levitate/wall_sand.jpg",
+    "top": "levitate/cap_stone.jpg",
+    "down": "levitate/wall_sand.jpg"
+   },
+   "is_trigger": false,
+   "uv_scale": {
+    "north": [
+     0.9333,
+     0.5667
+    ],
+    "south": [
+     0.9333,
+     0.5667
+    ],
+    "east": [
+     0.9333,
+     0.5667
+    ],
+    "west": [
+     0.9333,
+     0.5667
+    ],
+    "top": [
+     1.0332,
+     1.0332
+    ],
+    "down": [
+     0.9333,
+     0.9333
+    ]
+   },
+   "uv_shift": {
+    "north": [
+     0.75,
+     0.0
+    ],
+    "south": [
+     0.75,
+     0.0
+    ],
+    "east": [
+     0.75,
+     0.0
+    ],
+    "west": [
+     0.75,
+     0.0
+    ]
+   },
+   "uv_angle": {
+    "east": 90.0,
+    "west": 90.0
+   }
   }
  ],
  "things": [
