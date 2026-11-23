@@ -1379,7 +1379,7 @@
    "type": "levitateflag",
    "pos": [
     -2640.0,
-    0,
+    72.0,
     2112.0
    ],
    "properties": {
@@ -1393,7 +1393,7 @@
    "type": "levitateflag",
    "pos": [
     -2640.0,
-    0,
+    72.0,
     0.0
    ],
    "properties": {
@@ -1407,7 +1407,7 @@
    "type": "levitateflag",
    "pos": [
     2640.0,
-    0,
+    72.0,
     2112.0
    ],
    "properties": {
@@ -1421,7 +1421,7 @@
    "type": "levitateflag",
    "pos": [
     528.0,
-    0,
+    72.0,
     -2112.0
    ],
    "properties": {
@@ -1435,7 +1435,7 @@
    "type": "levitateflag",
    "pos": [
     1056.0,
-    0,
+    72.0,
     -1056.0
    ],
    "properties": {
@@ -1449,7 +1449,7 @@
    "type": "levitateflag",
    "pos": [
     -2112.0,
-    0,
+    72.0,
     1584.0
    ],
    "properties": {

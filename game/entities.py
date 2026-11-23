@@ -22,6 +22,12 @@ def sprite(name):
     return f"assets/sprites/levitate/{name}"
 
 
+#: A flag billboard's size, ``[width, height]``. Fio draws a billboard centred
+#: on its position, so a flag stands on the floor at ``FLAG_SIZE[1] / 2``
+#: above it (:data:`FLAG_RAISE`).
+FLAG_SIZE = [96, 144]
+FLAG_RAISE = FLAG_SIZE[1] / 2
+
 #: The power-ups a pickup can hold, in the HUD's slot order.
 POWERUPS = ("shield", "phantom", "barrier", "jammer")
 #: The floor pads, by kind.
@@ -43,14 +49,17 @@ class LevitateRules(Thing):
 
 
 class LevitateFlag(Prop):
-    """A team's flag, placed at floor height. Collect every rival flag to win."""
+    """A team's flag. Collect every rival flag to win.
+
+    The billboard is centred on the flag's position: place it
+    :data:`FLAG_RAISE` (72) above the floor for the pole to stand on it."""
 
     def __init__(self, pos=None, properties=None):
         super().__init__(pos, properties)
         self.properties["type"] = "levitateflag"
         self.properties.setdefault("team", "blue")
         self.properties.update(render_mode="billboard", sprite_path=self.get_sprite_path(),
-                               sprite_size=[96, 144], collect_enabled=False,
+                               sprite_size=list(FLAG_SIZE), collect_enabled=False,
                                carry_enabled=False, no_collision=True)
 
     def get_sprite_path(self):

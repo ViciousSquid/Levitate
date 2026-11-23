@@ -24,6 +24,8 @@ import os
 import random
 import uuid
 
+from game.entities import FLAG_RAISE
+
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 OUT = os.path.join(ROOT, "maps", "levitate")
 
@@ -243,7 +245,7 @@ def build(spec):
         rival += pick(dist, key=lambda cell: -dist[cell], count=3 - len(rival))
     for i, cell in enumerate(rival):
         x, z = centre(*cell)
-        b.thing("levitateflag", f"Flag_Blue_{i + 1}", (x, 0, z), team="blue")
+        b.thing("levitateflag", f"Flag_Blue_{i + 1}", (x, FLAG_RAISE, z), team="blue")
     # Home flags: dead ends in the near half.
     near = [cell for cell in dist if dist[cell] <= far * 0.5]
     home = pick([c for c in dead_ends if c in near], key=lambda cell: dist[cell], count=3)
@@ -251,7 +253,7 @@ def build(spec):
         home += pick([c for c in near if c != start], key=lambda cell: -dist[cell], count=3 - len(home))
     for i, cell in enumerate(home):
         x, z = centre(*cell)
-        b.thing("levitateflag", f"Flag_Red_{i + 1}", (x, 0, z), team="red")
+        b.thing("levitateflag", f"Flag_Red_{i + 1}", (x, FLAG_RAISE, z), team="red")
 
     # Ledges: a raised block in a dead end, a spring pad in the cell before it.
     pad_tex = {k: faces(tex("trim_dark"), top=tex(f"pad_{k}")) for k in ("spring", "boost", "barrier")}

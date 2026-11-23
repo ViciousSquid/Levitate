@@ -202,3 +202,39 @@ def test_a_ledge_spring_clears_the_scaled_ledge(fio_session):
         peak = max(peak, feet)
     assert peak - floor_y > make_mazes.LEDGE_H, (peak, floor_y)
     editor.stop_play()
+
+
+@pytest.mark.parametrize("maze", MAZES)
+def test_flags_and_orbs_stand_above_the_floor(maze):
+    """Billboards are centred on their position: none may dip into the floor."""
+    from game.entities import FLAG_SIZE
+    data = json.load(open(os.path.join(ROOT, maze)))
+    floor_top = next(b for b in data["brushes"] if b["name"] == "Floor")
+    floor_top = floor_top["pos"][1] + floor_top["size"][1] / 2
+    for thing in data["things"]:
+        if thing["type"] == "levitateflag":
+            half = FLAG_SIZE[1] / 2
+        elif thing["type"] == "levitatepickup":
+            half = 28
+        else:
+            continue
+        assert thing["pos"][1] - half >= floor_top, thing["properties"]["name"]
+
+
+def test_hovercraft_monster_has_eight_views_per_team():
+    from editor.things import Monster
+    from engine import monster_constants as mc
+    _game()
+    assert "hovercraft" in mc.MONSTER_TYPES and "blue" in mc.MONSTER_VARIANTS["hovercraft"]
+    base = os.path.join(ROOT, "assets", "sprites", "monsters", "hovercraft")
+    for folder in (base, os.path.join(base, "blue")):
+        for state in ("idle", "shoot"):
+            for view in range(1, 9):
+                assert os.path.isfile(os.path.join(folder, f"{state}_{view}.png"))
+        assert os.path.isfile(os.path.join(folder, "dead.png"))
+    red = Monster(properties={"monster_type": "hovercraft"})
+    blue = Monster(properties={"monster_type": "hovercraft", "variant": "blue"})
+    assert red.properties["monster_type"] == "hovercraft"
+    assert blue.properties["variant"] == "blue"
+    idle, _dead, _shoot = Monster._get_default_paths("hovercraft", "blue")
+    assert idle == "assets/sprites/monsters/hovercraft/blue/idle.png"

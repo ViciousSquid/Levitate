@@ -491,7 +491,182 @@ def main():
     make_world_sprites()
     make_textures()
     make_branding()
+    make_hovercraft_sprites()
 
 
 if __name__ == "__main__":
     main()
+
+
+# Hovercraft: 8-direction monster sprites --------------------------------------
+# A small faceted 3D model of Levitate!'s craft (the same original design as
+# the app icon), rendered orthographically from eight bearings with flat
+# shading, so every view agrees with the others.
+#
+# Fio's eight views (engine/monster_facing.py): file _1 is the front, _2
+# front-left, _3 left, _4 back-left, _5 back, _6 back-right, _7 right and _8
+# front-right. In the craft's own frame +Z is forward, +X is its left (as for
+# Fio's player) and +Y is up; view k looks from a bearing of (k-1)*45 degrees
+# from the nose, turning toward the craft's left.
+
+HOVER_TEAMS = {
+    # body, body shadow side, trim, stripe
+    "red": ((206, 44, 44), (150, 26, 30), (120, 22, 26), (250, 236, 220)),
+    "blue": ((46, 104, 220), (30, 70, 160), (24, 46, 112), (230, 240, 255)),
+}
+SPRITE_SIZE = 256
+CRAFT_SCALE = 1.55        # model units -> sprite pixels
+CAMERA_ELEVATION = 16.0   # degrees above the horizon
+
+
+def _prism(bottom, top, colours):
+    """Faces of a prism between two outlines given as [(x, z)] at heights
+    (y0, y1): ``bottom = (y0, outline)``, ``top = (y1, outline)``.
+    *colours* is ``(side, top, bottom)``; a side colour may be a callable
+    ``f(index)`` for per-edge colour."""
+    (y0, lo), (y1, hi) = bottom, top
+    side, top_c, bottom_c = colours
+    faces = []
+    n = len(lo)
+    for i in range(n):
+        j = (i + 1) % n
+        quad = [(lo[i][0], y0, lo[i][1]), (lo[j][0], y0, lo[j][1]),
+                (hi[j][0], y1, hi[j][1]), (hi[i][0], y1, hi[i][1])]
+        faces.append((quad, side(i) if callable(side) else side))
+    faces.append(([(x, y1, z) for x, z in hi], top_c))
+    faces.append(([(x, y0, z) for x, z in reversed(lo)], bottom_c))
+    return faces
+
+
+def _mirror(outline):
+    """An outline given for the left half (x >= 0, nose to tail) mirrored into
+    a closed loop."""
+    return outline + [(-x, z) for x, z in reversed(outline)]
+
+
+def hovercraft_model(team):
+    body, shade, trim, stripe = HOVER_TEAMS[team]
+    skirt_c = (44, 46, 54)
+    faces = []
+    # Skirt: a wide rounded footprint, dark rubber.
+    skirt = []
+    for i in range(16):
+        a = math.radians(i * 360 / 16)
+        skirt.append((math.sin(a) * 46, math.cos(a) * 62))
+    faces += _prism((0, skirt), (12, [(x * 0.97, z * 0.97) for x, z in skirt]),
+                    (skirt_c, skirt_c, skirt_c))
+    # Hull: a wedge, narrow at the nose, broad at the tail.
+    hull_lo = _mirror([(14, 64), (40, 30), (44, -20), (38, -52)])
+    hull_hi = _mirror([(8, 48), (30, 22), (34, -18), (30, -46)])
+
+    def hull_side(i):
+        # The nose facets catch the stripe; the rest is body colour.
+        return stripe if i in (0, len(hull_lo) - 1) else body
+    faces += _prism((12, hull_lo), (30, hull_hi), (hull_side, body, shade))
+    # Deck and cabin.
+    deck = _mirror([(20, 14), (24, -16), (20, -40)])
+    cabin_top = _mirror([(12, 0), (16, -16), (14, -32)])
+    faces += _prism((30, deck), (46, cabin_top), (trim, trim, trim))
+    # Canopy: a bright slanted glass panel on the cabin's front.
+    faces.append(([(20, 30, 14), (-20, 30, 14), (-12, 46, 0), (12, 46, 0)], (130, 220, 255)))
+    # Tail fins, left and right.
+    for sx in (1, -1):
+        fin_lo = [(sx * 24, -30), (sx * 30, -30), (sx * 30, -50), (sx * 24, -50)]
+        fin_hi = [(sx * 30, -44), (sx * 34, -44), (sx * 34, -56), (sx * 30, -56)]
+        faces += _prism((30, fin_lo if sx > 0 else fin_lo[::-1]),
+                        (66, fin_hi if sx > 0 else fin_hi[::-1]), (body, stripe, shade))
+    # Thruster: a glowing panel across the tail.
+    faces.append(([(-22, 16, -51.5), (22, 16, -51.5), (20, 27, -47), (-20, 27, -47)], (255, 170, 60)))
+    return faces
+
+
+def _shade(colour, normal, light):
+    lit = max(0.0, sum(n * l for n, l in zip(normal, light)))
+    k = 0.45 + 0.65 * lit
+    return tuple(max(0, min(255, int(c * k))) for c in colour[:3])
+
+
+def render_hovercraft(team, view, flare=False, wreck=False):
+    """One sprite: *view* 1..8 as Fio numbers them."""
+    theta = math.radians((view - 1) * 45.0)
+    elev = math.radians(CAMERA_ELEVATION)
+    d = (math.sin(theta), 0.0, math.cos(theta))                  # craft -> camera
+    right = (math.cos(theta), 0.0, -math.sin(theta))
+    toward = (d[0] * math.cos(elev), math.sin(elev), d[2] * math.cos(elev))
+    up = (-d[0] * math.sin(elev), math.cos(elev), -d[2] * math.sin(elev))
+    light = (0.35, 0.85, 0.40)
+    norm = math.sqrt(sum(v * v for v in light))
+    light = tuple(v / norm for v in light)
+
+    size = SPRITE_SIZE
+    img, draw = canvas(size, size)
+    cx, cy = size / 2, size * 0.66
+
+    def dot(a, b):
+        return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+    def project(p):
+        if wreck:
+            # Lying askew: rolled onto one side a little and sunk.
+            x, y, z = p
+            roll = math.radians(18)
+            p = (x * math.cos(roll) - y * math.sin(roll),
+                 x * math.sin(roll) + y * math.cos(roll) - 6, z)
+        return ((cx + dot(p, right) * CRAFT_SCALE) * S,
+                (cy - dot(p, up) * CRAFT_SCALE) * S), dot(p, toward)
+
+    # The hover glow / shadow beneath.
+    glow = (*TEAL, 110) if not wreck else (0, 0, 0, 90)
+    gw, gh = 62 * CRAFT_SCALE, 62 * CRAFT_SCALE * math.sin(elev) * 1.4 + 8
+    draw.ellipse(sc(cx - gw, cy + 6 - gh / 2, cx + gw, cy + 6 + gh / 2), fill=glow)
+
+    polys = []
+    for points, colour in hovercraft_model(team):
+        a, b, c = points[0], points[1], points[2]
+        u = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+        v = (c[0] - a[0], c[1] - a[1], c[2] - a[2])
+        n = (u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0])
+        length = math.sqrt(dot(n, n)) or 1.0
+        n = tuple(x / length for x in n)
+        projected = [project(p) for p in points]
+        depth = sum(z for _xy, z in projected) / len(projected)
+        polys.append((depth, [xy for xy, _z in projected], colour, n))
+    # Painter's algorithm: farthest first. Faces pointing away are skipped
+    # unless the outline is flat (two-sided panels).
+    for depth, pts, colour, n in sorted(polys, key=lambda item: item[0]):
+        facing = dot(n, toward)
+        if facing < -0.02 and len(pts) > 4:
+            continue
+        fill = colour if colour == (255, 170, 60) or colour == (130, 220, 255) else _shade(colour, n, light)
+        if wreck:
+            fill = tuple(int(c * 0.45) for c in fill)
+        draw.polygon(pts, fill=fill + (255,), outline=(14, 14, 18, 255))
+    if flare and not wreck:
+        # Thruster flare, seen from behind and the sides only.
+        tail, depth = project((0, 22, -60))
+        if depth < 8:
+            r = 16 * S
+            draw.ellipse((tail[0] - r, tail[1] - r * 0.7, tail[0] + r, tail[1] + r * 0.7),
+                         fill=(255, 210, 120, 200))
+    if wreck:
+        for i in range(5):
+            x = cx - 20 + i * 11
+            draw.ellipse(sc(x - 9, cy - 70 - i * 7, x + 9, cy - 52 - i * 7), fill=(60, 60, 66, 150))
+    return img
+
+
+def make_hovercraft_sprites():
+    """assets/sprites/monsters/hovercraft/ (red) and .../hovercraft/blue/:
+    idle_1..8, shoot_1..8 (thrusters lit), dead, and idle/shoot (front)."""
+    base = os.path.join(ROOT, "assets", "sprites", "monsters", "hovercraft")
+    for team, folder in (("red", base), ("blue", os.path.join(base, "blue"))):
+        for view in range(1, 9):
+            finish(render_hovercraft(team, view), SPRITE_SIZE, SPRITE_SIZE,
+                   os.path.join(folder, f"idle_{view}.png"))
+            finish(render_hovercraft(team, view, flare=True), SPRITE_SIZE, SPRITE_SIZE,
+                   os.path.join(folder, f"shoot_{view}.png"))
+        finish(render_hovercraft(team, 1), SPRITE_SIZE, SPRITE_SIZE, os.path.join(folder, "idle.png"))
+        finish(render_hovercraft(team, 1, flare=True), SPRITE_SIZE, SPRITE_SIZE,
+               os.path.join(folder, "shoot.png"))
+        finish(render_hovercraft(team, 2, wreck=True), SPRITE_SIZE, SPRITE_SIZE,
+               os.path.join(folder, "dead.png"))

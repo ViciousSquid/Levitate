@@ -46,6 +46,7 @@ def install() -> None:
     starting.
     """
     global _installed
+    _register_hovercraft_monster()
     try:
         from plugins.manager import get_manager
         get_manager().register_builtin_game(_game_host())
@@ -53,6 +54,27 @@ def install() -> None:
         print(f"[Levitate] game host registration skipped: {exc}")
         return
     _installed = True
+
+
+#: The rival craft's monster type: 8-direction sprites under
+#: assets/sprites/monsters/hovercraft/ (red) and its ``blue`` variant,
+#: drawn by game/tools/make_art.py.
+HOVERCRAFT_MONSTER = "hovercraft"
+HOVERCRAFT_VARIANTS = ("blue",)
+
+
+def _register_hovercraft_monster() -> None:
+    """Add the hovercraft to Fio's monster types (and its blue variant), so a
+    Monster -- or a future rival-craft bot -- can wear it, editor included.
+    Fio reads both tables when it needs them, so extending them here is
+    enough; the engine's own list is left as it ships."""
+    from engine import monster_constants as mc
+    if HOVERCRAFT_MONSTER not in mc.MONSTER_TYPES:
+        mc.MONSTER_TYPES = tuple(mc.MONSTER_TYPES) + (HOVERCRAFT_MONSTER,)
+    variants = mc.MONSTER_VARIANTS.setdefault(HOVERCRAFT_MONSTER, [])
+    for name in HOVERCRAFT_VARIANTS:
+        if name not in variants:
+            variants.append(name)
 
 
 def show_launcher(root_directory, settings_path) -> str:
