@@ -2,14 +2,21 @@
 
 Every match fills the maze with rival craft on the other team -- how many is
 the launcher's **Rival craft** setting (``[Game] bots`` in ``settings.ini``,
-:data:`DEFAULT_BOTS` when unset, 0 for a solo time trial). They start at
-their own flags, in the far half, and play the match against you:
+:data:`DEFAULT_BOTS` when unset, 0 for a solo time trial). Like the player,
+each starts on one of the maze's spawn points at random (game/spawns.py),
+and they play the match against you:
 
 * **raiders** go for your home flags. A raider that reaches one picks it up
-  and carries it back to its base; a flag delivered there is lost. Ram a
+  and carries it to the nearest of its own team's flags; a flag delivered
+  there is lost. Ram a
   carrier to knock the flag loose: it goes straight back to its pole. Lose all
   three and the match is over.
 * **defenders** patrol their own flags and ram you when they see you.
+
+A match has :data:`MAX_CRAFT` seats. When it is full and another human
+craft joins (Fio's split-screen player 2, F9), a rival gives up its seat --
+one not carrying a flag, a defender before a raider -- and comes back when
+the seat is free again (:meth:`Squad.seat`).
 
 They answer the power cells: a **phantom** hides you from them, a **jammer**
 stalls every rival craft near you, and a **barrier** dropped behind you is a
@@ -38,6 +45,9 @@ from collections import deque
 DEFAULT_BOTS = 3
 #: The most the launcher offers.
 MAX_BOTS = 7
+#: Seats in a match: human craft and rival craft together. When it is full a
+#: human joining takes a rival's seat.
+MAX_CRAFT = MAX_BOTS + 1
 #: Where the count lives in settings.ini.
 SETTINGS_SECTION, SETTINGS_KEY = "Game", "bots"
 
@@ -450,7 +460,9 @@ class Bot:
         self.entity = entity
         self.actor = actor
         self.role = role                   # "raider" / "defender"
-        self.spawn = spawn                 # (x, y, z) feet, and its base
+        self.spawn = spawn                 # (x, y, z) feet: where it starts
+        self.fallback = spawn              # its start in a maze without spawn points
+        self.base = None                   # (x, z) where it takes a flag it holds
         self.carrying = None               # a home flag it holds
         self.target = None                 # the flag it is after
         self.patrol = None                 # (x, z) a defender is heading for
@@ -481,14 +493,20 @@ class Squad:
         self.count = max(0, min(MAX_BOTS, int(count)))
         self.rng = random.Random(seed)
         self.bots = []
+        self.spawns = None
+        self.benched = []                  # rivals that gave a human their seat
         self.nav = None
         self.routes = None                 # NodeGraph, or GridRoutes without nodes
         self.barriers = []                 # [(x, z, until, prop or None)]
         self.clock = 0.0
 
     # -- life cycle ------------------------------------------------------------
-    def start(self, match):
-        """Spawn the rival craft at their flags. Returns how many came."""
+    def start(self, match, spawns=None, occupied=()):
+        """Put the rival craft in the maze, each on a spawn point of
+        *spawns* (a :class:`game.spawns.SpawnPoints`) no craft at *occupied*
+        is on, or round their flags in a maze without any. Returns how many
+        came."""
+        self.spawns = spawns if spawns else None
         if self.count <= 0 or not match.rival_flags:
             return 0
         logic = self.logic
@@ -504,9 +522,9 @@ class Squad:
         things = logic.editor_state.things
         self.nav = NavGrid(match.walls, match.bounds)
         self.routes = NodeGraph.of(things, self.nav) or GridRoutes(self.nav)
-        spawns = self._spawn_points(match)
+        starts = self._spawn_points(match)
         for i in range(self.count):
-            x, y, z = spawns[i]
+            x, y, z = starts[i]
             entity = Monster(pos=[x, y + SPRITE_SIZE / 2, z], properties={
                 "name": f"Rival_{i + 1}", "monster_type": MONSTER_TYPE,
                 "variant": "blue" if match.rival_team == "blue" else "<None>",
@@ -522,7 +540,9 @@ class Squad:
             self.bots.append(bot)
             things.append(entity)
         self._entities_changed()
-        self.reset(match)
+        self.reset(match, occupied)
+        # Humans already playing come first.
+        self.seat(match, self.humans(), announce=False)
         # Fields for every place a craft heads for, while the maze loads
         # rather than in the middle of play.
         for flag in list(match.home_flags) + list(match.rival_flags):
@@ -530,7 +550,8 @@ class Squad:
         return len(self.bots)
 
     def _spawn_points(self, match):
-        """Feet positions round the rival flags, one per craft."""
+        """Feet positions round the rival flags, one per craft: where they
+        start in a maze without spawn points."""
         points = []
         flags = list(match.rival_flags)
         for i in range(self.count):
@@ -555,29 +576,103 @@ class Squad:
         friction = type(actor)._apply_move_friction.__get__(actor)
         actor._apply_move_friction = lambda delta: friction(delta * 0.14)
 
-    def reset(self, match):
-        """Every craft back to its start, flags it carried back home, raids
-        timed from now."""
-        import glm
+    def reset(self, match, occupied=()):
+        """Every craft to a spawn point no craft at *occupied* (the human
+        craft) is on, flags it carried back home, raids timed from now."""
         self.clock = 0.0
         self._clear_barriers()
         raiders = 0
+        taken = list(occupied)
         for bot in self.bots:
             if bot.carrying is not None:
                 self._return_flag(match, bot, announce=False)
-            x, y, z = bot.spawn
-            bot.actor.pos = glm.vec3(x, y + bot.actor.height / 2 + 2.0, z)
-            bot.actor.velocity = glm.vec3(0.0)
-            bot.actor.on_ground = False
-            bot.actor.angle = math.atan2(-x, -z)          # towards the middle
-            bot.prev = (0.0, 0.0)
-            bot.target = bot.patrol = None
-            bot.stun_until = bot.jammed_until = 0.0
-            bot.state = "waiting"
+            self._deal(bot, taken)
+            taken.append(bot.spawn)
+            self._home(bot)
             if bot.role == "raider":
                 bot.raid_at = RAID_START + RAID_STAGGER * raiders
                 raiders += 1
             self._place(bot)
+
+    def _deal(self, bot, occupied):
+        """A start for *bot*: a spawn point nobody at *occupied* is on."""
+        point = self.spawns.pick(occupied) if self.spawns else None
+        bot.spawn = point[:3] if point is not None else bot.fallback
+
+    def occupied(self, humans=()):
+        """Where every craft is: *humans* and the rivals in play."""
+        return list(humans) + [bot.feet() for bot in self.bots]
+
+    def _home(self, bot):
+        """*bot* at rest at its start, doing nothing yet."""
+        import glm
+        x, y, z = bot.spawn
+        bot.actor.pos = glm.vec3(x, y + bot.actor.height / 2 + 2.0, z)
+        bot.actor.velocity = glm.vec3(0.0)
+        bot.actor.on_ground = False
+        bot.actor.angle = math.atan2(-x, -z)          # towards the middle
+        bot.prev = (0.0, 0.0)
+        bot.target = bot.patrol = None
+        bot.stun_until = bot.jammed_until = 0.0
+        bot.state = "waiting"
+
+    # -- seats -------------------------------------------------------------------
+    def _human_positions(self):
+        runtime = getattr(self.logic, "player_runtime", None)
+        return [tuple(float(v) for v in p.pos)
+                for p in (getattr(runtime, "player", None), getattr(runtime, "player2", None))
+                if p is not None]
+
+    def humans(self):
+        """How many human craft are playing: the player, and player 2 when
+        split-screen is on."""
+        runtime = getattr(self.logic, "player_runtime", None)
+        return (int(getattr(runtime, "player", None) is not None)
+                + int(getattr(runtime, "player2", None) is not None)) or 1
+
+    def seat(self, match, humans, announce=True):
+        """Make the rivals fit beside *humans* human craft in
+        :data:`MAX_CRAFT` seats: in a full match a rival leaves for each human
+        that joins, and comes back when a human leaves. Returns how many
+        rivals left (negative: came back)."""
+        room = max(0, MAX_CRAFT - int(humans))
+        change = 0
+        while len(self.bots) > room:
+            self._bench(match, self._leaver())
+            change += 1
+        while len(self.bots) < room and self.benched:
+            self._unbench(min(self.benched, key=lambda b: b.index))
+            change -= 1
+        if change:
+            self._entities_changed()
+            if announce and match is not None and match.finished is None:
+                match.say("A PLAYER JOINED  —  A RIVAL MAKES ROOM" if change > 0
+                          else "A RIVAL RETURNS TO THE MAZE", 2.5)
+        return change
+
+    def _leaver(self):
+        """The rival that gives up its seat: one not holding a flag, a
+        defender before a raider, the last to come first."""
+        return max(self.bots, key=lambda b: (b.carrying is None, b.role == "defender", b.index))
+
+    def _bench(self, match, bot):
+        if bot.carrying is not None and match is not None:
+            self._return_flag(match, bot, announce=False)
+        self.bots.remove(bot)
+        self.benched.append(bot)
+        things = self.logic.editor_state.things
+        if bot.entity in things:
+            things.remove(bot.entity)
+
+    def _unbench(self, bot):
+        self.benched.remove(bot)
+        self._deal(bot, self.occupied(self._human_positions()))
+        self._home(bot)
+        bot.raid_at = self.clock + RAID_REST
+        self.bots.append(bot)
+        self.bots.sort(key=lambda b: b.index)
+        self.logic.editor_state.things.append(bot.entity)
+        self._place(bot)
 
     def stop(self, match=None):
         """Take the rival craft out of the scene (and any flag they hold back
@@ -589,12 +684,13 @@ class Squad:
         self._clear_barriers()
         things = getattr(getattr(self.logic, "editor_state", None), "things", None)
         if things is not None:
-            for bot in self.bots:
+            for bot in self.bots + self.benched:
                 if bot.entity in things:
                     things.remove(bot.entity)
         if self.bots:
             self._entities_changed()
         self.bots = []
+        self.benched = []
 
     def _entities_changed(self):
         session = getattr(self.logic, "session_runtime", None)
@@ -611,7 +707,7 @@ class Squad:
         """Run every craft for *dt* seconds. *player* is the RuntimeAPI's
         PlayerState; *handling* the player's HoverHandling (for the bump
         flash)."""
-        if not self.bots:
+        if not self.bots and not self.benched:
             return
         dt = max(0.0, min(float(dt), 0.1))
         self.clock += dt
@@ -624,6 +720,7 @@ class Squad:
                 self._step(match, player, dt, now, handling)
 
     def _step(self, match, player, dt, now, handling):
+        self.seat(match, self.humans())
         live = match.finished is None
         ppos = tuple(player.position)
         hidden = match.phantom_until > now
@@ -656,7 +753,7 @@ class Squad:
         nav = self.nav
         if bot.carrying is not None:
             bot.state = "carrying"
-            return self._follow(bot.spawn[0], bot.spawn[2], x, z)
+            return self._follow(bot.base[0], bot.base[1], x, z)
         if bot.role == "raider" and self.clock >= bot.raid_at:
             flag = self._raid_target(match, bot)
             if flag is not None:
@@ -834,8 +931,8 @@ class Squad:
     def _flags(self, match, bot):
         x, y, z = bot.feet()
         if bot.carrying is not None:
-            sx, _sy, sz = bot.spawn
-            if math.hypot(sx - x, sz - z) <= BASE_REACH:
+            bx, bz = bot.base
+            if math.hypot(bx - x, bz - z) <= BASE_REACH:
                 self._deliver(match, bot)
             return
         flag = bot.target
@@ -844,8 +941,21 @@ class Squad:
         fx, fy, fz = flag.pos
         if math.hypot(fx - x, fz - z) <= FLAG_REACH and abs(fy - y) < 200:
             bot.carrying, bot.target = flag, None
+            bot.base = self._base(match, bot)
             _glow(match, flag, False)
             match.say("A RIVAL HAS YOUR FLAG  —  RAM IT TO WIN IT BACK", 3.0)
+
+    def _base(self, match, bot):
+        """Where *bot* takes a flag it has picked up: the nearest pole of its
+        own team's flags, along the maze."""
+        x, _y, z = bot.feet()
+        best = None
+        for flag in match.rival_flags:
+            fx, _fy, fz = match.homes.get(id(flag), (tuple(flag.pos),))[0]
+            far = self.routes.distance(fx, fz, x, z)
+            if far is not None and (best is None or far < best[0]):
+                best = (far, (fx, fz))
+        return best[1] if best else (bot.spawn[0], bot.spawn[2])
 
     def _carry(self, bot):
         """A held flag rides above its craft."""
@@ -856,7 +966,7 @@ class Squad:
 
     def _return_flag(self, match, bot, announce=True):
         from engine.change_journal import moved
-        flag, bot.carrying = bot.carrying, None
+        flag, bot.carrying, bot.base = bot.carrying, None, None
         home = match.homes.get(id(flag))
         if home is not None:
             flag.pos = home[0]
@@ -867,7 +977,7 @@ class Squad:
 
     def _deliver(self, match, bot):
         from plugins.api import set_flag
-        flag, bot.carrying = bot.carrying, None
+        flag, bot.carrying, bot.base = bot.carrying, None, None
         match.lost.add(id(flag))
         set_flag(flag, "hidden", True)
         _glow(match, flag, False)

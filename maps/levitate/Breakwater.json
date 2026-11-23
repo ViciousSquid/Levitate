@@ -18907,6 +18907,118 @@
     "id": "d2f4c702-3781-5378-b158-4ed19a7aa415",
     "links": "Nav_5_7,Nav_6_6"
    }
+  },
+  {
+   "type": "levitatespawn",
+   "pos": [
+    -1848.0,
+    0,
+    -1848.0
+   ],
+   "properties": {
+    "type": "levitatespawn",
+    "name": "Spawn_1",
+    "id": "d926c847-10ed-5166-b9bd-a37665ab6076",
+    "angle": 0.0
+   }
+  },
+  {
+   "type": "levitatespawn",
+   "pos": [
+    1320.0,
+    0,
+    1848.0
+   ],
+   "properties": {
+    "type": "levitatespawn",
+    "name": "Spawn_2",
+    "id": "eedbff67-e992-587a-ba33-eadd3b3d5817",
+    "angle": 270.0
+   }
+  },
+  {
+   "type": "levitatespawn",
+   "pos": [
+    1848.0,
+    0,
+    -1320.0
+   ],
+   "properties": {
+    "type": "levitatespawn",
+    "name": "Spawn_3",
+    "id": "7e1230c1-24de-50b9-9f60-ad4e53fce398",
+    "angle": 270.0
+   }
+  },
+  {
+   "type": "levitatespawn",
+   "pos": [
+    -1320.0,
+    0,
+    792.0
+   ],
+   "properties": {
+    "type": "levitatespawn",
+    "name": "Spawn_4",
+    "id": "719ceb6b-1ea2-5a2b-83a7-fa897d1bf349",
+    "angle": 270.0
+   }
+  },
+  {
+   "type": "levitatespawn",
+   "pos": [
+    -264.0,
+    0,
+    -792.0
+   ],
+   "properties": {
+    "type": "levitatespawn",
+    "name": "Spawn_5",
+    "id": "13502900-06ba-5c89-9513-fde05590cdd0",
+    "angle": 270.0
+   }
+  },
+  {
+   "type": "levitatespawn",
+   "pos": [
+    1320.0,
+    0,
+    264.0
+   ],
+   "properties": {
+    "type": "levitatespawn",
+    "name": "Spawn_6",
+    "id": "ba58019c-4cd8-5f81-9747-b1ab2e2e31de",
+    "angle": 90.0
+   }
+  },
+  {
+   "type": "levitatespawn",
+   "pos": [
+    -264.0,
+    0,
+    1848.0
+   ],
+   "properties": {
+    "type": "levitatespawn",
+    "name": "Spawn_7",
+    "id": "dfc3479c-a5bb-507d-8644-244f6edd59ba",
+    "angle": 90.0
+   }
+  },
+  {
+   "type": "levitatespawn",
+   "pos": [
+    264.0,
+    0,
+    -1848.0
+   ],
+   "properties": {
+    "type": "levitatespawn",
+    "name": "Spawn_8",
+    "id": "e6a1f825-92e6-5e77-ab1a-b9d1cd5fad9e",
+    "angle": 90.0
+   }
   }
  ]
 }

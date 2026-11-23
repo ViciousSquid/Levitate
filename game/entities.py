@@ -138,6 +138,19 @@ class LevitateNode(Thing):
         self.properties.setdefault("links", "")
 
 
+class LevitateSpawn(Thing):
+    """A spawn point (game/spawns.py). Every maze has eight, one per seat;
+    each craft in a match -- player or rival -- starts on one chosen at
+    random. Stands on the floor; ``angle`` is the heading, in degrees, as a
+    PlayerStart's."""
+    pixmap_path = "assets/sprites/player.png"
+
+    def __init__(self, pos=None, properties=None):
+        super().__init__(pos, properties)
+        self.properties["type"] = "levitatespawn"
+        self.properties.setdefault("angle", 0.0)
+
+
 class LevitateBarrier(Prop):
     """A barrier a craft has dropped: a wall of force rival craft cannot
     cross (game/bots.py). Made in play from a power cell, never placed in a
@@ -158,4 +171,5 @@ ENTITIES = (
     (LevitatePickup, "Power-up"),
     (LevitatePad, "Pad"),
     (LevitateNode, "Navigation Node"),
+    (LevitateSpawn, "Spawn Point"),
 )

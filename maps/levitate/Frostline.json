@@ -33248,6 +33248,118 @@
     "id": "ec2b40c1-25b0-5b0b-aa6f-c54290343413",
     "links": "Nav_10_9,Nav_11_8"
    }
+  },
+  {
+   "type": "levitatespawn",
+   "pos": [
+    -2904.0,
+    0,
+    -2376.0
+   ],
+   "properties": {
+    "type": "levitatespawn",
+    "name": "Spawn_1",
+    "id": "e41c4e7a-69c5-5375-8527-634487e4610e",
+    "angle": 0.0
+   }
+  },
+  {
+   "type": "levitatespawn",
+   "pos": [
+    2904.0,
+    0,
+    1848.0
+   ],
+   "properties": {
+    "type": "levitatespawn",
+    "name": "Spawn_2",
+    "id": "b5fc178d-07e2-534c-8ca9-ae631aadd165",
+    "angle": 0.0
+   }
+  },
+  {
+   "type": "levitatespawn",
+   "pos": [
+    -1848.0,
+    0,
+    2376.0
+   ],
+   "properties": {
+    "type": "levitatespawn",
+    "name": "Spawn_3",
+    "id": "56c4c4dc-708a-5053-85cb-751a0fd4a27c",
+    "angle": 90.0
+   }
+  },
+  {
+   "type": "levitatespawn",
+   "pos": [
+    1848.0,
+    0,
+    -2376.0
+   ],
+   "properties": {
+    "type": "levitatespawn",
+    "name": "Spawn_4",
+    "id": "a7c4bdb3-4cc6-53a8-89a7-1c883d8d6d50",
+    "angle": 90.0
+   }
+  },
+  {
+   "type": "levitatespawn",
+   "pos": [
+    -264.0,
+    0,
+    -264.0
+   ],
+   "properties": {
+    "type": "levitatespawn",
+    "name": "Spawn_5",
+    "id": "a042a988-51ee-5db8-877c-0e74ceb56a19",
+    "angle": 90.0
+   }
+  },
+  {
+   "type": "levitatespawn",
+   "pos": [
+    -2904.0,
+    0,
+    264.0
+   ],
+   "properties": {
+    "type": "levitatespawn",
+    "name": "Spawn_6",
+    "id": "e3efefdc-db06-5cf5-b3a3-ea379c52fcdc",
+    "angle": 90.0
+   }
+  },
+  {
+   "type": "levitatespawn",
+   "pos": [
+    2376.0,
+    0,
+    -264.0
+   ],
+   "properties": {
+    "type": "levitatespawn",
+    "name": "Spawn_7",
+    "id": "fa47f1e9-b317-5383-b54f-843c6fcf2996",
+    "angle": 90.0
+   }
+  },
+  {
+   "type": "levitatespawn",
+   "pos": [
+    264.0,
+    0,
+    1848.0
+   ],
+   "properties": {
+    "type": "levitatespawn",
+    "name": "Spawn_8",
+    "id": "a89de1f8-20c4-5bbb-85aa-90c49f221433",
+    "angle": 90.0
+   }
   }
  ]
 }

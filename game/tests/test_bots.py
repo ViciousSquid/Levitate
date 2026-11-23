@@ -39,6 +39,25 @@ def _rivals(editor):
     return [t for t in editor.state.things if t.properties.get("levitate_bot")]
 
 
+def _assert_on_spawn_points(host, extra=()):
+    """The player and every rival (and *extra* human positions) stand on a
+    spawn point each, no two on the same one."""
+    points = host.spawns.points
+    assert len(points) == 8
+
+    def spawn_of(x, z):
+        index = min(range(len(points)),
+                    key=lambda i: math.hypot(points[i][0] - x, points[i][2] - z))
+        assert math.hypot(points[index][0] - x, points[index][2] - z) < 40.0, (x, z)
+        return index
+
+    px, _py, pz = host.api.player.position
+    seats = [spawn_of(px, pz)] + [spawn_of(x, z) for x, z in extra]
+    seats += [spawn_of(bot.feet()[0], bot.feet()[2]) for bot in host.squad.bots]
+    assert len(set(seats)) == len(seats), seats
+    return seats
+
+
 def test_the_rival_count_setting():
     def config(text):
         parser = configparser.ConfigParser()
@@ -85,11 +104,8 @@ def test_a_match_starts_with_three_rivals_by_default(fio_session):
         props = craft.properties
         assert props["monster_type"] == "hovercraft" and props["variant"] == "blue"
         assert props["disabled"], "stock monster AI must leave the rivals alone"
-    # They start in the rival half, at the rival flags, not on the player.
-    px, _py, pz = host.api.player.position
-    for bot in host.squad.bots:
-        x, _y, z = bot.feet()
-        assert math.hypot(x - px, z - pz) > 1500.0
+    # Everyone starts on a spawn point of their own.
+    _assert_on_spawn_points(host)
     assert len(host.match.rivals) == 3
     editor.stop_play()
     assert not _rivals(editor) and host.squad is None
@@ -134,6 +150,10 @@ def test_a_raider_takes_a_flag_and_a_ram_wins_it_back(fio_session, monkeypatch):
     host, editor = _play(fio_session, 1)
     match, bot = host.match, host.squad.bots[0]
     player = host.api.player
+    # The player sits on a random spawn point; keep it from bumping the
+    # raider until the ram.
+    bump = bots.Squad._bump_player
+    monkeypatch.setattr(bots.Squad, "_bump_player", lambda *args: None)
     for _ in range(60 * 60):
         editor.step(1)
         if bot.carrying is not None:
@@ -145,6 +165,7 @@ def test_a_raider_takes_a_flag_and_a_ram_wins_it_back(fio_session, monkeypatch):
     assert math.hypot(flag.pos[0] - home[0], flag.pos[2] - home[2]) > 150.0, \
         "the flag rides on the raider"
     # Ram the carrier.
+    monkeypatch.setattr(bots.Squad, "_bump_player", bump)
     x, y, z = bot.feet()
     player.teleport((x - 60.0, y + 50.0, z), velocity=(400.0, 0.0, 0.0))
     editor.step(2)
@@ -162,7 +183,10 @@ def test_rivals_delivering_every_flag_lose_the_match_and_r_restarts(fio_session)
         bot.target = flag
         squad._flags(match, _At(bot, flag.pos))
         assert bot.carrying is flag
-        squad._flags(match, _At(bot, bot.spawn))
+        base = bot.base
+        assert any(math.hypot(base[0] - f.pos[0], base[1] - f.pos[2]) < 1.0
+                   for f in match.rival_flags), "a flag is taken to a rival flag"
+        squad._flags(match, _At(bot, (base[0], 0.0, base[1])))
         assert bot.carrying is None and id(flag) in match.lost
         assert flag.properties.get("hidden")
     assert match.finished == "lost"
@@ -348,4 +372,124 @@ def test_a_maze_without_nodes_still_has_rivals_that_drive(fio_session):
     editor.step(240)
     assert max(math.hypot(b.feet()[0] - s[0], b.feet()[2] - s[2])
                for b, s in zip(squad.bots, starts)) > 300.0
+    editor.stop_play()
+
+
+def test_zero_rivals_from_the_settings_file_when_no_window_answers(tmp_path, monkeypatch):
+    """The launcher's 0 is honoured even where no editor window can be
+    asked: settings.ini is read, never mistaken for the default."""
+    import editor.user_paths as user_paths
+    host = _game()
+    settings = tmp_path / "settings.ini"
+    launcher.DisplaySettings(str(settings)).save("Windowed", 1280, 720, True, bots=0)
+    monkeypatch.setattr(user_paths, "settings_path", lambda root: str(settings))
+    monkeypatch.setattr(type(host), "_window_for", staticmethod(lambda logic: None))
+    monkeypatch.setattr(host, "host", None)
+    assert host.bot_count(None) == 0
+    settings.write_text("[Game]\nbots = 4\n")
+    assert host.bot_count(None) == 4
+
+
+def test_a_human_joining_a_full_match_takes_a_rivals_seat(fio_session, monkeypatch):
+    from engine.player import Player
+    monkeypatch.setattr(bots, "BASE_REACH", -1.0)      # no deliveries here
+    host, editor = _play(fio_session, bots.MAX_BOTS)
+    squad, match = host.squad, host.match
+    assert len(_rivals(editor)) == bots.MAX_BOTS == bots.MAX_CRAFT - 1    # full
+    editor.step(30)
+    # A raider holding a flag keeps its seat.
+    raider = next(b for b in squad.bots if b.role == "raider")
+    flag = match.home_flags[0]
+    raider.target = flag
+    squad._flags(match, _At(raider, flag.pos))
+    assert raider.carrying is flag
+    # Player 2 joins (split-screen).
+    runtime = editor.logic.player_runtime
+    x, y, z = host.api.player.position
+    runtime.player2 = Player(x + 64.0, z)
+    editor.step(2)
+    assert len(squad.bots) == len(_rivals(editor)) == bots.MAX_BOTS - 1
+    gone = squad.benched[0]
+    assert gone.role == "defender" and gone.entity not in editor.state.things
+    assert raider in squad.bots and raider.carrying is flag
+    assert "MAKES ROOM" in match.message
+    # Player 2 came in on a spawn point, clear of every other craft.
+    p2x, p2z = float(runtime.player2.pos.x), float(runtime.player2.pos.z)
+    assert min(math.hypot(p[0] - p2x, p[2] - p2z) for p in host.spawns.points) < 40.0
+    others = [host.api.player.position] + [bot.feet() for bot in squad.bots]
+    assert min(math.hypot(o[0] - p2x, o[2] - p2z) for o in others) > 100.0
+    # Player 2 leaves: the rival comes back, at its start.
+    runtime.player2 = None
+    editor.step(2)
+    assert len(squad.bots) == len(_rivals(editor)) == bots.MAX_BOTS
+    assert not squad.benched and gone.entity in editor.state.things
+    editor.stop_play()
+    assert not _rivals(editor)
+
+
+def test_a_match_with_seats_to_spare_keeps_its_rivals(fio_session):
+    from engine.player import Player
+    host, editor = _play(fio_session, 3)
+    runtime = editor.logic.player_runtime
+    x, y, z = host.api.player.position
+    runtime.player2 = Player(x + 64.0, z)
+    editor.step(2)
+    assert len(host.squad.bots) == 3 and not host.squad.benched
+    runtime.player2 = None
+    editor.stop_play()
+
+
+# -- spawn points ----------------------------------------------------------------
+@pytest.mark.parametrize("maze", MAZES)
+def test_every_maze_has_eight_spawn_points_spread_over_it(maze):
+    from game.tools import make_mazes
+    data, _nodes, _graph, grid = _graph_of(maze)
+    spawns = [t for t in data["things"] if t["type"] == "levitatespawn"]
+    assert len(spawns) == 8 and len({t["properties"]["name"] for t in spawns}) == 8
+    flags = [t["pos"] for t in data["things"] if t["type"] == "levitateflag"]
+    pads = [t["pos"] for t in data["things"] if t["type"] == "levitatepad"]
+    for spawn in spawns:
+        x, y, z = spawn["pos"]
+        assert y == 0 and grid.free(x, z), spawn["properties"]["name"]
+        assert min(math.hypot(x - f[0], z - f[2]) for f in flags) > make_mazes.CELL * 0.6
+        assert min(math.hypot(x - p[0], z - p[2]) for p in pads) > 120.0
+    for i, a in enumerate(spawns):
+        for b in spawns[i + 1:]:
+            gap = math.hypot(a["pos"][0] - b["pos"][0], a["pos"][2] - b["pos"][2])
+            assert gap >= make_mazes.CELL * 2, (a["properties"]["name"], b["properties"]["name"])
+
+
+def test_random_mazes_have_eight_spawn_points_even_when_small():
+    from game import random_maze
+    for cols, rows in ((5, 5), (6, 5), (9, 9), (16, 16)):
+        data = random_maze.generate(dict(cols=cols, rows=rows, ledges=5, plazas=6, seed=31))
+        spawns = [t for t in data["things"] if t["type"] == "levitatespawn"]
+        assert len(spawns) == 8, (cols, rows)
+        assert len({(t["pos"][0], t["pos"][2]) for t in spawns}) == 8
+
+
+def test_every_craft_starts_on_a_random_spawn_point(fio_session):
+    host, editor = _play(fio_session, bots.MAX_BOTS)       # all eight seats
+    seen = set()
+    for _ in range(8):
+        seats = _assert_on_spawn_points(host)
+        assert len(seats) == 8
+        seen.add(seats[0])
+        host.match.finished = "timeout"                    # then retry
+        editor.step(2, keys={KEY_R})
+    assert len(seen) > 1, "the player always starts on the same spawn point"
+    editor.stop_play()
+
+
+def test_a_maze_without_spawn_points_starts_the_player_at_its_playerstart(fio_session):
+    import json
+    data = json.load(open(os.path.join(ROOT, MAZE)))
+    data["things"] = [t for t in data["things"] if t["type"] != "levitatespawn"]
+    start = next(t for t in data["things"] if t["type"] == "playerstart")
+    host = _game()
+    editor = fio_session(data)
+    editor.start_play().step(2)
+    x, _y, z = host.api.player.position
+    assert math.hypot(x - start["pos"][0], z - start["pos"][2]) < 60.0
+    assert len(host.squad.bots) == 3 and not host.spawns
     editor.stop_play()
