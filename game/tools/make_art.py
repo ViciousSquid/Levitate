@@ -353,79 +353,221 @@ def make_world_sprites():
 
 
 # Branding --------------------------------------------------------------------
-def craft_silhouette(d, cx, cy, scale, body, trim, glow):
-    """Levitate's hovercraft: a wedge hull over a skirt, twin fins and a
-    canopy -- an original design, seen three-quarters from the front."""
-    def p(*coords):
-        if coords and isinstance(coords[0], tuple):
-            pairs = coords
+# Levitate!'s logo is its hovercraft: the faceted red craft of the sprites
+# (render_hovercraft, below), seen from the front left. The app icon, the
+# console's logo and the mark on the launcher and splash are all that render.
+#
+# The launcher and splash set it in a 1990s synthwave scene -- a slatted sun
+# over a neon grid, a few Memphis shapes -- and the launcher stands on a
+# blacklight bowling-alley carpet (make_carpet).
+HOT_PINK = (255, 46, 160)
+NEON_CYAN = (40, 240, 255)
+NEON_YELLOW = (255, 232, 60)
+NEON_LIME = (140, 255, 80)
+NEON_ORANGE = (255, 140, 40)
+NEON_PURPLE = (170, 90, 255)
+
+
+def craft_logo(height, glow=True):
+    """The logo: the red hovercraft, front-left, *height* pixels tall
+    (RGBA, cropped to the craft)."""
+    scale = height / 118.0
+    size = int(256 * scale)
+    art = render_hovercraft("red", 2, size=size, scale=CRAFT_SCALE * scale, glow=glow)
+    art = art.resize((size, size), Image.LANCZOS)
+    return art.crop(art.getbbox())
+
+
+def _vertical_gradient(size, stops):
+    """An RGB image shaded top to bottom through *stops*: ``[(t, colour)]``."""
+    w, h = size
+    img = Image.new("RGB", size)
+    d = ImageDraw.Draw(img)
+    for y in range(h):
+        t = y / max(1, h - 1)
+        for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
+            if t0 <= t <= t1:
+                k = (t - t0) / max(1e-6, t1 - t0)
+                d.line([(0, y), (w, y)], fill=tuple(int(c0[i] + (c1[i] - c0[i]) * k) for i in range(3)))
+                break
+    return img
+
+
+def synthwave_scene(w, h, wordmark=True, seed=7):
+    """The launcher banner / splash: a slatted sun going down behind a neon
+    grid, the craft hovering over it, the wordmark across the sky."""
+    rng = random.Random(seed)
+    W, H = w * S, h * S
+    horizon = int(H * 0.60)
+    img = _vertical_gradient((W, H), [(0.0, (18, 8, 48)), (0.34, (74, 16, 110)),
+                                      (0.56, (214, 30, 140)), (0.60, (255, 120, 150)),
+                                      (0.601, (10, 4, 30)), (1.0, (26, 8, 60))]).convert("RGBA")
+    d = ImageDraw.Draw(img)
+    for _ in range(int(w * h / 900)):
+        x, y = rng.random() * W, rng.random() * horizon * 0.8
+        r = rng.choice((1, 1, 1, 2)) * S * 0.5
+        d.ellipse((x - r, y - r, x + r, y + r), fill=(255, 235, 255, rng.randint(90, 230)))
+    # The sun: yellow through orange to pink, cut by slats that widen downward.
+    radius = int(H * 0.40)
+    cx, cy = int(W * 0.70), horizon - int(H * 0.06)
+    sun = _vertical_gradient((radius * 2, radius * 2), [(0.0, (255, 236, 90)), (0.5, (255, 130, 60)),
+                                                        (1.0, (255, 40, 150))])
+    mask = Image.new("L", sun.size, 0)
+    md = ImageDraw.Draw(mask)
+    md.ellipse((0, 0, radius * 2, radius * 2), fill=255)
+    y, gap, bar = int(radius * 0.95), S * 2, S * 9
+    while y < radius * 2:
+        md.rectangle((0, y, radius * 2, y + gap), fill=0)
+        y += gap + bar
+        gap += int(S * 1.6)
+        bar = max(S * 3, bar - S)
+    halo = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(halo).ellipse((cx - radius * 1.25, cy - radius * 1.25, cx + radius * 1.25,
+                                  cy + radius * 1.25), fill=(255, 90, 170, 80))
+    img.alpha_composite(halo.filter(ImageFilter.GaussianBlur(radius * 0.22)))
+    sky = img.crop((0, 0, W, horizon))
+    sky.paste(sun, (cx - radius, cy - radius), mask)
+    img.paste(sky, (0, 0))
+    d = ImageDraw.Draw(img)
+    # Memphis shapes in the sky: a triangle, a field of dots, a squiggle.
+    tri = [(W * 0.035, H * 0.50), (W * 0.115, H * 0.50), (W * 0.075, H * 0.30)]
+    d.line(tri + [tri[0]], fill=(*NEON_CYAN, 255), width=S * 2, joint="curve")
+    for i in range(6):
+        for j in range(3):
+            x, y = W * 0.44 + i * S * 7, H * 0.07 + j * S * 7
+            d.ellipse((x - S * 1.4, y - S * 1.4, x + S * 1.4, y + S * 1.4), fill=(*NEON_YELLOW, 255))
+    squiggle = [(W * 0.90 + i * S * 5, H * 0.10 + (S * 5 if i % 2 else 0)) for i in range(9)]
+    d.line(squiggle, fill=(*NEON_LIME, 255), width=S * 2, joint="curve")
+    # The grid: lines to the vanishing point, and rows closing on the horizon.
+    grid = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(grid)
+    for i in range(-18, 19):
+        gd.line((W / 2 + i * W * 0.035, horizon, W / 2 + i * W * 0.22, H), fill=(*NEON_CYAN, 255), width=S)
+    for i in range(1, 15):
+        y = horizon + (H - horizon) * (i / 14.0) ** 2.2
+        gd.line((0, y, W, y), fill=(*NEON_CYAN, 255), width=S)
+    img.alpha_composite(grid.filter(ImageFilter.GaussianBlur(S * 2.2)))
+    img.alpha_composite(grid)
+    d = ImageDraw.Draw(img)
+    d.line((0, horizon, W, horizon), fill=(255, 220, 255, 255), width=S * 2)
+    # The craft, hovering over the grid in front of the sun.
+    craft = craft_logo(int(H * 0.56))
+    img.alpha_composite(craft, (int(cx - craft.width * 0.5), int(H * 0.93 - craft.height)))
+    if wordmark:
+        text = "LEVITATE!"
+        f = font("Rushfordclean-rgz89.otf", int(H * 0.36))
+        d = ImageDraw.Draw(img)
+        tw = int(d.textlength(text, font=f))
+        th = int(H * 0.40)
+        layer = Image.new("RGBA", (tw + th, th + S * 12), (0, 0, 0, 0))
+        ld = ImageDraw.Draw(layer)
+        ox, oy = int(th * 0.3), S * 4
+        ld.text((ox + S * 5, oy + S * 5), text, font=f, fill=(*NEON_CYAN, 255))
+        ld.text((ox + S * 2, oy + S * 2), text, font=f, fill=(40, 8, 70, 255))
+        face = Image.new("L", layer.size, 0)
+        ImageDraw.Draw(face).text((ox, oy), text, font=f, fill=255)
+        fill = _vertical_gradient(layer.size, [(0.0, (255, 250, 200)), (0.45, (255, 232, 60)),
+                                               (0.55, (255, 90, 170)), (1.0, (255, 46, 160))])
+        layer.paste(fill, (0, 0), face)
+        # Slanted, as if written at speed.
+        layer = layer.transform(layer.size, Image.AFFINE, (1, 0.24, -th * 0.24, 0, 1, 0),
+                                resample=Image.BICUBIC)
+        x, y = int(W * 0.035), int(H * 0.085)
+        img.alpha_composite(layer, (x, y))
+        d = ImageDraw.Draw(img)
+        d.line((x + th * 0.2, y + th * 0.99, x + tw * 0.92, y + th * 0.91), fill=(*HOT_PINK, 255), width=S * 3)
+        sub = font("HornetDisplay-Regular.ttf", int(H * 0.066))
+        d.text((x + th * 0.22, y + th * 1.04), "CAPTURE  THE  FLAGS  /  RULE  THE  MAZE",
+               font=sub, fill=(*NEON_CYAN, 255))
+    return img.resize((w, h), Image.LANCZOS)
+
+
+def make_carpet(size=384, seed=1994):
+    """A tile of blacklight bowling-alley carpet: neon squiggles, stars and
+    confetti on near-black. Seamless: every shape is drawn wrapped."""
+    rng = random.Random(seed)
+    W = size * S
+    img = Image.new("RGBA", (W, W), (9, 5, 20, 255))
+    colours = (HOT_PINK, NEON_CYAN, NEON_LIME, NEON_ORANGE, NEON_PURPLE, NEON_YELLOW)
+
+    def wrapped(draw_at):
+        for dx in (-W, 0, W):
+            for dy in (-W, 0, W):
+                draw_at(dx, dy)
+
+    layer = Image.new("RGBA", (W, W), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    for _ in range(15):
+        colour = rng.choice(colours) + (255,)
+        x, y = rng.random() * W, rng.random() * W
+        kind = rng.choice(("swirl", "swirl", "star", "zigzag", "ring", "triangle"))
+        r = rng.uniform(0.06, 0.13) * W
+        turn = rng.random() * 360
+        width = int(S * rng.uniform(2.5, 4.5))
+        if kind == "swirl":
+            wrapped(lambda dx, dy: d.arc((x - r + dx, y - r + dy, x + r + dx, y + r + dy),
+                                         turn, turn + rng.choice((200, 250, 290)), fill=colour, width=width))
+        elif kind == "ring":
+            wrapped(lambda dx, dy: d.ellipse((x - r * 0.4 + dx, y - r * 0.4 + dy, x + r * 0.4 + dx,
+                                              y + r * 0.4 + dy), outline=colour, width=width))
+        elif kind == "star":
+            pts = []
+            for i in range(10):
+                rad = r * (0.62 if i % 2 == 0 else 0.26)
+                ang = math.radians(turn + i * 36)
+                pts.append((x + math.cos(ang) * rad, y + math.sin(ang) * rad))
+            wrapped(lambda dx, dy: d.line([(px + dx, py + dy) for px, py in pts + [pts[0]]],
+                                          fill=colour, width=width, joint="curve"))
+        elif kind == "triangle":
+            pts = [(x + math.cos(math.radians(turn + i * 120)) * r * 0.5,
+                    y + math.sin(math.radians(turn + i * 120)) * r * 0.5) for i in range(3)]
+            wrapped(lambda dx, dy: d.line([(px + dx, py + dy) for px, py in pts + [pts[0]]],
+                                          fill=colour, width=width, joint="curve"))
         else:
-            pairs = list(zip(coords[0::2], coords[1::2]))
-        return [((cx + x * scale) * S, (cy + y * scale) * S) for x, y in pairs]
-    (sx0, sy0), (sx1, sy1) = p((-50, 18), (50, 34))
-    d.ellipse((sx0, sy0, sx1, sy1), fill=(0, 0, 0, 80))                              # shadow
-    d.polygon(p(-46, 10, -34, 22, 34, 22, 46, 10, 34, 4, -34, 4), fill=glow)            # skirt glow
-    d.polygon(p(-44, 6, -30, -10, 30, -10, 44, 6, 30, 14, -30, 14), fill=body)          # hull
-    d.polygon(p(-30, -10, -16, -24, 16, -24, 30, -10), fill=trim)                       # deck
-    d.polygon(p(-12, -24, -6, -34, 6, -34, 12, -24), fill=(120, 220, 255))              # canopy
-    d.polygon(p(-30, -10, -40, -30, -34, -30, -22, -12), fill=trim)                     # fin L
-    d.polygon(p(30, -10, 40, -30, 34, -30, 22, -12), fill=trim)                         # fin R
-    d.line(p(-44, 6, 44, 6), fill=WHITE, width=max(1, int(scale)) * S)
+            ang = math.radians(turn)
+            pts = [(x + math.cos(ang) * i * r * 0.28 - math.sin(ang) * (r * 0.16 if i % 2 else -r * 0.16),
+                    y + math.sin(ang) * i * r * 0.28 + math.cos(ang) * (r * 0.16 if i % 2 else -r * 0.16))
+                   for i in range(6)]
+            wrapped(lambda dx, dy: d.line([(px + dx, py + dy) for px, py in pts],
+                                          fill=colour, width=width, joint="curve"))
+    for _ in range(70):
+        colour = rng.choice(colours) + (255,)
+        x, y, r = rng.random() * W, rng.random() * W, S * rng.uniform(1.0, 2.2)
+        wrapped(lambda dx, dy: d.ellipse((x - r + dx, y - r + dy, x + r + dx, y + r + dy), fill=colour))
+    glow = layer.filter(ImageFilter.GaussianBlur(S * 3))
+    img.alpha_composite(glow)
+    img.alpha_composite(layer)
+    # Dimmed: it is the floor the launcher stands on, not the launcher.
+    img = Image.blend(img, Image.new("RGBA", (W, W), (9, 5, 20, 255)), 0.42)
+    finish(img.convert("RGB"), size, size, os.path.join(GAME, "ui", "carpet.png"))
 
 
 def make_branding():
-    # App icon.
+    # The logo: the craft alone. App icon (and its .ico), and the editor
+    # console's logo.
     size = 256
-    img, d = canvas(size, size)
-    d.rounded_rectangle(sc(8, 8, 248, 248), 48 * S, fill=(18, 22, 34))
-    d.rounded_rectangle(sc(8, 8, 248, 248), 48 * S, outline=TEAL, width=6 * S)
-    for r in (60, 90):
-        d.arc(sc(128 - r * 1.4, 150 - r * 0.5, 128 + r * 1.4, 150 + r * 0.5), 0, 180, fill=(30, 90, 80), width=3 * S)
-    craft_silhouette(d, 128, 140, 2.2, RED, (150, 30, 30), (*TEAL, 200))
-    finish(img, size, size, os.path.join(ROOT, "assets", "icon.png"))
-    Image.open(os.path.join(ROOT, "assets", "icon.png")).save(
-        os.path.join(ROOT, "assets", "icon.ico"), sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
+    icon = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    craft = craft_logo(190)
+    if craft.width > size - 8:
+        craft = craft.resize((size - 8, int(craft.height * (size - 8) / craft.width)), Image.LANCZOS)
+    icon.alpha_composite(craft, ((size - craft.width) // 2, (size - craft.height) // 2))
+    path = os.path.join(ROOT, "assets", "icon.png")
+    icon.save(path)
+    print("wrote assets/icon.png")
+    icon.save(os.path.join(ROOT, "assets", "icon.ico"),
+              sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
     print("wrote assets/icon.ico")
-    # Banner / splash: chrome wordmark over a perspective grid maze.
-    for path, (w, h) in ((os.path.join(GAME, "ui", "banner.png"), (720, 240)),
-                         (os.path.join(ROOT, "assets", "splash.png"), (455, 200))):
-        img, d = canvas(w, h, (10, 12, 22, 255))
-        horizon = h * 0.52
-        for i in range(0, 24):
-            t = i / 23
-            y = horizon + (h - horizon) * (t ** 2)
-            d.line(sc(0, y, w, y), fill=(20, 80 + int(60 * t), 72), width=S)
-        for i in range(-12, 13):
-            d.line(sc(w / 2 + i * 6, horizon, w / 2 + i * w / 8, h), fill=(20, 110, 96), width=S)
-        # Sky gradient.
-        for y in range(int(horizon)):
-            t = y / horizon
-            d.line(sc(0, y, w, y), fill=(int(14 + 30 * t), int(10 + 20 * t), int(40 + 50 * t)), width=S)
-        craft_silhouette(d, w * 0.78, h * 0.70, h / 120, RED, (150, 30, 30), (*TEAL, 200))
-        f = font("Rushfordclean-rgz89.otf", int(h * 0.30) * S)
-        text = "LEVITATE!"
-        tw = d.textlength(text, font=f)
-        x, y = (w * 0.06) * S, (h * 0.14) * S
-        d.text((x + 4 * S, y + 4 * S), text, font=f, fill=(0, 0, 0, 160))
-        # Chrome: fill with a vertical gradient through a mask.
-        mask = Image.new("L", img.size, 0)
-        ImageDraw.Draw(mask).text((x, y), text, font=f, fill=255)
-        grad = Image.new("RGBA", img.size)
-        gd = ImageDraw.Draw(grad)
-        top, bottom = int(y), int(y + h * 0.36 * S)
-        for yy in range(top, bottom):
-            t = (yy - top) / max(1, bottom - top)
-            if t < 0.5:
-                c = (int(250 - 90 * t), int(250 - 70 * t), 255)
-            else:
-                c = (int(120 + 200 * (t - 0.5)), int(90 + 120 * (t - 0.5)), int(60 + 40 * (t - 0.5)))
-            gd.line([(0, yy), (img.size[0], yy)], fill=c + (255,))
-        img.paste(grad, (0, 0), mask)
-        edge = mask.filter(ImageFilter.FIND_EDGES)
-        img.paste(Image.new("RGBA", img.size, (*TEAL, 255)), (0, 0), edge)
-        sub = font("HornetDisplay-Regular.ttf", int(h * 0.075) * S)
-        d.text((x + 6 * S, y + h * 0.36 * S), "CAPTURE  THE  FLAGS  ·  RULE  THE  MAZE", font=sub, fill=AMBER)
-        finish(img, w, h, path)
+    logo = Image.new("RGBA", (318, 172), (0, 0, 0, 0))
+    craft = craft_logo(150)
+    logo.alpha_composite(craft, ((318 - craft.width) // 2, (172 - craft.height) // 2))
+    logo.save(os.path.join(ROOT, "assets", "logo.png"))
+    print("wrote assets/logo.png")
+    # The launcher's banner and the splash: the craft in its synthwave scene.
+    synthwave_scene(720, 240).convert("RGB").save(os.path.join(GAME, "ui", "banner.png"))
+    print("wrote game/assets/ui/banner.png")
+    synthwave_scene(455, 200).convert("RGB").save(os.path.join(ROOT, "assets", "splash.png"))
+    print("wrote assets/splash.png")
+    make_carpet()
 
 
 def main():
@@ -531,8 +673,9 @@ def _shade(colour, normal, light):
     return tuple(max(0, min(255, int(c * k))) for c in colour[:3])
 
 
-def render_hovercraft(team, view, flare=False, wreck=False):
-    """One sprite: *view* 1..8 as Fio numbers them."""
+def render_hovercraft(team, view, flare=False, wreck=False, size=None, scale=None, glow=True):
+    """One sprite: *view* 1..8 as Fio numbers them. *size* and *scale* draw
+    it larger than a sprite (the logo); *glow* is the hover light beneath."""
     theta = math.radians((view - 1) * 45.0)
     elev = math.radians(CAMERA_ELEVATION)
     d = (math.sin(theta), 0.0, math.cos(theta))                  # craft -> camera
@@ -543,7 +686,8 @@ def render_hovercraft(team, view, flare=False, wreck=False):
     norm = math.sqrt(sum(v * v for v in light))
     light = tuple(v / norm for v in light)
 
-    size = SPRITE_SIZE
+    size = size or SPRITE_SIZE
+    CRAFT_SCALE = scale or globals()["CRAFT_SCALE"]
     img, draw = canvas(size, size)
     cx, cy = size / 2, size * 0.66
 
@@ -561,9 +705,10 @@ def render_hovercraft(team, view, flare=False, wreck=False):
                 (cy - dot(p, up) * CRAFT_SCALE) * S), dot(p, toward)
 
     # The hover glow / shadow beneath.
-    glow = (*TEAL, 110) if not wreck else (0, 0, 0, 90)
-    gw, gh = 62 * CRAFT_SCALE, 62 * CRAFT_SCALE * math.sin(elev) * 1.4 + 8
-    draw.ellipse(sc(cx - gw, cy + 6 - gh / 2, cx + gw, cy + 6 + gh / 2), fill=glow)
+    if glow:
+        under = (*TEAL, 110) if not wreck else (0, 0, 0, 90)
+        gw, gh = 62 * CRAFT_SCALE, 62 * CRAFT_SCALE * math.sin(elev) * 1.4 + 8
+        draw.ellipse(sc(cx - gw, cy + 6 - gh / 2, cx + gw, cy + 6 + gh / 2), fill=under)
 
     polys = []
     for points, colour in hovercraft_model(team):
