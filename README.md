@@ -8,10 +8,8 @@ ride springs up onto ledges and take every rival flag before the clock runs
 out.
 
 Levitate! is a first-party game built on the **[Fio](https://github.com/ViciousSquid/Fio)
-3.5.1.0** engine, in the same way as [MiniWind](https://github.com/ViciousSquid/MiniWind).
-Fio is the engine powering a total conversion here: Levitate! is built in and
-always on, not an optional plugin. The editor that builds the mazes is one
-click away in the launcher.
+3.5.1.0** engine.
+
 
 > **Status.** Five worlds, random mazes, rival hovercraft (bots) and the
 > full rule set, drawn with a sun, a sky, shadows and photo-scanned
