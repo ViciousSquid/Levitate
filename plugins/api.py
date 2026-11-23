@@ -931,7 +931,7 @@ class EditorAPI:
         """Register a plugin-owned debug console command."""
         self._manager._register_console_command(self._plugin, name, callback, help_text)
 
-    def register_pause_menu_item(self, label: str, callback: Callable,
+    def register_pause_menu_item(self, label, callback: Callable,
                                  close_menu: bool = True) -> None:
         """Add an item to the Play Mode pause menu (API 1.7.0).
 
@@ -940,6 +940,8 @@ class EditorAPI:
         Exit to Editor (Quit in a played package). Choosing this item calls
         ``callback(main_window, logic)`` on the UI thread with the world
         paused; with *close_menu* the menu then closes and play resumes,
+        *label* may be a zero-argument callable, asked each time the menu is
+        drawn, for an item that shows a state ("HUD Size: Compact");
         otherwise it stays open (for an item that opens a screen of its own;
         call ``main_window.close_pause_menu()`` when done).
         """

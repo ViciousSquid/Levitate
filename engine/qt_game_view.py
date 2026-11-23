@@ -2933,6 +2933,9 @@ class QtGameView(QOpenGLWidget):
             return
         if self.play_mode and event.key() == Qt.Key_F12:
             if getattr(self.editor, 'is_kiosk_mode', False):
+                reachable = getattr(self.editor, 'editor_reachable_from_game', None)
+                if callable(reachable) and not reachable():
+                    return
                 self.editor.exit_kiosk_mode(keep_play_mode=True)
             else:
                 self.editor.enter_kiosk_mode()

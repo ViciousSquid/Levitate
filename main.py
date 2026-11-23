@@ -1,5 +1,5 @@
-# Fio — Liminal World Editor & Procedural Engine
-#    https://github.com/ViciousSquid/Fio
+# Levitate! — hovercraft capture-the-flag, built on Fio
+#    https://github.com/ViciousSquid/Levitate  (engine: https://github.com/ViciousSquid/Fio)
 
 import sys
 import os
@@ -136,6 +136,31 @@ dark_stylesheet = """
 from editor_styles import CONTROL_STYLESHEET
 dark_stylesheet += CONTROL_STYLESHEET
 
+def _missing_mandatory_plugins(config):
+    """Names in ``[Plugins] mandatory`` that discovery did not find.
+
+    A build that lists a plugin as mandatory is made of it: it is enabled
+    here, whatever ``[Plugins] disabled`` says, and its absence stops the
+    launch with one clear message rather than surfacing later as unknown
+    entities halfway into a map.
+    """
+    names = [n.strip() for n in config.get('Plugins', 'mandatory', fallback='').split(',')
+             if n.strip()]
+    if not names:
+        return []
+    from plugins.manager import get_manager, load_plugins
+    load_plugins()
+    manager = get_manager()
+    missing = []
+    for name in names:
+        plugin = manager.find_plugin(name)
+        if plugin is None:
+            missing.append(name)
+        else:
+            manager.set_enabled(plugin, True)
+    return missing
+
+
 if __name__ == "__main__":
     require_supported_python()
 
@@ -188,7 +213,7 @@ if __name__ == "__main__":
     if sys.platform == 'win32':
         try:
             import ctypes
-            myappid = 'fio.editor.v1'  # arbitrary string
+            myappid = 'levitate.game.v1'  # arbitrary string
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
         except Exception:
             pass
@@ -197,7 +222,7 @@ if __name__ == "__main__":
     if sys.platform == 'darwin' and not (
             getattr(sys, 'frozen', False) or "__compiled__" in globals()):
         from macos_app import set_process_app_name
-        set_process_app_name("Fio")
+        set_process_app_name("Levitate!")
     # ---------------------------------------------------------
 
     # Version print
@@ -292,6 +317,29 @@ if __name__ == "__main__":
     # and arrows from their pre-rendered PNGs instead.
     app.setStyleSheet(portable_stylesheet(dark_stylesheet))
 
+    # ---------------------------------------------------------
+    # Built-in game layer ([Startup] game_module in settings.ini)
+    # ---------------------------------------------------------
+    # Loaded by name, before the main window builds its menus, so the editor
+    # and engine never import a game. Its plugins must be present first.
+    import importlib
+    game_module = None
+    game_name = config.get('Startup', 'game_module', fallback='').strip()
+    if game_name:
+        missing = _missing_mandatory_plugins(config)
+        if missing:
+            message = (f"{missing[0].capitalize()} plugin is mandatory: "
+                       f"could not be located")
+            print(f"\nerror: {message}", file=sys.stderr)
+            try:
+                from PyQt5.QtWidgets import QMessageBox
+                QMessageBox.critical(None, "Cannot start", message)
+            except Exception:
+                pass
+            sys.exit(1)
+        game_module = importlib.import_module(game_name)
+        game_module.install()
+
     # Set application icon
     icon_path = os.path.join(root_directory, 'assets', 'icon.ico')
     if asset_exists(icon_path):
@@ -312,9 +360,30 @@ if __name__ == "__main__":
     splash.show()
     splash.set_progress(5, "Configuring OpenGL...")
 
+    # A game may ask what this launch is for (play or edit) and let the
+    # display be set up first. It writes settings.ini, so re-read the parts
+    # that must be applied before the first OpenGL widget exists.
+    launch_choice = "edit"
+    show_launcher = getattr(game_module, 'show_launcher', None)
+    if show_launcher is not None and config.getboolean(
+            'Startup', 'show_launcher', fallback=True):
+        splash.hide()
+        QApplication.processEvents()
+        launch_choice = show_launcher(root_directory, settings_path(root_directory))
+        if launch_choice == "quit":
+            sys.exit(0)
+        read_settings(config, settings_path(root_directory))
+        set_default_surface_format(
+            1 if config.getboolean('Display', 'vsync', fallback=True) else 0)
+        splash.show()
+
     splash.set_progress(25, "Building editor UI...")
 
-    window = MainWindow(root_directory)
+    # Straight into the game: the editor is built dormant (hidden, its panels
+    # unfilled) and wakes only if the player leaves fullscreen.
+    window = MainWindow(root_directory, dormant=launch_choice == "play")
+    if launch_choice == "play":
+        window.begin_dormant_launch()
     
     # Set icon on main window
     if 'app_icon' in locals():
@@ -324,5 +393,50 @@ if __name__ == "__main__":
 
     window.showMaximized()
     splash.finish(window)
+
+    # The map this build opens with ([Startup] default_map), loaded one
+    # event-loop turn after the window is built. Playing goes straight on
+    # from there, under the same loading bar, so the scene has a Player
+    # Start to spawn at and the window never sits frozen between the two.
+    default_map = config.get('Startup', 'default_map', fallback='').strip()
+    # A game may choose the map at launch (a level select): asked of the game
+    # module loaded by name above -- Fio never imports the game.
+    launched_map = getattr(game_module, 'launched_map', None)
+    chosen = launched_map() if callable(launched_map) else None
+    if chosen:
+        default_map = chosen
+    default_map_path = os.path.join(root_directory, default_map) if default_map else ''
+
+    def _open_default_map():
+        try:
+            _open_default_map_unguarded()
+        except Exception as exc:
+            # Reported on screen and in the log rather than leaving a window
+            # that never shows the game.
+            import traceback
+            traceback.print_exc()
+            try:
+                window.show_toast(f"Could not start the game: {exc}", is_error=True)
+            except Exception:
+                pass
+        finally:
+            # A dormant launch that did not reach the game wakes the editor
+            # rather than leave a window with its controls hidden.
+            if not window.is_kiosk_mode:
+                window.wake_editor()
+
+    def _open_default_map_unguarded():
+        title = (f"Loading {os.path.splitext(os.path.basename(default_map))[0]}"
+                 if default_map else "Starting the game")
+        with window.loading_overlay.busy(title, "Reading the map", 0):
+            if default_map_path and os.path.isfile(default_map_path):
+                window.load_level_file(default_map_path)
+            if launch_choice == "play":
+                window.loading_overlay.step("Starting the game", 50)
+                window.enter_kiosk_mode()
+
+    if (default_map_path and os.path.isfile(default_map_path)) or launch_choice == "play":
+        from PyQt5.QtCore import QTimer
+        QTimer.singleShot(0, _open_default_map)
 
     sys.exit(app.exec_())

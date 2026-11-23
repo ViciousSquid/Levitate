@@ -408,8 +408,11 @@ class PluginManager:
         return list(self._menu_actions)
 
     def _record_pause_menu_item(self, plugin, label: str, callback, close_menu: bool = True) -> None:
-        if callable(callback) and str(label).strip():
-            self._pause_menu_items.append((plugin, str(label), callback, bool(close_menu)))
+        # *label* is text, or a zero-argument callable the menu asks each
+        # time it draws (engine.pause_menu.Item), for an item showing a state.
+        if callable(callback) and (callable(label) or str(label).strip()):
+            self._pause_menu_items.append(
+                (plugin, label if callable(label) else str(label), callback, bool(close_menu)))
 
     def pause_menu_items(self):
         """``[(label, callback, close_menu)]`` from enabled plugins, in order."""

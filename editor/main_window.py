@@ -226,7 +226,7 @@ class MainWindow(QMainWindow):
     #: A background autosave finished: ``(path, error)``, error '' on success.
     #: Emitted on the writer thread; delivered on the GUI thread.
     _autosave_finished = pyqtSignal(str, str)
-    def __init__(self, root_dir):
+    def __init__(self, root_dir, dormant=False):
         super().__init__()
         self.root_dir = root_dir
         self.root_dir = os.path.abspath(root_dir) 
@@ -249,6 +249,13 @@ class MainWindow(QMainWindow):
 
         self.unsaved_changes = False
         self.is_kiosk_mode = False
+        #: Started straight into the game ([Startup] game_module's launcher
+        #: chose Play): the editor is built hidden and stays dormant until
+        #: kiosk mode is left (begin_dormant_launch / wake_editor).
+        self._dormant_launch = bool(dormant)
+        #: This process was launched to play a game, not to edit: quitting
+        #: the game goes to the desktop rather than into the editor.
+        self.game_launch = bool(dormant)
         #: The world as Play started, when Stop is set to restore it.
         self._pre_play_world = None
         #: Set while the open level is the procedural generator's untouched
@@ -1883,9 +1890,11 @@ class MainWindow(QMainWindow):
     def editor_dormant(self):
         """Whether the editor's own UI is out of sight and does no work:
         kiosk mode, where the game has the window (fullscreen, borderless or
-        windowed) and rendering has the UI thread to itself. Its panels and
-        2D views are brought up to date once, when kiosk mode is left."""
-        return bool(getattr(self, 'is_kiosk_mode', False))
+        windowed) and rendering has the UI thread to itself -- or a launch
+        straight into the game that has not reached kiosk mode yet. Its panels
+        and 2D views are brought up to date once, when kiosk mode is left."""
+        return bool(getattr(self, 'is_kiosk_mode', False)
+                    or getattr(self, '_dormant_launch', False))
 
     def update_all_ui(self, selection_only=False):
         # *selection_only*: called by set_selected_objects, so the hierarchy
@@ -6233,6 +6242,14 @@ class MainWindow(QMainWindow):
         editor returns.
         """
         if getattr(self, 'is_kiosk_mode', False):
+            if self.game_launch:
+                # Launched to play: Quit goes to the desktop, not the editor.
+                reply = QMessageBox.question(
+                    self, "Quit", "Quit to desktop?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if reply == QMessageBox.Yes:
+                    self.quit_immediately()
+                return
             self.exit_kiosk_mode()
             return
         self._exit_play_mode()
@@ -6449,33 +6466,64 @@ class MainWindow(QMainWindow):
             self.move(area.x() + (area.width() - width) // 2,
                       area.y() + (area.height() - height) // 2)
 
+    def begin_dormant_launch(self):
+        """Before the window is first shown, for a launch straight into the
+        game: hide the editor's chrome so the first paint is the 3D view
+        alone, and keep the editor dormant until fullscreen is left. The
+        saved editor layout is left as it is."""
+        self._dormant_launch = True
+        self.game_launch = True
+        self._hide_editor_chrome()
+
+    def editor_reachable_from_game(self):
+        """[Startup] allow_editor: whether a game launch may leave fullscreen
+        for the editor (F12). A release build sets it False."""
+        if not self.game_launch:
+            return True
+        return self.config.getboolean('Startup', 'allow_editor', fallback=True)
+
+    def wake_editor(self):
+        """End a dormant launch that never reached the game (its map failed to
+        open): the editor comes back as it was saved, ready to use."""
+        if not self._dormant_launch:
+            return
+        self._dormant_launch = False
+        self.load_layout()
+        if self.menuBar():
+            self.menuBar().setVisible(True)
+        self.statusBar().setVisible(True)
+        if hasattr(self, 'play_button'):
+            self.play_button.setVisible(True)
+        self.update_all_ui()
+
+    def _hide_editor_chrome(self):
+        """Menu bar, status bar, toolbars, every dock but the 3D view, and the
+        floating play button: hidden (kiosk mode and a dormant launch)."""
+        if self.menuBar():
+            self.menuBar().setVisible(False)
+        self.statusBar().setVisible(False)
+        for toolbar in self.findChildren(QToolBar):
+            toolbar.setVisible(False)
+        for dock in self.findChildren(QDockWidget):
+            if dock is not self.view_3d_dock:
+                dock.setVisible(False)
+        self.view_3d_dock.setVisible(True)
+        if hasattr(self, 'play_button'):
+            self.play_button.setVisible(False)
+
     def enter_kiosk_mode(self):
         """Hide all editor UI and launch play mode fullscreen."""
         self.is_kiosk_mode = True
 
-        # Save layout before hiding
-        self.save_layout()
+        # Save layout before hiding -- unless the editor was never shown (a
+        # dormant launch): what is on screen then is the hidden chrome, and
+        # the layout saved last time is the one to come back to.
+        if self._dormant_launch:
+            self._dormant_launch = False
+        else:
+            self.save_layout()
 
-        # Hide menu bar and status bar
-        if self.menuBar():
-            self.menuBar().setVisible(False)
-        self.statusBar().setVisible(False)
-
-        # Hide all toolbars
-        for toolbar in self.findChildren(QToolBar):
-            toolbar.setVisible(False)
-
-        # Hide all docks except the 3D view
-        for dock in self.findChildren(QDockWidget):
-            if dock is not self.view_3d_dock:
-                dock.setVisible(False)
-
-        # Ensure 3D view is visible
-        self.view_3d_dock.setVisible(True)
-
-        # Hide the floating play button
-        if hasattr(self, 'play_button'):
-            self.play_button.setVisible(False)
+        self._hide_editor_chrome()
 
         # Hide sysmon overlay by default in kiosk mode (F3 to toggle back on)
         self.view_3d.sysmon.set_active(False)
