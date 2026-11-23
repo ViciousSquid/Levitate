@@ -1,0 +1,1264 @@
+"""Combat and projectile runtime delegated from LogicThread.
+
+Owns player hitscan shooting, monster projectile simulation, bullet marks, and
+player-noise events. LogicThread remains the tick-order orchestrator.
+"""
+
+from __future__ import annotations
+
+import math
+import time
+
+import glm
+import numpy as np
+
+from .brush_placement import world_bounds
+from .constants import brush_aabb_bounds, is_solid_world_brush, is_water_brush
+from .change_journal import touch
+from .items import DEFAULT_REGISTRY, ITEM_IDS
+from .projectile_table import ProjectileStore
+from .decal_table import FLOOR, WALL, DecalTable
+from .monster_constants import MONSTER_PROJECTILE_MAX_DIST
+
+try:
+    from editor.things import Monster as MonsterThing
+except ImportError:
+    MonsterThing = None
+
+try:
+    from editor.debug_console import debug_log
+except ImportError:
+    def debug_log(category, message):
+        print(f"[{category}] {message}")
+
+
+#: ``owner_id`` of a projectile the player fired. Monster projectiles carry
+#: the firing monster's ``id()``, which is never 0.
+PLAYER_PROJECTILE_OWNER = 0
+
+#: Shared, read-only "no projectiles" array for the published frame.
+NO_PROJECTILES = np.empty((0, 3), dtype=np.float32)
+NO_PROJECTILES.flags.writeable = False
+
+
+class LogicCombat:
+    """Runtime for weapons, projectiles, bullet marks, and player noise.
+
+    The player's weapons are the item slots (:mod:`engine.items`): ``weapons``
+    holds the ids of the weapon items the player has picked up, in the order of
+    the slots, and ``active_weapon`` the one in hand. How a weapon fires is its
+    compiled :class:`~engine.items.WeaponSpec`, resolved through ``items`` --
+    the session's :class:`~engine.items.ItemRegistry`.
+    """
+
+    def __init__(self, logic):
+        self.logic = logic
+        #: ``hitboxes 1``: publish every shootable monster's hit sphere for
+        #: the 3D view to outline (LogicRender, view_debug_draw).
+        self.show_hitboxes = False
+        self._monster_projectiles = ProjectileStore()
+        #: Projectile paths swept this session (_sweep_projectile): a work count.
+        self.projectile_sweeps = 0
+        self.bullet_marks = []
+        self.projectile_positions = NO_PROJECTILES
+        self.items = DEFAULT_REGISTRY
+        self.active_weapon = None
+        self.weapons = set()
+        self.player_ammo = 0
+        self._last_player_shot_time = float('-inf')
+        self.BULLET_FADE_TIME = 20.0
+        #: Blood: projected decals thrown when an actor is shot (see
+        #: _spawn_blood and engine/decal_table.py), and how much of it --
+        #: GORE_LEVELS, from the Settings (0 is none).
+        self.blood = DecalTable()
+        self.gore_level = 1
+        self._blood_serial = 0
+        self.muzzle_flash_active = False
+        #: Bumped each time a slot key takes a weapon the player has in hand.
+        self.weapon_switch_serial = 0
+        self._gunfire_events = []
+        # Scoped to a projectile's damage callback, for actor-aware plugins.
+        self.projectile_damage_owner = None
+
+    # -- the player's weapons -------------------------------------------------
+
+    def reset_weapons(self):
+        """Unarmed, with no ammunition: how every play session starts."""
+        self.active_weapon = None
+        self.weapons = set()
+        self.player_ammo = 0
+        self._last_player_shot_time = float('-inf')
+
+    def give_weapon(self, item):
+        """The player picks up weapon *item* and takes it in hand.
+
+        A weapon's ammunition is granted the first time the player gets it;
+        picking it up again only takes it in hand.
+        """
+        if item.id not in self.weapons:
+            self.weapons.add(item.id)
+            if item.weapon.ammo:
+                self.player_ammo = max(int(self.player_ammo), item.weapon.ammo)
+        self.active_weapon = item.id
+
+    def select_slot(self, slot):
+        """Take the weapon in slot *slot* (1-4) in hand, if the player has it."""
+        if 1 <= slot <= len(ITEM_IDS):
+            item_id = ITEM_IDS[slot - 1]
+            if item_id in self.weapons:
+                self.active_weapon = item_id
+                self.weapon_switch_serial += 1
+
+    def held_weapon(self):
+        """The :class:`~engine.items.WeaponSpec` in hand, or None."""
+        item = self.items.resolve(self.active_weapon) if self.active_weapon else None
+        return item.weapon if item is not None else None
+
+    def shot_ready(self, now):
+        """Whether a shot fired at *now* would go off."""
+        weapon = self.held_weapon()
+        return (weapon is not None and weapon.fires
+                and now - self._last_player_shot_time >= weapon.cooldown
+                and int(self.player_ammo) >= weapon.ammo_per_shot)
+
+    def _handle_shooting(self):
+        """Fire the weapon in hand, as its definition says.
+
+        Authoritative on the logic thread, so a burst of UI clicks can never
+        beat a cooldown or spend ammunition twice. A weapon whose mode is
+        ``none`` is held and shown but never fires: no flash, no sound, no
+        noise.
+        """
+        logic = self.logic
+        if not logic.player_runtime.player:
+            return
+        weapon = self.held_weapon()
+        if weapon is None or not weapon.fires:
+            return
+        now = time.perf_counter()
+        if not self.shot_ready(now):
+            return
+        self.player_ammo = int(self.player_ammo) - weapon.ammo_per_shot
+        self._last_player_shot_time = now
+
+        self.muzzle_flash_active = True
+        if weapon.sound:
+            logic.game_state.queue_sound({"file": weapon.sound, "volume": 1.0})
+        logic._plugin_emit("player_shoot", weapon=self.active_weapon)
+        ray_origin, ray_dir = self._aim()
+        if weapon.mode == 'projectile':
+            self._fire_projectile(weapon, ray_origin, ray_dir)
+            return
+        directions = [self._scatter(ray_dir, weapon.spread, pellet)
+                      for pellet in range(weapon.pellets)]
+        any_miss = not all(self._fire_rays(weapon, ray_origin, directions))
+        # Monsters hear a shot that hit nothing; one that hits is the fight.
+        if any_miss and weapon.noise > 0.0:
+            self._emit_noise_event(
+                [ray_origin.x, ray_origin.y, ray_origin.z],
+                source='gunfire', loudness=weapon.noise)
+
+    def _aim(self):
+        """The ray a shot leaves along: from the eye, along the view."""
+        logic = self.logic
+        yaw_rad = logic.player_runtime.player.angle
+        if logic.camera.is_overhead():
+            # Top-down aiming is planar: the player rotates to face a target and
+            # fires along that ground heading. The overhead camera and sprite
+            # both ignore pitch, so there is no way to aim vertically — folding
+            # pitch into the ray would just tilt shots into the sky or floor and
+            # make monsters (which stand on the ground plane) nearly unhittable.
+            # Keep the ray horizontal at eye height so it can actually connect.
+            dir_x = math.sin(yaw_rad)
+            dir_y = 0.0
+            dir_z = math.cos(yaw_rad)
+        else:
+            pitch_rad = logic.player_runtime.player.pitch
+            dir_x = math.sin(yaw_rad) * math.cos(pitch_rad)
+            dir_y = math.sin(pitch_rad)
+            dir_z = math.cos(yaw_rad) * math.cos(pitch_rad)
+        player = logic.player_runtime.player
+        # From the eye the player sees from (it eases after a duck).
+        eye = getattr(player, 'view_height', player.camera_height)
+        ray_origin = glm.vec3(player.pos.x, player.pos.y + eye, player.pos.z)
+        return ray_origin, glm.normalize(glm.vec3(dir_x, dir_y, dir_z))
+
+    @staticmethod
+    def _scatter(direction, spread, pellet):
+        """*direction* turned by up to *spread* degrees; unchanged at 0.
+
+        Deterministic per pellet index (a fixed sunflower pattern across the
+        cone), so a shotgun's pattern is the same every shot.
+        """
+        if spread <= 0.0:
+            return direction
+        golden = 2.399963229728653
+        radius = math.radians(spread) * math.sqrt((pellet + 0.5) / 8.0)
+        angle = pellet * golden
+        up = glm.vec3(0.0, 1.0, 0.0)
+        right = glm.cross(direction, up)
+        if glm.length(right) < 1e-6:
+            right = glm.vec3(1.0, 0.0, 0.0)
+        right = glm.normalize(right)
+        up = glm.normalize(glm.cross(right, direction))
+        offset = right * (math.cos(angle) * radius) + up * (math.sin(angle) * radius)
+        return glm.normalize(direction + offset)
+
+    def _fire_projectile(self, weapon, origin, direction):
+        """One projectile into the shared projectile store, owned by the player."""
+        speed = weapon.projectile_speed
+        self._add_monster_projectile(
+            (origin.x, origin.y, origin.z),
+            (direction.x * speed, direction.y * speed, direction.z * speed),
+            PLAYER_PROJECTILE_OWNER, weapon.damage,
+            min(weapon.range, MONSTER_PROJECTILE_MAX_DIST) / speed)
+        self._emit_noise_event([origin.x, origin.y, origin.z],
+                               source='gunfire', loudness=weapon.noise)
+
+    def _fire_rays(self, weapon, ray_origin, directions):
+        """Trace one shot's hitscan or melee rays; per ray, True if it hit a monster.
+
+        Every ray of a shot traces against one instant of the world: the
+        collision brushes, and a snapshot of the monsters taken once, under a
+        single ``monster_lock`` acquisition. Only then are the effects applied
+        -- damage, death, I/O outputs, bullet marks -- one ray at a time in
+        pellet order. A monster an earlier ray's damage killed is passed over
+        by a later ray, which goes on to whatever it met behind (another
+        monster, or the wall); otherwise nothing an effect does, I/O it fires
+        included, is seen by the other rays of the same shot, only by the next.
+        """
+        logic = self.logic
+        reach = weapon.range
+        rows = logic.collision_runtime.collision_rows()
+        walls = [self._trace_brushes(rows, ray_origin, direction, reach)
+                 for direction in directions]
+        # Explosive Props in the way (none on most maps: one check). A barrel
+        # stops the ray like a wall, but takes the hit.
+        explosions = logic.explosion_runtime
+        barrels = [None] * len(walls)
+        if explosions.explosives():
+            for k, ((dist, _point), direction) in enumerate(zip(walls, directions)):
+                hit = explosions.trace(ray_origin, direction, min(dist, reach))
+                if hit is not None:
+                    barrels[k] = hit
+                    walls[k] = (hit[1], None)
+        results = []
+        with logic.session_runtime.monster_lock:
+            monsters, centres, radii = self._hitscan_monster_snapshot()
+            pending = self._trace_monsters(ray_origin, directions, reach,
+                                           [dist for dist, _ in walls],
+                                           centres, radii)
+            killed = set()
+            bleeding = []       # (the actor's centre, the ray that hit it)
+            for (dist, point), candidates, direction, barrel in zip(
+                    walls, pending, directions, barrels):
+                target = None
+                for row in candidates:
+                    if id(monsters[row]) not in killed:
+                        target = monsters[row]
+                        if self.gore_level:
+                            bleeding.append((centres[row], direction))
+                            self._wound(weapon, target)
+                        break
+                if target is not None:
+                    if self._damage_monster(weapon, target):
+                        killed.add(id(target))
+                    results.append(True)
+                    continue
+                if barrel is not None:
+                    explosions.damage_prop(barrel[0], weapon.damage)
+                    results.append(False)
+                    continue
+                # A melee strike leaves no mark on the wall it meets.
+                if point is not None and weapon.mode == 'hitscan':
+                    self.bullet_marks.append({
+                        'pos': point,
+                        'time': time.perf_counter()
+                    })
+                results.append(False)
+        if bleeding:
+            # After the monsters' lock is released: only brushes are traced.
+            self._spawn_blood(weapon, rows, bleeding)
+        return results
+
+    # -- blood -------------------------------------------------------------
+
+    #: Settings > Play Modes > Gore: how much each hit throws, by level.
+    #: ``(amount multiplier, size multiplier)``; level 0 throws none.
+    GORE_LEVELS = ((0, 0.0), (1, 1.0), (2, 1.3), (5, 1.8))
+    GORE_NAMES = ("Off", "Normal", "Heavy", "Verhoeven")
+    #: Seconds a blood decal lasts, the last BLOOD_FADE_TIME of them fading.
+    BLOOD_LIFETIME = 90.0
+    BLOOD_FADE_TIME = 20.0
+    #: A light weapon (the pistol) and a heavy one (the shotgun: a shot of
+    #: several pellets, or of BLOOD_HEAVY_DAMAGE or more): decals a shot at
+    #: the Normal level, their width range in world units, how far the
+    #: blood flies before it falls, and how wide its cone is (radians).
+    #: Widths are in proportion to the actors (a monster is ~130 wide and
+    #: ~190 tall): a pistol leaves a spatter the size of a hand to a head, a
+    #: shotgun one up to the size of a torso.
+    BLOOD_LIGHT = (1, (18.0, 44.0), 200.0, 0.22)
+    BLOOD_HEAVY = (4, (44.0, 100.0), 340.0, 0.40)
+    BLOOD_HEAVY_DAMAGE = 50
+
+    def set_gore_level(self, level):
+        """0 (off) to the last of GORE_LEVELS; turning it off clears what is there."""
+        self.gore_level = max(0, min(int(level), len(self.GORE_LEVELS) - 1))
+        if not self.gore_level:
+            self.blood.clear()
+
+    #: Wounds shown on an actor's sprite: steps a hit adds (light, heavy)
+    #: at each gore level, up to WOUND_STEPS.
+    WOUND_STEPS = 15
+    WOUND_PER_HIT = ((0, 0), (2, 5), (3, 8), (5, 15))
+
+    def _wound(self, weapon, monster):
+        """Mark *monster*'s sprite with the hit: more blood on it per hit."""
+        light, heavy = self.WOUND_PER_HIT[self.gore_level]
+        is_heavy = weapon.pellets > 1 or weapon.damage >= self.BLOOD_HEAVY_DAMAGE
+        props = monster.properties
+        before = int(props.get('_wounds', 0))
+        after = min(self.WOUND_STEPS, before + (heavy if is_heavy else light))
+        if after != before:
+            props['_wounds'] = after
+            touch(monster)
+
+    def _spawn_blood(self, weapon, rows, bleeding):
+        """Throw blood from each actor hit, away from the shooter.
+
+        *bleeding* is ``(centre, direction)`` per ray that hit an actor:
+        the actor's centre and the ray's direction of travel. The blood
+        leaves the centre along that direction -- out of the far side of
+        the actor, opposite to where the shot came from -- spread over a
+        cone and falling a little, and makes a decal where it meets the
+        world: the wall behind, or the floor under where it ran out of
+        reach. Each is one brush trace; nothing is stored about the shot.
+        A light weapon throws little, a heavy one (several pellets a shot)
+        a lot, and the gore level multiplies both.
+        """
+        amount, scale = self.GORE_LEVELS[self.gore_level]
+        if not amount or not bleeding:
+            return
+        heavy = weapon.pellets > 1 or weapon.damage >= self.BLOOD_HEAVY_DAMAGE
+        base, (small, large), reach, cone = self.BLOOD_HEAVY if heavy else self.BLOOD_LIGHT
+        now = time.perf_counter()
+        blood = self.blood
+        down = glm.vec3(0.0, -1.0, 0.0)
+        # The shot's amount, shared round the rays that hit (a shotgun's
+        # pellets, or its one ray).
+        for index in range(base * amount):
+            centre, direction = bleeding[index % len(bleeding)]
+            origin = glm.vec3(float(centre[0]), float(centre[1]), float(centre[2]))
+            side = glm.cross(direction, glm.vec3(0.0, 1.0, 0.0))
+            side = glm.normalize(side) if glm.length(side) > 1e-6 else glm.vec3(1.0, 0.0, 0.0)
+            lift = glm.normalize(glm.cross(side, direction))
+            for _ in range(1):
+                # A fixed sequence (no global random state): the same shot
+                # at the same moment of a session bleeds the same way.
+                self._blood_serial += 1
+                n = self._blood_serial
+                a, b, c, e = (math.fmod(n * k, 1.0) for k in (
+                    0.61803398875, 0.75487766625, 0.56984029099, 0.81917251339))
+                # Every decal differs: its size, its proportions (0.7 to 1.4
+                # as tall as wide), its image and whether that is mirrored.
+                tall = 0.7 + 0.7 * e
+                mirrored = b > 0.5
+                angle, spread = a * 2.0 * math.pi, cone * math.sqrt(b)
+                thrown = glm.normalize(
+                    direction + side * (math.cos(angle) * spread)
+                    + lift * (math.sin(angle) * spread) + down * (0.12 + 0.2 * c))
+                width = (small + (large - small) * c) * scale
+                dist, point = self._trace_brushes(rows, origin, thrown, reach)
+                if point is not None:
+                    # Onto what it hit. Thrown level, so the decal's up is
+                    # the world's and runs go downwards; unless it met the
+                    # floor or ceiling head on.
+                    level = glm.vec3(thrown.x, 0.0, thrown.z)
+                    on_wall = glm.length(level) > 0.35
+                    forward = glm.normalize(level) if on_wall else thrown
+                    # On a wall it hangs nearly upright (runs go down); on a
+                    # floor or ceiling it lies at any turn.
+                    roll = (e - 0.5) * 0.5 if on_wall else a * 2.0 * math.pi
+                    blood.add((point.x, point.y, point.z), (forward.x, forward.y, forward.z),
+                              width, max(width * 0.6, 28.0), n, now, roll,
+                              height=width * tall, kind=WALL if on_wall else FLOOR,
+                              flip=mirrored)
+                    continue
+                # Ran out of reach in the air: it falls from there.
+                above = origin + thrown * (reach * (0.45 + 0.5 * a))
+                dist, point = self._trace_brushes(rows, above, down, 2048.0)
+                if point is not None:
+                    blood.add((point.x, point.y, point.z), (0.0, -1.0, 0.0),
+                              width, max(width * 0.6, 28.0), n, now, a * 2.0 * math.pi,
+                              height=width * tall, kind=FLOOR, flip=mirrored)
+
+    @staticmethod
+    def _blocks_hitscan(brush):
+        return not (brush.get('is_trigger') or brush.get('hidden') or
+                    is_water_brush(brush) or brush.get('is_fog'))
+
+    def _trace_brushes(self, rows, ray_origin, ray_dir, reach):
+        """``(distance, point)`` of the nearest blocking brush, or ``(inf, None)``.
+
+        The first brush in cache order wins a tie. Given the cache's
+        :class:`~engine.logic_collision.CollisionRows` (None below the dense
+        threshold), the boxes are tested as one NumPy query, and only the few
+        the ray meets are asked whether they block, nearest first.
+        """
+        if rows is not None:
+            hit_rows, dists = rows.ray_hits(ray_origin, ray_dir, reach)
+            brushes = rows.brushes
+            for row, dist in zip(hit_rows.tolist(), dists.tolist()):
+                if self._blocks_hitscan(brushes[row]):
+                    return dist, ray_origin + ray_dir * dist
+            return float('inf'), None
+        closest_brush_hit = None
+        closest_brush_dist = float('inf')
+        for brush in self.logic.collision_runtime._collision_brushes_cache:
+            if not self._blocks_hitscan(brush):
+                continue
+            # The brush's derived bounds, rounded as CollisionRows.lo32 is.
+            b = brush_aabb_bounds(brush)
+            min_b = glm.vec3(b[0], b[1], b[2])
+            max_b = glm.vec3(b[3], b[4], b[5])
+            hit, dist = self.intersect_ray_aabb(ray_origin, ray_dir, min_b, max_b, reach)
+            if hit and dist < closest_brush_dist:
+                closest_brush_dist = dist
+                closest_brush_hit = ray_origin + ray_dir * dist
+        return closest_brush_dist, closest_brush_hit
+
+    @staticmethod
+    def hit_sphere(pos, props):
+        """``((x, y, z), radius)``: the sphere player shots and melee test
+        for a monster at *pos* (the centre of its billboard) -- centred at
+        feet + 0.45 H, wider than the sprite for a forgiving feel."""
+        sprite_width = float(props.get('sprite_width', 64.0))
+        sprite_height = float(props.get('sprite_height', 128.0))
+        feet_y = pos[1] - sprite_height * 0.5
+        return ((pos[0], feet_y + sprite_height * 0.45, pos[2]),
+                max(sprite_width * 0.75, sprite_height * 0.4, 48.0))
+
+    def _hitscan_monster_snapshot(self):
+        """The shootable monsters, in things order, with their hit spheres.
+
+        ``(monsters, centres, radii)``: ``centres`` float32 as ``glm.vec3``
+        rounds them, ``radii`` float64. The sphere is wider than the sprite,
+        for a more forgiving feel: width matters more than height when
+        shooting. Taken under ``monster_lock``.
+
+        ``Monster.pos`` is the centre of the billboard (the AI grounds a
+        monster at ``floor + sprite_height / 2`` and the sprite pass draws the
+        quad centred on ``pos``), so the feet are half the sprite below it and
+        the sphere sits just under the middle of what is drawn. Measuring
+        from ``pos`` as if it were the feet put the sphere on the head: on a
+        192-tall human the whole lower half of the body, eye height included,
+        could not be hit.
+        """
+        monsters = []
+        centres = []
+        radii = []
+        for thing in self.logic.editor_state.things:
+            if not isinstance(thing, MonsterThing):
+                continue
+            props = thing.properties
+            if props.get('dead', False) or props.get('hidden', False):
+                continue
+            monsters.append(thing)
+            centre, radius = self.hit_sphere(thing.pos, props)
+            centres.append(centre)
+            radii.append(radius)
+        return (monsters,
+                np.array(centres, dtype=np.float32).reshape(len(monsters), 3),
+                np.array(radii, dtype=np.float64))
+
+    def hitbox_snapshot(self):
+        """``(centres, radii)`` of the spheres player shots and melee test
+        (:meth:`_hitscan_monster_snapshot`), as float32 copies the UI thread
+        can draw: exactly what a bullet has to touch."""
+        with self.logic.session_runtime.monster_lock:
+            _monsters, centres, radii = self._hitscan_monster_snapshot()
+        return centres.copy(), radii.astype(np.float32)
+
+    @staticmethod
+    def _trace_monsters(ray_origin, directions, reach, wall_dists, centres, radii):
+        """Per ray, the monster rows it meets before its wall, nearest first.
+
+        The ray/sphere quadratic of every ray against every monster at once,
+        in the arithmetic the ``glm`` walk used: the offsets and dot products
+        in float32 (each dot summed ``(x + y) + z``, as ``glm.dot`` does), the
+        quadratic in float64. Ties go to the first monster in things order.
+        """
+        if not len(radii):
+            return [[] for _ in directions]
+        o = np.array((ray_origin[0], ray_origin[1], ray_origin[2]), dtype=np.float32)
+        d = np.array([(v[0], v[1], v[2]) for v in directions], dtype=np.float32)
+        oc = o - centres                                            # (M, 3)
+        a = ((d[:, 0] * d[:, 0] + d[:, 1] * d[:, 1])
+             + d[:, 2] * d[:, 2]).astype(np.float64)[:, None]        # (P, 1)
+        b = 2.0 * ((oc[None, :, 0] * d[:, None, 0] + oc[None, :, 1] * d[:, None, 1])
+                   + oc[None, :, 2] * d[:, None, 2]).astype(np.float64)  # (P, M)
+        c = ((oc[:, 0] * oc[:, 0] + oc[:, 1] * oc[:, 1])
+             + oc[:, 2] * oc[:, 2]).astype(np.float64) - radii * radii   # (M,)
+        disc = b * b - 4 * a * c
+        real = disc >= 0
+        t = (-b - np.sqrt(np.where(real, disc, 0.0))) / (2.0 * a)
+        # A point-blank shot can originate inside the target sphere. Its
+        # entry root is behind the eye; count the current point as the hit.
+        far_t = (-b + np.sqrt(np.where(real, disc, 0.0))) / (2.0 * a)
+        t = np.where((c[None, :] <= 0) & (far_t >= 0), 0.0, t)
+        walls = np.asarray(wall_dists, dtype=np.float64)[:, None]
+        valid = real & (0 <= t) & (t <= reach) & (t < walls)
+        if not valid.any():
+            return [[] for _ in directions]
+        pending = []
+        for ray in range(len(directions)):
+            rows = np.flatnonzero(valid[ray])
+            if len(rows) > 1:
+                rows = rows[np.lexsort((rows, t[ray, rows]))]
+            pending.append(rows.tolist())
+        return pending
+
+    def _damage_monster(self, weapon, monster):
+        """Apply one ray's hit to *monster*; True if it died of it."""
+        logic = self.logic
+        damage = weapon.damage
+        health_raw = monster.properties.get('health', 100)
+        try:
+            health = int(health_raw)
+        except (ValueError, TypeError):
+            health = 100
+        new_health = health - damage
+        monster.properties['health'] = new_health
+        debug_log("MonsterAI", f"Monster {monster.properties.get('name')} health: {health} -> {new_health} (weapon={self.active_weapon}, dmg={damage})")
+        logic.game_state.queue_sound({
+            'file': 'hit.wav',
+            'volume': 1.0,
+            'entity_id': id(monster)
+        })
+        if logic.io_manager:
+            logic.io_manager.fire_output(monster, 'OnDamaged')
+        if new_health > 0:
+            return False
+        monster.properties['dead'] = True
+        monster.properties.pop('is_shooting', None)
+        touch(monster)
+        if logic.io_manager:
+            logic.io_manager.fire_output(monster, 'OnDeath')
+        if logic.monster_ai.monster_debug_active:
+            name = monster.properties.get('name', '?')
+            debug_log("MonsterAI",
+                f'<a href="filter:{name}" style="color: #EF5350; font-weight: bold; text-decoration: none;">{name}</a> '
+                f'<span style="color: #B71C1C; font-weight: bold;">DIED</span> (shot by player)')
+        return True
+
+
+    def intersect_ray_aabb(self, origin, direction, box_min, box_max, max_dist=10000.0):
+        t_min = 0.0
+        t_max = max_dist
+        for i in range(3):
+            if abs(direction[i]) < 1e-6:
+                if origin[i] < box_min[i] or origin[i] > box_max[i]:
+                    return False, 0
+            else:
+                inv_d = 1.0 / direction[i]
+                t1 = (box_min[i] - origin[i]) * inv_d
+                t2 = (box_max[i] - origin[i]) * inv_d
+                t_near = min(t1, t2)
+                t_far = max(t1, t2)
+                t_min = max(t_min, t_near)
+                t_max = min(t_max, t_far)
+                if t_min > t_max:
+                    return False, 0
+        return True, t_min
+
+
+    def _update_bullet_marks(self):
+        logic = self.logic
+        current_time = time.perf_counter()
+        self.bullet_marks = [
+            m for m in self.bullet_marks 
+            if (current_time - m['time']) < self.BULLET_FADE_TIME
+        ]
+
+    # =========================================================================
+    # MONSTER PROJECTILES (flying monster ranged attacks)
+    # =========================================================================
+
+    def _add_monster_projectile(self, pos, vel, owner_id, damage, lifetime):
+        """Add one projectile directly to the dense numeric store."""
+        logic = self.logic
+        with logic.session_runtime.monster_lock:
+            return self._monster_projectiles.add(
+                pos, vel, owner_id, damage, lifetime
+            )
+
+
+    #: Monster hit sphere for projectiles: centred on the monster's origin
+    #: -- the middle of its billboard (see _hitscan_monster_snapshot) --
+    #: radius 64. It was 64 units above it, as if the origin were the feet,
+    #: which put it over the head of a 192-tall human.
+    PROJECTILE_MONSTER_LIFT = 0.0
+    PROJECTILE_MONSTER_RADIUS = 64.0
+    #: Player hit sphere for projectiles.
+    PROJECTILE_PLAYER_RADIUS = 32.0
+
+
+    def _projectile_monster_candidates(self, pos32, owners):
+        """``(projectile, monster row)`` pairs inside a monster's hit sphere.
+
+        The monsters are hashed into cells twice the hit radius wide, so a
+        projectile's candidates are the monsters filed in the 3x3 cells round
+        it; the exact test is the float32 distance the ``glm`` walk used. The
+        owner and the owner's team are excluded here; dead and hidden are
+        judged live when a hit is applied, because a hit earlier in the pass
+        can kill a monster this list still holds.
+        """
+        logic = self.logic
+        monsters = logic.world_runtime.monster_things
+        empty = np.empty(0, dtype=np.int64)
+        if not monsters or not len(pos32):
+            return monsters, empty, empty
+        count = len(monsters)
+        centres = np.empty((count, 3), dtype=np.float32)
+        centres[:] = [m.pos for m in monsters]
+        centres[:, 1] += np.float32(self.PROJECTILE_MONSTER_LIFT)
+        codes = {}
+        team = np.fromiter(
+            (codes.setdefault(m.properties.get('team', ''), len(codes))
+             if m.properties.get('team', '') else -1 for m in monsters),
+            dtype=np.int64, count=count)
+        row_of = {id(m): row for row, m in enumerate(monsters)}
+
+        cell = 2.0 * self.PROJECTILE_MONSTER_RADIUS
+        mcx = np.floor(centres[:, 0] / cell).astype(np.int64)
+        mcz = np.floor(centres[:, 2] / cell).astype(np.int64)
+        mkey = (mcx + (1 << 30)) * (1 << 31) + (mcz + (1 << 30))
+        order = np.argsort(mkey, kind='stable')
+        keys = mkey[order]
+        pcx = np.floor(pos32[:, 0] / cell).astype(np.int64)
+        pcz = np.floor(pos32[:, 2] / cell).astype(np.int64)
+        query_parts, row_parts = [], []
+        for dx in (-1, 0, 1):
+            for dz in (-1, 0, 1):
+                qkey = (pcx + dx + (1 << 30)) * (1 << 31) + (pcz + dz + (1 << 30))
+                lo = np.searchsorted(keys, qkey, side='left')
+                hi = np.searchsorted(keys, qkey, side='right')
+                counts = hi - lo
+                total = int(counts.sum())
+                if not total:
+                    continue
+                query = np.repeat(np.arange(len(qkey)), counts)
+                within = np.arange(total) - np.repeat(np.cumsum(counts) - counts, counts)
+                query_parts.append(query)
+                row_parts.append(order[np.repeat(lo, counts) + within])
+        if not query_parts:
+            return monsters, empty, empty
+        query = np.concatenate(query_parts)
+        row = np.concatenate(row_parts)
+        d = centres[row] - pos32[query]
+        near = (d[:, 0] * d[:, 0] + d[:, 1] * d[:, 1] + d[:, 2] * d[:, 2]
+                < np.float32(self.PROJECTILE_MONSTER_RADIUS) ** 2)
+        owner_row = np.array([row_of.get(o, -1) for o in owners], dtype=np.int64)
+        owner = owner_row[query]
+        near &= row != owner
+        owner_team = np.where(owner >= 0, team[np.maximum(owner, 0)], -1)
+        near &= ~((owner_team >= 0) & (team[row] == owner_team))
+        query, row = query[near], row[near]
+        # First in things order within each projectile.
+        order = np.lexsort((row, query))
+        return monsters, query[order], row[order]
+
+
+    def _projectile_wall_candidates(self, pos32):
+        """``(projectile, brush)`` pairs whose box holds the projectile's point.
+
+        The brushes filed in the projectile's cell -- what ``get_nearby_brushes``
+        returned -- tested inclusively against the same float64 boxes. Whether
+        each is solid is asked live, of the few that contain a point.
+        """
+        logic = self.logic
+        grid = logic.session_runtime.spatial_grid
+        rows = grid._cell_rows
+        rows.refresh_movers()
+        cs = grid.cell_size
+        x = pos32[:, 0].astype(np.float64)
+        y = pos32[:, 1].astype(np.float64)
+        z = pos32[:, 2].astype(np.float64)
+        query, row = rows.pairs(np.floor(x / cs), np.floor(z / cs))
+        if not len(query):
+            return {}
+        lo = rows.lo[row]
+        hi = rows.hi[row]
+        inside = ((lo[:, 0] <= x[query]) & (x[query] <= hi[:, 0])
+                  & (lo[:, 1] <= y[query]) & (y[query] <= hi[:, 1])
+                  & (lo[:, 2] <= z[query]) & (z[query] <= hi[:, 2]))
+        hits = {}
+        for q, r in zip(query[inside].tolist(), row[inside].tolist()):
+            hits.setdefault(q, []).append(r)
+        return hits
+
+    #: A projectile that moves further than this in one tick is swept: its
+    #: path from where it was is tested against the walls, the player, the
+    #: monsters and explosive Props, and it is stopped at the first it meets,
+    #: so a fast shot cannot pass through a wall -- or an actor -- between two
+    #: ticks. 16 units is the thinnest wall the point tests alone are sure to
+    #: catch (a step no longer than the wall is thick lands inside it); the
+    #: default 900 u/s shot moves 15 a tick at 60 Hz and is never swept.
+    PROJECTILE_SWEEP_STEP = 16.0
+    #: How far into what it met a swept projectile is stopped, so that the
+    #: ordinary point tests that follow find the hit (their spheres are
+    #: strict at the surface).
+    PROJECTILE_SWEEP_BITE = 0.5
+
+    @staticmethod
+    def _ray_sphere(sx, sy, sz, ux, uy, uz, cx, cy, cz, radius):
+        """Distance along the unit ray to where it enters the sphere (0 when
+        it starts inside), or None if it misses or the sphere is behind it."""
+        ox, oy, oz = sx - cx, sy - cy, sz - cz
+        b = ox * ux + oy * uy + oz * uz
+        c = ox * ox + oy * oy + oz * oz - radius * radius
+        if c <= 0.0:
+            return 0.0
+        if b >= 0.0:
+            return None
+        disc = b * b - c
+        if disc < 0.0:
+            return None
+        return -b - math.sqrt(disc)
+
+    def _sweep_projectile(self, projectiles, i, prev, delta, rows, explosions):
+        """Stop row *i* at the first thing its path from *prev* meets this tick.
+
+        Only a step longer than :data:`PROJECTILE_SWEEP_STEP` is swept, and
+        only a straight one (a portal that moved the projectile this tick
+        leaves it where it came out). The walls are the solid brushes the
+        wall point test asks about, the spheres are the point tests' own --
+        the player's unless it is the player's own shot or the player cannot
+        be hit, every live monster but the owner and the owner's team -- and
+        the barrels are traced as hitscan traces them. When the path meets
+        one the projectile is put :data:`PROJECTILE_SWEEP_BITE` inside it, and
+        the point tests apply the hit as they always have. Returns whether it
+        was moved back.
+        """
+        logic = self.logic
+        pos = projectiles.pos[i]
+        vel = projectiles.vel[i]
+        sx, sy, sz = (float(v) for v in prev)
+        ex, ey, ez = float(pos[0]), float(pos[1]), float(pos[2])
+        dx, dy, dz = ex - sx, ey - sy, ez - sz
+        length = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if not (self.PROJECTILE_SWEEP_STEP < length < math.inf):
+            return False
+        # A portal moved it: the straight path is not the one it took.
+        tol = 1.0 + 1.0e-4 * length
+        if (abs(dx - float(vel[0]) * delta) > tol or abs(dy - float(vel[1]) * delta) > tol
+                or abs(dz - float(vel[2]) * delta) > tol):
+            return False
+        ux, uy, uz = dx / length, dy / length, dz / length
+        self.projectile_sweeps += 1
+        best = length
+
+        if rows is not None:
+            hit_rows, dists = rows.ray_hits((sx, sy, sz), (ux, uy, uz), best)
+            brushes = rows.brushes
+            for row, dist in zip(hit_rows.tolist(), dists.tolist()):
+                if is_solid_world_brush(brushes[row]):
+                    best = min(best, dist)
+                    break
+        else:
+            for brush in logic.collision_runtime._collision_brushes_cache:
+                if not is_solid_world_brush(brush):
+                    continue
+                b = world_bounds(brush)
+                hit, dist = self.intersect_ray_aabb(
+                    (sx, sy, sz), (ux, uy, uz), b[:3], b[3:], best)
+                if hit and dist < best:
+                    best = dist
+
+        owner_id = int(projectiles.owner_id[i])
+        runtime = logic.player_runtime
+        player = runtime.player
+        if (player is not None and owner_id != PLAYER_PROJECTILE_OWNER
+                and not runtime.god_mode and not runtime.player_dead):
+            t = self._ray_sphere(sx, sy, sz, ux, uy, uz,
+                                 float(player.pos[0]), float(player.pos[1]),
+                                 float(player.pos[2]), float(self.PROJECTILE_PLAYER_RADIUS))
+            if t is not None and t < best:
+                best = t
+
+        owner = logic.world_runtime.monster_by_id.get(owner_id)
+        owner_team = owner.properties.get('team', '') if owner is not None else None
+        radius = float(self.PROJECTILE_MONSTER_RADIUS)
+        lift = float(self.PROJECTILE_MONSTER_LIFT)
+        # The path's box, grown by the hit radius: most monsters are outside.
+        lo_x, hi_x = min(sx, ex) - radius, max(sx, ex) + radius
+        lo_z, hi_z = min(sz, ez) - radius, max(sz, ez) + radius
+        for candidate in logic.world_runtime.monster_things:
+            if id(candidate) == owner_id:
+                continue
+            cx, cz = float(candidate.pos[0]), float(candidate.pos[2])
+            if not (lo_x <= cx <= hi_x and lo_z <= cz <= hi_z):
+                continue
+            cp = candidate.properties
+            if cp.get('dead', False) or cp.get('hidden', False):
+                continue
+            team = cp.get('team', '')
+            if owner_team and team and owner_team == team:
+                continue
+            t = self._ray_sphere(sx, sy, sz, ux, uy, uz,
+                                 cx, float(candidate.pos[1]) + lift, cz, radius)
+            if t is not None and t < best:
+                best = t
+
+        if explosions is not None:
+            hit = explosions.trace((sx, sy, sz), (ux, uy, uz), best)
+            if hit is not None and hit[1] < best:
+                best = hit[1]
+
+        if best >= length:
+            return False
+        t = min(best + self.PROJECTILE_SWEEP_BITE, length)
+        pos[0] = sx + ux * t
+        pos[1] = sy + uy * t
+        pos[2] = sz + uz * t
+        return True
+
+    # Below this count, the Python scalar path avoids allocating the batch
+    # query/candidate arrays. Keep the threshold isolated so profiling can tune
+    # the crossover without changing either implementation.
+    PROJECTILE_DENSE_THRESHOLD = 100
+
+
+    def _publish_projectile_render_snapshot(self):
+        """Snapshot live projectile positions for the render buffer.
+
+        Rendering can run a frame without a whole simulation tick. Keep the
+        published positions derived from the authoritative ProjectileStore so
+        those frames cannot accidentally publish an empty/stale projectile set.
+        The copy is intentional: the renderer never aliases mutable simulation
+        storage.
+        """
+        logic = self.logic
+        with logic.session_runtime.monster_lock:
+            projectiles = self._monster_projectiles
+            count = len(projectiles)
+            if count:
+                self.projectile_positions = projectiles.pos[:count].astype(
+                    np.float32, copy=True
+                )
+            else:
+                self.projectile_positions = NO_PROJECTILES
+            return self.projectile_positions
+
+
+    def _update_monster_projectiles(self, delta: float):
+        """Use a scalar path for small swarms and the dense path for large ones."""
+        logic = self.logic
+
+        with logic.session_runtime.monster_lock:
+            projectiles = self._monster_projectiles
+            if not projectiles:
+                self.projectile_positions = NO_PROJECTILES
+                return
+
+            if len(projectiles) < self.PROJECTILE_DENSE_THRESHOLD:
+                self._update_monster_projectiles_scalar(projectiles, delta)
+            else:
+                self._update_monster_projectiles_dense(projectiles, delta)
+
+    def _projectile_damage(self, victim, damage, owner_id, at=None):
+        previous = self.projectile_damage_owner
+        self.projectile_damage_owner = int(owner_id)
+        try:
+            if victim is None:
+                # *at*: where the projectile was -- the side the hit came from.
+                self.logic.player_runtime.damage_source = at
+                self.logic.trigger_runtime._apply_player_damage(damage)
+            else:
+                self.logic.monster_ai._apply_monster_damage(victim, damage, attacker=None)
+        finally:
+            self.projectile_damage_owner = previous
+
+
+    def _update_monster_projectiles_scalar(self, projectiles, delta: float):
+        """Advance a small projectile set row-by-row without batch allocations."""
+        logic = self.logic
+
+        count = len(projectiles)
+        has_portals = bool(logic.portal_runtime.portal_things)
+        collision_brushes = logic.collision_runtime._collision_brushes_cache
+        # The swarm is small but the world may not be: on a large cache each
+        # wall test is one NumPy query over every box instead of a walk.
+        collision_rows = logic.collision_runtime.collision_rows()
+        survivors = []
+        explosions = logic.explosion_runtime
+        any_explosives = bool(explosions.explosives())
+
+        player = logic.player_runtime.player
+        player_can_be_hit = (
+            player is not None
+            and not logic.player_runtime.god_mode
+            and not logic.player_runtime.player_dead
+        )
+        if player is not None:
+            player_pos = player.pos
+            player_radius_sq = float(self.PROJECTILE_PLAYER_RADIUS) ** 2
+        else:
+            player_pos = None
+            player_radius_sq = 0.0
+
+        radius_sq = float(self.PROJECTILE_MONSTER_RADIUS) ** 2
+        lift = float(self.PROJECTILE_MONSTER_LIFT)
+
+        sweep_sq = (self.PROJECTILE_SWEEP_STEP / delta) ** 2 if delta > 0.0 else math.inf
+        sweep_barrels = explosions if any_explosives else None
+
+        for i in range(count):
+            pos = projectiles.pos[i]
+            vel = projectiles.vel[i]
+            fast = float(vel[0]) ** 2 + float(vel[1]) ** 2 + float(vel[2]) ** 2 > sweep_sq
+            if has_portals or fast:
+                prev = (float(pos[0]), float(pos[1]), float(pos[2]))
+            else:
+                prev = None
+
+            pos[0] += vel[0] * delta
+            pos[1] += vel[1] * delta
+            pos[2] += vel[2] * delta
+
+            if has_portals:
+                logic.portal_runtime.transit_projectile_through_portals(projectiles, i, prev)
+            if fast:
+                self._sweep_projectile(projectiles, i, prev, delta,
+                                       collision_rows, sweep_barrels)
+
+            vx = float(projectiles.vel[i, 0])
+            vy = float(projectiles.vel[i, 1])
+            vz = float(projectiles.vel[i, 2])
+            speed = math.sqrt(vx * vx + vy * vy + vz * vz)
+
+            distance = float(projectiles.distance[i]) + speed * delta
+            lifetime = float(projectiles.lifetime[i]) - delta
+            projectiles.distance[i] = distance
+            projectiles.lifetime[i] = lifetime
+
+            if distance >= MONSTER_PROJECTILE_MAX_DIST or lifetime <= 0.0:
+                continue
+
+            px = float(projectiles.pos[i, 0])
+            py = float(projectiles.pos[i, 1])
+            pz = float(projectiles.pos[i, 2])
+            owner_id = int(projectiles.owner_id[i])
+
+            if player_can_be_hit and owner_id != PLAYER_PROJECTILE_OWNER:
+                dx = px - float(player_pos[0])
+                dy = py - float(player_pos[1])
+                dz = pz - float(player_pos[2])
+                if dx * dx + dy * dy + dz * dz < player_radius_sq:
+                    damage = float(projectiles.damage[i])
+                    self._projectile_damage(None, damage, owner_id, at=(px, py, pz))
+                    if logic.monster_ai.monster_debug_active:
+                        debug_log(
+                            "MonsterAI",
+                            f"Projectile hit player for {damage} dmg",
+                        )
+                    continue
+
+            owner = logic.world_runtime.monster_by_id.get(owner_id)
+            owner_team = (
+                owner.properties.get('team', '')
+                if owner is not None else None
+            )
+
+            hit_monster = None
+            for candidate in logic.world_runtime.monster_things:
+                if id(candidate) == owner_id:
+                    continue
+                cp = candidate.properties
+                if cp.get('dead', False) or cp.get('hidden', False):
+                    continue
+                candidate_team = cp.get('team', '')
+                if owner_team and candidate_team and owner_team == candidate_team:
+                    continue
+
+                centre_x = float(candidate.pos[0])
+                centre_y = float(candidate.pos[1]) + lift
+                centre_z = float(candidate.pos[2])
+                dx = px - centre_x
+                dy = py - centre_y
+                dz = pz - centre_z
+                if dx * dx + dy * dy + dz * dz < radius_sq:
+                    hit_monster = candidate
+                    break
+
+            if hit_monster is not None:
+                damage = float(projectiles.damage[i])
+                self._projectile_damage(hit_monster, damage, owner_id)
+                if logic.monster_ai.monster_debug_active:
+                    name = hit_monster.properties.get('name', '?')
+                    debug_log(
+                        "MonsterAI",
+                        f"Projectile hit {name} for {damage} dmg",
+                    )
+                continue
+
+            barrel = explosions.point_hit(px, py, pz) if any_explosives else None
+            if barrel is not None:
+                explosions.damage_prop(barrel, float(projectiles.damage[i]))
+                continue
+
+            hit_wall = False
+            if collision_rows is not None:
+                brushes = collision_rows.brushes
+                hit_wall = any(
+                    is_solid_world_brush(brushes[row])
+                    for row in collision_rows.point_hits(px, py, pz).tolist()
+                )
+            else:
+                for brush in collision_brushes:
+                    if not is_solid_world_brush(brush):
+                        continue
+                    b = world_bounds(brush)
+                    if (
+                        b[0] <= px <= b[3]
+                        and b[1] <= py <= b[4]
+                        and b[2] <= pz <= b[5]
+                    ):
+                        hit_wall = True
+                        break
+            if hit_wall:
+                continue
+
+            survivors.append(i)
+
+        if survivors:
+            keep = np.asarray(survivors, dtype=np.intp)
+            projectiles.compact(
+                keep,
+                projectiles.pos[:count],
+                projectiles.vel[:count],
+                projectiles.lifetime[:count],
+                projectiles.distance[:count],
+            )
+            live_count = len(survivors)
+            # Publication makes the immutable render snapshot copy once.
+            # Keep the simulation-side value as a view until then.
+            self.projectile_positions = projectiles.pos[:live_count]
+        else:
+            projectiles.clear()
+            self.projectile_positions = NO_PROJECTILES
+
+
+    def _update_monster_projectiles_dense(self, projectiles, delta: float):
+        """Advance monster projectiles through the batched dense numeric path."""
+        logic = self.logic
+
+        count = len(projectiles)
+        pos = projectiles.pos[:count]
+        vel = projectiles.vel[:count]
+        prev = None
+
+        # Portal transit needs the previous segment endpoint. The common
+        # no-portal path stays entirely in the persistent arrays.
+        if logic.portal_runtime.portal_things:
+            prev = pos.copy()
+        # Rows fast enough to step over a wall are swept below (see
+        # _sweep_projectile); at the default speed there are none.
+        step_sq = (vel[:, 0] * vel[:, 0] + vel[:, 1] * vel[:, 1]
+                   + vel[:, 2] * vel[:, 2]) * np.float32(delta * delta)
+        fast = np.flatnonzero(step_sq > np.float32(self.PROJECTILE_SWEEP_STEP ** 2))
+        fast_prev = pos[fast].copy() if len(fast) else None
+        pos += vel * delta
+        if prev is not None:
+            for i in range(count):
+                logic.portal_runtime.transit_projectile_through_portals(
+                    projectiles, i, tuple(prev[i]))
+        if fast_prev is not None:
+            rows = logic.collision_runtime.collision_rows()
+            barrels = logic.explosion_runtime
+            barrels = barrels if barrels.explosives() else None
+            for k, i in enumerate(fast.tolist()):
+                self._sweep_projectile(projectiles, i, fast_prev[k], delta, rows, barrels)
+
+        speed = np.sqrt(
+            vel[:, 0] * vel[:, 0]
+            + vel[:, 1] * vel[:, 1]
+            + vel[:, 2] * vel[:, 2]
+        )
+        travelled = projectiles.distance[:count] + speed * delta
+        lifetime = projectiles.lifetime[:count] - delta
+        live = (
+            (travelled < MONSTER_PROJECTILE_MAX_DIST)
+            & (lifetime > 0.0)
+        )
+        # ProjectileStore positions are authoritative float32 storage, so do not
+        # copy the array merely to restate its dtype on every dense tick.
+        pos32 = pos
+
+        # The player's hit sphere, in the float32 glm.distance used previously.
+        player_hit = np.zeros(count, dtype=bool)
+        if logic.player_runtime.player is not None:
+            pp = logic.player_runtime.player.pos
+            player32 = np.array((pp[0], pp[1], pp[2]), dtype=np.float32)
+            d = pos32 - player32
+            player_hit = (
+                np.sqrt(
+                    d[:, 0] * d[:, 0]
+                    + d[:, 1] * d[:, 1]
+                    + d[:, 2] * d[:, 2]
+                )
+                < np.float32(self.PROJECTILE_PLAYER_RADIUS)
+            ) & live & (projectiles.owner_id[:count] != PLAYER_PROJECTILE_OWNER)
+
+        grid = logic.session_runtime.spatial_grid
+        all_collision_brushes = logic.collision_runtime._collision_brushes_cache
+        keep = live.copy()
+        explosions = logic.explosion_runtime
+        any_explosives = bool(explosions.explosives())
+
+        live_rows = np.flatnonzero(live)
+        owners = projectiles.owner_id[live_rows]
+        monsters, mq, mrow = self._projectile_monster_candidates(
+            pos32[live_rows], owners
+        )
+        mq = live_rows[mq] if len(mq) else mq
+        monster_hits = {}
+        for q, r in zip(mq.tolist(), mrow.tolist()):
+            monster_hits.setdefault(q, []).append(r)
+
+        if grid is not None:
+            wall_hits = self._projectile_wall_candidates(pos32[live_rows])
+            wall_hits = {
+                int(live_rows[q]): rows
+                for q, rows in wall_hits.items()
+            }
+            wall_brushes = grid._cell_rows
+        else:
+            wall_hits = None
+
+        for i in live_rows.tolist():
+            if (
+                player_hit[i]
+                and logic.player_runtime.player
+                and not logic.player_runtime.god_mode
+                and not logic.player_runtime.player_dead
+            ):
+                damage = float(projectiles.damage[i])
+                self._projectile_damage(
+                    None, damage, int(projectiles.owner_id[i]),
+                    at=tuple(pos32[i].tolist()))
+                if logic.monster_ai.monster_debug_active:
+                    debug_log(
+                        "MonsterAI",
+                        f"Projectile hit player for {damage} dmg",
+                    )
+                keep[i] = False
+                continue
+
+            hit_monster = None
+            for r in monster_hits.get(i, ()):
+                candidate = monsters[r]
+                cp = candidate.properties
+                if not (cp.get('dead', False) or cp.get('hidden', False)):
+                    hit_monster = candidate
+                    break
+            if hit_monster is not None:
+                damage = float(projectiles.damage[i])
+                self._projectile_damage(hit_monster, damage, int(projectiles.owner_id[i]))
+                if logic.monster_ai.monster_debug_active:
+                    name = hit_monster.properties.get('name', '?')
+                    debug_log(
+                        "MonsterAI",
+                        f"Projectile hit {name} for {damage} dmg",
+                    )
+                keep[i] = False
+                continue
+
+            if any_explosives:
+                bx, by, bz = (float(v) for v in pos32[i])
+                barrel = explosions.point_hit(bx, by, bz)
+                if barrel is not None:
+                    explosions.damage_prop(barrel, float(projectiles.damage[i]))
+                    keep[i] = False
+                    continue
+
+            if wall_hits is not None:
+                hit_wall = any(
+                    is_solid_world_brush(wall_brushes.brushes[r])
+                    for r in wall_hits.get(i, ())
+                )
+            else:
+                x, y, z = pos32[i]
+                hit_wall = False
+                for brush in all_collision_brushes:
+                    if not is_solid_world_brush(brush):
+                        continue
+                    b = world_bounds(brush)
+                    if (
+                        b[0] <= x <= b[3]
+                        and b[1] <= y <= b[4]
+                        and b[2] <= z <= b[5]
+                    ):
+                        hit_wall = True
+                        break
+            if hit_wall:
+                keep[i] = False
+
+        survivors = np.flatnonzero(keep)
+        projectiles.compact(survivors, pos, vel, lifetime, travelled)
+
+        # Published as an independent snapshot so the renderer can keep
+        # consuming its frame even while the next logic tick mutates the store.
+        # Publication makes the immutable render snapshot copy once.
+        # The compacted store is authoritative until that boundary.
+        self.projectile_positions = (
+            projectiles.pos[:len(survivors)]
+            if len(survivors) else NO_PROJECTILES
+        )
+    
+
+    # =========================================================================
+    # GUNFIRE SOUND EVENTS (for AI hearing)
+    # =========================================================================
+
+
+    def _emit_noise_event(self, pos, source: str, loudness: float = 1.0):
+        """Record an audible player action so hearing monsters can react.
+
+        Stored in the shared player-noise list (self._gunfire_events); every
+        event carries a position, timestamp, a source tag and a loudness
+        multiplier that scales how far it can be heard. Used by the monster
+        AI both to wake sleeping monsters and to steer awake ones toward the
+        source (see MonsterAI._hears_noise / _investigate_sounds).
+        """
+        logic = self.logic
+        self._gunfire_events.append({
+            'pos': [float(pos[0]), float(pos[1]), float(pos[2])],
+            'time': time.perf_counter(),
+            'source': source,
+            'loudness': float(loudness),
+        })
+        logic._plugin_emit("noise", pos=[float(pos[0]), float(pos[1]), float(pos[2])],
+                          source=source, loudness=float(loudness))
+
+
+    def prune_noise_events(self, max_age: float = 3.0):
+        """Discard player-noise events older than *max_age* seconds."""
+        current_time = time.perf_counter()
+        self._gunfire_events = [
+            event for event in self._gunfire_events
+            if (current_time - event['time']) < max_age
+        ]
+
+    def get_recent_noise_events(self, max_age: float = 3.0) -> list:
+        logic = self.logic
+        current_time = time.perf_counter()
+        return [
+            e for e in self._gunfire_events
+            if (current_time - e['time']) < max_age
+        ]
+
+    # =========================================================================
+    # FRUSTUM CULLING
+    # =========================================================================
+

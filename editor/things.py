@@ -1,0 +1,2513 @@
+"""
+This module defines all placeable entities (Things) in the level editor.
+Each Thing type has associated I/O definitions (inputs/outputs) for
+the event-driven entity communication system.
+"""
+
+from engine.asset_qt import load_pixmap
+from engine.asset_archives import asset_exists
+import copy
+import os
+import math
+import uuid
+import importlib
+
+from engine.change_journal import TrackedAttribute, TrackedPosition, touch
+from engine.constants import (PLAYER_HULL_SIZE, SHADOW_BIAS_DEFAULT,
+                              SHADOW_SOFTNESS_DEFAULT)
+from engine.portal_transform import (
+    basis_from_rotation as _portal_basis_from_rotation,
+    map_point as _portal_map_point,
+    map_direction as _portal_map_direction,
+    corners as _portal_corners,
+    contains_point as _portal_contains_point,
+)
+if __name__.startswith('editor.'):
+    # The editor tier. It is PyQt-backed, and the headless boundary is this
+    # import: without Qt the module does not load, and a headless desktop
+    # host falls back to plugins.entitybase.
+    from PyQt5.QtGui import QPixmap
+    from PyQt5.QtCore import Qt
+else:
+    # The same file staged as ``engine.entities`` for the standalone player
+    # (player/tools/stage_runtime.py), which ships no Qt and draws no editor
+    # icon: the entity classes load, their 2D pixmaps are never asked for.
+    QPixmap = Qt = None
+import ast
+import posixpath
+
+from . import state_values as _sv
+
+
+try:
+    from .debug_console import debug_log
+except ImportError:
+    try:
+        from editor.debug_console import debug_log
+    except ImportError:
+        def debug_log(category, message):
+            print(f"[{category}] {message}")
+
+def find_subclasses(cls):
+    """Recursively finds all subclasses of a given class."""
+    all_subclasses = []
+    for subclass in cls.__subclasses__():
+        all_subclasses.append(subclass)
+        all_subclasses.extend(find_subclasses(subclass))
+    return all_subclasses
+
+def update_all_counters_from_entities(entities):
+    """
+    Update the class-level _counters for Thing subclasses based on existing entity names.
+    entities: list of brushes (dict) and Thing instances.
+    For brushes, they have a 'name' key; for Things, they have a 'name' property.
+    The counter for each class is set to the highest numeric suffix found + 1.
+    """
+    import re
+    from collections import defaultdict
+
+    # Map class name to highest numeric index found
+    max_indices = defaultdict(int)
+
+    for entity in entities:
+        # Get name
+        if isinstance(entity, dict):
+            name = entity.get('name', '')
+        else:
+            name = entity.properties.get('name', '')
+
+        if not name or not isinstance(name, str):
+            continue
+
+        # Names are typically "ClassName_number" (e.g., "Monster_5", "Light_12")
+        match = re.match(r'^([A-Za-z]+)_(\d+)$', name)
+        if match:
+            class_name = match.group(1)
+            num = int(match.group(2))
+            if num > max_indices[class_name]:
+                max_indices[class_name] = num
+
+    # Update counters for all Thing subclasses (including core entities
+    # defined outside this module, e.g. Prop).
+    _load_core_entity_types()
+    for cls in find_subclasses(Thing):
+        class_name = cls.__name__
+        if class_name in max_indices:
+            cls._counters[class_name] = max_indices[class_name]
+        else:
+            # Ensure counter exists, starting at 0 (next created gets 1)
+            cls._counters[class_name] = 0
+
+
+#: Entity class -> its default properties, learned once from a probe instance.
+_CLASS_DEFAULTS = {}
+
+
+def _class_defaults(cls):
+    """The properties a fresh *cls* declares, keyed by name.
+
+    Learned from one probe instance per class.  The probe is given a name and
+    id so that constructing it neither advances the naming counters nor
+    generates a UUID.
+    """
+    defaults = _CLASS_DEFAULTS.get(cls)
+    if defaults is None:
+        try:
+            probe = cls(pos=[0.0, 0.0, 0.0],
+                        properties={'name': '\x00probe', 'id': '\x00probe'})
+            defaults = dict(probe.properties)
+        except Exception:
+            defaults = {}
+        _CLASS_DEFAULTS[cls] = defaults
+    return defaults
+
+
+def _heal_legacy_strings(cls, properties):
+    """*properties* with legacy string-encoded values restored to their type.
+
+    Old maps stored numbers, booleans and lists as their text (``"0.5"``,
+    ``"True"``).  Such a string is parsed back only where *cls* declares a
+    non-string default for that property: a property that is text by
+    declaration (a name, a message, a map path) or that the class does not
+    declare at all keeps exactly what was authored.  Parsing every string
+    turned an entity named ``"2"`` into the integer 2 on save, and the next
+    load of that map crashed.
+    """
+    defaults = _class_defaults(cls)
+    healed = {}
+    for key, value in properties.items():
+        default = defaults.get(key)
+        if (isinstance(value, str) and default is not None
+                and not isinstance(default, str)):
+            try:
+                value = ast.literal_eval(value)
+            except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+                pass  # Genuinely a string — keep it
+        healed[key] = value
+    return healed
+
+
+class Thing:
+    """Base class for all placeable entities."""
+    #: Assigning ``pos`` tells the render projection the entity moved; see
+    #: :mod:`engine.change_journal`. Assign a new list rather than mutating it.
+    pos = TrackedPosition()
+    pixmap_path = None
+    _pixmap_cache = {}  # Class-level cache for loaded pixmaps
+    _counters = {}      # Class-level counter for unique naming
+
+    # Editor property classification.
+    #
+    # Properties listed here are shown on the main Properties tab.
+    # Properties listed in EDITOR_ADVANCED_PROPERTIES are shown on
+    # the Advanced tab.
+    #
+    # Subclasses should explicitly opt properties into Advanced.
+    # Everything else should remain available to the main Properties
+    # editor unless handled by a specialised widget.
+    EDITOR_PRIMARY_PROPERTIES = ()
+    EDITOR_ADVANCED_PROPERTIES = ()
+
+    def __init__(self, pos=None, properties=None):
+        self.pos = pos if pos is not None else [0, 0, 0]
+        self.properties = properties if properties is not None else {}
+        self.properties.setdefault('type', self.__class__.__name__.lower())
+        self.properties.setdefault('io_enabled', True)
+        
+        # Set a default and unique name
+        if 'name' not in self.properties or not self.properties['name']:
+            class_name = self.__class__.__name__
+            if class_name not in Thing._counters:
+                Thing._counters[class_name] = 1
+            else:
+                Thing._counters[class_name] += 1
+            self.properties['name'] = f"{class_name}_{Thing._counters[class_name]}"
+        
+        # Stable unique ID (persists across save/load)
+        if 'id' not in self.properties:
+            self.properties['id'] = str(uuid.uuid4())
+
+        # I/O Connections - stored as list of OutputConnection objects
+        if '_io_connections' not in self.properties:
+            self.properties['_io_connections'] = []
+
+    def editor_label_lines(self):
+        """Text the 2D views write under this entity's sprite, top line first."""
+        return ()
+
+    @property
+    def name(self):
+        """Gets the name from the properties dictionary."""
+        return self.properties.get('name', '')
+
+    @name.setter
+    def name(self, value):
+        """Sets the name in the properties dictionary."""
+        self.properties['name'] = value
+
+    @classmethod
+    def get_pixmap(cls):
+        """
+        Gets the QPixmap for this class, loading it from disk and caching it
+        the first time it's requested.
+        """
+        class_name = cls.__name__
+        if class_name in cls._pixmap_cache:
+            return cls._pixmap_cache[class_name]
+
+        if not cls.pixmap_path:
+            cls._pixmap_cache[class_name] = None
+            return None
+
+        try:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            project_root = os.path.abspath(os.path.join(script_dir, os.pardir))
+        except NameError:
+            project_root = os.path.abspath(os.path.join(os.getcwd()))
+
+        absolute_path = os.path.join(project_root, cls.pixmap_path)
+
+        pixmap = None
+        if asset_exists(absolute_path):
+            loaded_pixmap = load_pixmap(absolute_path)
+            if not loaded_pixmap.isNull():
+                pixmap = loaded_pixmap
+            else:
+                print(f"Error: QPixmap failed to load image for {class_name} from {absolute_path}")
+        else:
+            print(f"Warning: Sprite file not found for {class_name} at: {absolute_path}")
+
+        cls._pixmap_cache[class_name] = pixmap
+        return pixmap
+
+    def get_icon_pixmap(self):
+        """Return a 60×60 icon for 2D views. Default implementation returns scaled instance pixmap."""
+        pixmap = self.get_instance_pixmap()
+        if pixmap and not pixmap.isNull():
+            # Scale to 60×60 for consistent icon size in 2D view
+            return pixmap.scaled(60, 60, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        return None
+    
+    def get_instance_pixmap(self):
+        """
+        Gets the QPixmap for this specific instance. 
+        Override in subclasses for dynamic sprite selection.
+        """
+        return self.__class__.get_pixmap()
+
+    def _pixmap_for_path(self, sprite_path):
+        """Cached QPixmap for an authored, project-relative sprite path.
+
+        Returns None when the file is missing or unreadable, or when the path
+        (map data) is absolute, a drive or UNC path, or leaves the project's
+        ``assets``/``plugins`` folders. Shared by any entity whose 2D icon
+        comes from an authored path rather than its class.
+        """
+        cache_key = ('sprite_path', sprite_path)
+        if cache_key in self._pixmap_cache:
+            return self._pixmap_cache[cache_key]
+        from engine.asset_paths import confined_path, safe_relative, warn_refused
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+        relative = safe_relative(sprite_path)
+        absolute_path = None
+        if relative is not None and relative.split('/')[0] in ('assets', 'plugins'):
+            top, _, rest = relative.partition('/')
+            absolute_path = confined_path(os.path.join(project_root, top), rest)
+        if absolute_path is None:
+            warn_refused(sprite_path, 'sprite')
+        pixmap = (load_pixmap(absolute_path)
+                  if absolute_path and asset_exists(absolute_path) else None)
+        if pixmap is not None and pixmap.isNull():
+            pixmap = None
+        self._pixmap_cache[cache_key] = pixmap
+        return pixmap
+
+    def duplicate(self, existing_names=()):
+        """An independent copy of this entity, ready to place.
+
+        Everything the entity carries comes across — every property, its I/O
+        connections, its position — but the copy gets its own identity: a fresh
+        UUID and a name with ``(copy)`` appended.  ``existing_names`` is the set
+        of names already in use; a number is added when needed so two clones of
+        the same entity never end up sharing a name, which would otherwise make
+        every name-addressed I/O connection ambiguous between them.
+
+        A plain ``copy.copy`` will not do here: it leaves the copy sharing the
+        original's ``properties`` dict, so editing one silently edits both.
+        """
+        clone = copy.deepcopy(self)
+        # Position is mutated in place by dragging, so it must not be shared
+        # even if a subclass stored something exotic there.
+        clone.pos = [float(self.pos[0]), float(self.pos[1]), float(self.pos[2])]
+        clone.properties['id'] = str(uuid.uuid4())
+
+        base = self.properties.get('name', '')
+        if base:
+            taken = set(existing_names)
+            name = '%s (copy)' % base
+            counter = 2
+            while name in taken:
+                name = '%s (copy %d)' % (base, counter)
+                counter += 1
+            clone.properties['name'] = name
+        return clone
+
+    def to_dict(self):
+        """Serialize to dictionary for saving."""
+        props_copy = {k: v for k, v in self.properties.items() if k != '_io_connections'}
+
+        # Heal legacy string-typed values on save, so old map files are
+        # repaired by the next save (see _heal_legacy_strings).
+        serializable_props = {}
+        for k, v in _heal_legacy_strings(type(self), props_copy).items():
+            if isinstance(v, (str, int, float, bool, list, dict, type(None))):
+                serializable_props[k] = v
+            else:
+                serializable_props[k] = str(v)  # QColor etc.
+
+        result = {
+            'type': self.properties.get('type'),
+            'pos': self.pos,
+            'properties': serializable_props
+        }
+
+        # Always emit io_connections, even if empty, so loaders are unambiguous
+        try:
+            from .io_system import serialize_connections
+            result['io_connections'] = serialize_connections(self)
+        except ImportError:
+            io_connections = self.properties.get('_io_connections', [])
+            result['io_connections'] = [
+                conn.to_dict() if hasattr(conn, 'to_dict') else conn
+                for conn in io_connections
+            ]
+
+        return result
+
+    @staticmethod
+    def from_dict(data):
+        """Deserialize from dictionary."""
+        thing_type = data.get('type')
+
+        # Untouched copy for opaque preservation of unresolvable types.
+        original_record = copy.deepcopy(data)
+
+        if not thing_type:
+            # Deliberately *not* preserved, unlike an unresolvable type token.
+            # Preservation exists so an entity whose plugin is missing survives
+            # a load/save round trip; that entity is identifiable, carries
+            # authored content, and a plugin may supply its class later. A
+            # record with no type at all is none of those things -- there is
+            # nothing to resolve it to and nothing to show the author but a
+            # nameless ghost. Skipping it (without stopping the load) is the
+            # contract test_a_thing_with_no_type_is_skipped_rather_than_
+            # crashing_the_load pins.
+            return None
+
+        properties = data.get('properties', {})
+        if not isinstance(properties, dict):
+            properties = {}
+
+        # A subclass may declare `map_type` when its serialised type token
+        # differs from its class name; otherwise the class name is used.
+        thing = None
+        token = thing_type.replace('_', '').lower()
+        _load_core_entity_types()
+        legacy_model = token == 'model'
+        if legacy_model:
+            # There is no Model entity: every model is a Prop. A map written
+            # before that keeps what its models were -- solid scenery the
+            # player does not pick up -- under whatever the record authors.
+            from engine.prop_entity import legacy_model_properties
+            properties = legacy_model_properties(properties)
+            token = 'prop'
+        subclasses = find_subclasses(Thing)
+        match = next((c for c in subclasses
+                      if token == getattr(c, 'map_type', c.__name__.lower())), None)
+        if match is None and thing_type == 'thing':
+            match = Thing
+        if match is not None:
+            thing = match(pos=data.get('pos'),
+                          properties=_heal_legacy_strings(match, properties))
+            if legacy_model:
+                # Transient: lets the map loader re-aim I/O written against the
+                # old Model inputs (see io_system.retarget_legacy_model_inputs).
+                thing._legacy_model = True
+
+        if thing is None:
+            # Never drop an entity: a later save would erase it for good.
+            # Keep the record opaque so it round-trips byte-for-byte.
+            print(f"Warning: Unknown thing type '{thing_type}' found in map file; "
+                  f"preserved unchanged (is a plugin missing or disabled?).")
+            return UnresolvedThing(original_record)
+        
+        io_data = copy.deepcopy(data.get('io_connections', []))
+        if io_data:
+            try:
+                from .io_system import OutputConnection
+                connections = [OutputConnection.from_dict(d) for d in io_data]
+                thing.properties['_io_connections'] = connections
+            except ImportError:
+                thing.properties['_io_connections'] = io_data
+        
+        return thing
+    
+    def add_output_connection(self, output_name, target_name, input_name, 
+                               parameter="", delay=0.0, fire_once=False,
+                               target_id=""):
+        """Helper method to add an output connection."""
+        try:
+            from .io_system import OutputConnection, add_connection
+            conn = OutputConnection(
+                output_name=output_name,
+                target_name=target_name,
+                input_name=input_name,
+                parameter=parameter,
+                delay=delay,
+                fire_once=fire_once,
+                target_id=target_id
+            )
+            add_connection(self, conn)
+            return conn
+        except ImportError:
+            if '_io_connections' not in self.properties:
+                self.properties['_io_connections'] = []
+            self.properties['_io_connections'].append({
+                'output': output_name,
+                'target': target_name,
+                'target_id': target_id,
+                'input': input_name,
+                'parameter': parameter,
+                'delay': delay,
+                'fire_once': fire_once
+            })
+            return None
+    
+    def get_io_connections(self):
+        """Get all I/O connections for this entity."""
+        return self.properties.get('_io_connections', [])
+    
+    def clear_io_connections(self):
+        """Clear all I/O connections."""
+        self.properties['_io_connections'] = []
+
+# =============================================================================
+# STANDARD THING SUBCLASSES
+# =============================================================================
+
+class PlayerStart(Thing):
+    """Defines where the player spawns.
+
+    ``name`` is what a LevelChanger's ``destination_spawn`` refers to;
+    ``primary`` marks the level's default start, at most one per level (see
+    :mod:`engine.player_starts`, and ``EditorState.settle_player_starts``,
+    which gives a level's first-created start the flag and keeps it unique).
+    """
+    # Private editor artwork, deliberately outside assets/models (the browser).
+    # It is presentation only: no Prop/model fields are persisted on the spawn.
+    pixmap_path = None
+    editor_model_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        'assets', 'editor', 'playerstart.obj')
+    editor_model_bounds = (tuple(-size / 2 for size in PLAYER_HULL_SIZE),
+                           tuple(size / 2 for size in PLAYER_HULL_SIZE))
+    EDITOR_PRIMARY_PROPERTIES = ('angle',)
+    
+    def __init__(self, pos=None, properties=None):
+        super().__init__(pos, properties)
+        self.properties.setdefault('type', 'playerstart')
+        self.properties.setdefault('angle', 0.0)
+        self.properties.setdefault('primary', False)
+
+    def get_angle(self):
+        return float(self.properties.get('angle', 0.0))
+
+    @property
+    def primary(self):
+        return self.properties.get('primary') is True
+
+    def editor_label_lines(self):
+        lines = [self.properties['name']] if self.properties.get('name') else []
+        if self.primary:
+            lines.append("Primary")
+        return tuple(lines)
+
+
+class UnresolvedThing(Thing):
+    """Opaque stand-in for an entity whose type this build cannot resolve.
+
+    Typically a plugin entity whose plugin is missing or disabled, or a type
+    from a newer/older Fio with no migration. The original map record is kept
+    verbatim and written back unchanged on save (only ``pos`` follows edits,
+    so it can still be moved or deleted in the editor). It has no runtime
+    behaviour: no class-specific handling matches it, and it declares no I/O.
+
+    ``map_type`` is set to a token no map can contain, so the from_dict
+    subclass walk can never resolve a record *to* this class.
+    """
+    map_type = '\x00unresolved'
+
+    def __init__(self, record=None, pos=None, properties=None):
+        record = copy.deepcopy(record) if isinstance(record, dict) else {}
+        self._record = record
+        raw_props = record.get('properties')
+        props = copy.deepcopy(raw_props) if isinstance(raw_props, dict) else {}
+        if properties:
+            props.update(properties)
+        super().__init__(pos=list(record.get('pos') or pos or [0, 0, 0]),
+                         properties=props)
+        self.properties['type'] = record.get('type') or self.properties.get('type')
+
+    @property
+    def unresolved_type(self):
+        return self._record.get('type')
+
+    def to_dict(self):
+        data = copy.deepcopy(self._record)
+        data['pos'] = [float(v) for v in self.pos]
+        # Its brush group is the editor's, not the missing plugin's: it
+        # follows edits as ``pos`` does (editor.brush_groups).
+        group = self.properties.get('brush_group')
+        props = data.get('properties')
+        if group or (isinstance(props, dict) and 'brush_group' in props):
+            if not isinstance(props, dict):
+                props = data['properties'] = {}
+            if group:
+                props['brush_group'] = group
+            else:
+                props.pop('brush_group', None)
+        return data
+
+    def duplicate(self, existing_names=()):
+        """Copies need their own identity inside the preserved record too."""
+        clone = super().duplicate(existing_names)
+        props = clone._record.setdefault('properties', {})
+        if isinstance(props, dict):
+            props['id'] = clone.properties['id']
+            props['name'] = clone.properties['name']
+        return clone
+
+
+class Light(Thing):
+    """Dynamic light source."""
+    pixmap_path = "assets/sprites/light.png"
+    EDITOR_PRIMARY_PROPERTIES = (
+    'intensity',
+    'radius',
+    'state',
+    'show_radius',
+    'casts_shadows',
+    'shadow_map_size',
+    'shadow_softness',
+    'shadow_bias',
+    'cookie_enabled',
+    'cookie_texture',
+    'cookie_shadow_floor',
+    )
+
+    def __init__(self, pos=None, properties=None):
+        super().__init__(pos, properties)
+        self.properties.setdefault('type', 'light')
+        self.properties.setdefault('colour', [255, 255, 255])
+        self.properties.setdefault('intensity', 1.0)
+        self.properties.setdefault('radius', 512.0)
+        self.properties.setdefault('state', 'on')
+        self.properties.setdefault('show_radius', False)
+        self.properties.setdefault('casts_shadows', False)
+        # The shadow's map resolution per cube face (0: [Renderer]
+        # shadow_map_size), its edge softness (PCF disk radius in shadow-map
+        # texels) and the multiplier on its acne-preventing depth bias.
+        self.properties.setdefault('shadow_map_size', 0)
+        self.properties.setdefault('shadow_softness', SHADOW_SOFTNESS_DEFAULT)
+        self.properties.setdefault('shadow_bias', SHADOW_BIAS_DEFAULT)
+        # Projected image (engine.light_cookies): explicit opt-in, and
+        # independent of casts_shadows. With both, the image stays visible in
+        # the light's own shadow at cookie_shadow_floor brightness.
+        self.properties.setdefault('cookie_enabled', False)
+        self.properties.setdefault('cookie_texture', '')
+        self.properties.setdefault('cookie_shadow_floor', 0.15)
+
+        # Parenting: attach this light to a mover brush by name.
+        # When parent_mover is non-empty the logic thread moves this
+        # light to (mover.pos + parent_offset) every tick during play.
+        self.properties.setdefault('parent_mover', '')
+        self.properties.setdefault('parent_offset', [0.0, 0.0, 0.0])
+
+    def get_color(self):
+        color = self.properties.get('colour', [255, 255, 255])
+        return [c / 255.0 for c in color]
+
+    def get_intensity(self):
+        return float(self.properties.get('intensity', 1.0))
+
+    def get_radius(self):
+        return float(self.properties.get('radius', 512.0))
+
+    def get_show_radius(self):
+        val = self.properties.get('show_radius', False)
+        if isinstance(val, str):
+            return val.lower() == 'true'
+        return bool(val)
+
+    def set_show_radius(self, value):
+        self.properties['show_radius'] = bool(value)
+
+    show_radius = property(get_show_radius, set_show_radius)
+
+
+class LightVolume(Thing):
+    """An idTech 4-style bounded light: a box that is lit, and a light source.
+
+    Unlike :class:`Light` -- a point whose light reaches a sphere and fades
+    with distance -- a light volume lights exactly the box it is given and
+    nothing outside it. The light (and its shadows) come from its *light
+    source*, a point that may be anywhere, inside the box or not: a long box
+    lit from one end, a shaft lit from above. It sits beside the point Light;
+    the two are separate entities and a map's point lights are untouched.
+
+    Created in a 2D view by right-clicking a brush and choosing Light Volume:
+    the box takes the brush's bounds and the brush is removed (one undo puts
+    it back). The box is resized with its handles and the source dragged by
+    its marker, in the 2D views.
+
+    Properties
+    ----------
+    volume_size     The box: width, height and depth (x, y, z), world units,
+                    centred on the entity's position.
+    source_offset   The light source, relative to the box's centre.
+    colour, intensity, state
+                    As a Light's.
+    casts_shadows, shadow_map_size, shadow_softness, shadow_bias
+                    As a Light's, cast from the light source.
+
+    It has no icon: the views show its box and its light source.
+    """
+    pixmap_path = None
+    EDITOR_PRIMARY_PROPERTIES = (
+        'volume_size',
+        'source_offset',
+        'intensity',
+        'state',
+        'casts_shadows',
+        'shadow_map_size',
+        'shadow_softness',
+        'shadow_bias',
+    )
+    #: The smallest box edge, world units: a volume never collapses to a
+    #: plane (its handles and its light both need a thickness).
+    MIN_SIZE = 8.0
+
+    def __init__(self, pos=None, properties=None):
+        super().__init__(pos, properties)
+        self.properties['type'] = 'light_volume'
+        self.properties.setdefault('colour', [255, 255, 255])
+        self.properties.setdefault('intensity', 1.0)
+        self.properties.setdefault('state', 'on')
+        self.properties.setdefault('volume_size', [256.0, 256.0, 256.0])
+        self.properties.setdefault('source_offset', [0.0, 0.0, 0.0])
+        self.properties.setdefault('casts_shadows', False)
+        self.properties.setdefault('shadow_map_size', 0)
+        self.properties.setdefault('shadow_softness', SHADOW_SOFTNESS_DEFAULT)
+        self.properties.setdefault('shadow_bias', SHADOW_BIAS_DEFAULT)
+
+    @staticmethod
+    def _vec3(value, default):
+        try:
+            out = [float(v) for v in value][:3]
+        except (TypeError, ValueError):
+            return list(default)
+        if len(out) != 3 or not all(math.isfinite(v) for v in out):
+            return list(default)
+        return out
+
+    def get_volume_size(self):
+        """The box's (x, y, z) extents, each at least MIN_SIZE."""
+        size = self._vec3(self.properties.get('volume_size'), (256.0, 256.0, 256.0))
+        return [max(self.MIN_SIZE, abs(v)) for v in size]
+
+    def get_bounds(self):
+        """``(lo, hi)``: the box's world corners."""
+        half = [v / 2.0 for v in self.get_volume_size()]
+        centre = [float(v) for v in self.pos]
+        return ([c - h for c, h in zip(centre, half)],
+                [c + h for c, h in zip(centre, half)])
+
+    def get_source_offset(self):
+        return self._vec3(self.properties.get('source_offset'), (0.0, 0.0, 0.0))
+
+    def get_source_position(self):
+        """Where the light and its shadows come from, in the world."""
+        return [float(c) + o for c, o in zip(self.pos, self.get_source_offset())]
+
+    def get_color(self):
+        color = self.properties.get('colour', [255, 255, 255])
+        return [c / 255.0 for c in color]
+
+    def get_intensity(self):
+        try:
+            return float(self.properties.get('intensity', 1.0))
+        except (TypeError, ValueError):
+            return 1.0
+
+    @classmethod
+    def from_bounds(cls, lo, hi, **properties):
+        """A light volume filling the box *lo*..*hi*, its source at the centre."""
+        lo = [float(v) for v in lo]
+        hi = [float(v) for v in hi]
+        centre = [(a + b) / 2.0 for a, b in zip(lo, hi)]
+        size = [max(cls.MIN_SIZE, abs(b - a)) for a, b in zip(lo, hi)]
+        props = dict(properties)
+        props['volume_size'] = size
+        props.setdefault('source_offset', [0.0, 0.0, 0.0])
+        return cls(pos=centre, properties=props)
+
+
+class Speaker(Thing):
+    """Sound emitter entity."""
+    pixmap_path = "assets/sprites/speaker.png"
+    EDITOR_PRIMARY_PROPERTIES = (
+        'sound_file',
+        'radius',
+        'global',
+        'show_radius',
+        'volume',
+        'looping',
+        'play_on_start',
+        'state',
+    )
+    
+    def __init__(self, pos=None, properties=None):
+        super().__init__(pos, properties)
+        self.properties.setdefault('type', 'speaker')
+        self.properties.setdefault('sound_file', "")
+        self.properties.setdefault('radius', 512.0)
+        self.properties.setdefault('global', False)
+        self.properties.setdefault('show_radius', False)
+        self.properties.setdefault('volume', 1.0)
+        self.properties.setdefault('looping', False)
+        self.properties.setdefault('play_on_start', False)
+        self.properties.setdefault('state', 'off')
+
+    def get_radius(self):
+        return float(self.properties.get('radius', 512.0))
+
+
+class ReflectionProbe(Thing):
+    """Local reflections for water: Source's ``env_cubemap``, done Fio's way.
+
+    Water reflects the map's sky, plus whatever is on screen (high quality's
+    screen-space reflections). Under a roof the sky is the wrong thing to see
+    where those miss. Water whose centre is inside a probe's radius reflects
+    a 360-degree snapshot taken from the probe instead -- the room around it.
+
+    The snapshot is taken by the renderer, not baked into the map: when the
+    map loads, when Play starts, and when the probe is moved or its radius
+    changed. Nothing is redrawn per frame, and reading it costs the water
+    what reading the sky does. A map without probes renders as before.
+    """
+    pixmap_path = "assets/sprites/reflection_probe.png"
+    #: Its icon in the 3D view, while editing (never in Play).
+    editor_sprite_path = pixmap_path
+    EDITOR_PRIMARY_PROPERTIES = ('radius', 'show_radius')
+
+    def __init__(self, pos=None, properties=None):
+        super().__init__(pos, properties)
+        self.properties.setdefault('type', 'reflection_probe')
+        self.properties.setdefault('radius', 512.0)
+        self.properties.setdefault('show_radius', True)
+
+    def get_radius(self):
+        try:
+            return max(16.0, float(self.properties.get('radius', 512.0)))
+        except (TypeError, ValueError):
+            return 512.0
+
+
+#: How far above a water brush's top surface the probe its High quality
+#: checkbox creates stands: a standing player's height, about where a viewer
+#: sees the water from.
+WATER_PROBE_HEIGHT = float(PLAYER_HULL_SIZE[1])
+
+
+def water_probe_of(brush, things):
+    """The ReflectionProbe the *brush*'s High quality checkbox created
+    (its ``water_brush`` property is the brush's id), or None. A probe the
+    author placed has no ``water_brush`` and is never this."""
+    brush_id = brush.get('id') if isinstance(brush, dict) else None
+    if not brush_id:
+        return None
+    return next((t for t in things if isinstance(t, ReflectionProbe)
+                 and t.properties.get('water_brush') == brush_id), None)
+
+
+def make_water_probe(brush):
+    """A new ReflectionProbe for a water *brush*: centred over it,
+    WATER_PROBE_HEIGHT above its top surface, its radius reaching the brush's
+    centre (which is what decides which water a probe serves) and at least the
+    brush's half-width. The brush is given an id if it has none."""
+    brush_id = brush.get('id')
+    if brush_id is None:
+        brush_id = brush['id'] = str(uuid.uuid4())
+    pos = [float(v) for v in brush.get('pos', (0.0, 0.0, 0.0))]
+    size = [abs(float(v)) for v in brush.get('size', (64.0, 64.0, 64.0))]
+    top = pos[1] + size[1] / 2.0
+    radius = max(512.0, 0.5 * math.hypot(size[0], size[2]),
+                 size[1] / 2.0 + WATER_PROBE_HEIGHT + 16.0)
+    return ReflectionProbe(pos=[pos[0], top + WATER_PROBE_HEIGHT, pos[2]],
+                           properties={'radius': round(radius, 1),
+                                       'water_brush': brush_id})
+
+
+class Decal(Thing):
+    """A decal: an image painted onto whatever surfaces its box meets.
+
+    It is a row of the same decal table blood is (engine.decal_table), drawn
+    by the same pass: a box thrown along (yaw, pitch) -- straight down by
+    default -- that paints walls, floors, the corner between, terrain and
+    models, under water and glass.
+
+    Properties
+    ----------
+    texture     An image in assets/textures/decals (a file name). One with
+                "wet" or "puddle" in its name is a mask of where the surface
+                is wet -- darkened and reflecting the scene (faded out with
+                distance, off with ``reflections 0``); any other is painted.
+    width, height, depth   The box: across, up the image, and along the throw.
+    yaw, pitch  The direction it is thrown: yaw 0 along +X, 90 along -Z;
+                pitch -90 straight down (a floor), 0 level (a wall).
+    roll        The image's rotation about the throw, degrees.
+    mirrored    Flip the image left to right.
+    opacity     How strongly it paints (for 'wet', how wet).
+    tint        A colour the image is multiplied by, ``[r, g, b]`` 0..1:
+                white (the default) leaves it as it is. A wet decal's tint
+                colours the wet surface. IO: SetTint.
+    text        Words painted on, centred over the image (engine.decal_text);
+                empty for none. ``\\n`` starts a new line. With no image
+                (``texture`` empty) the words are painted alone. IO: SetText,
+                ClearText, SetFont, SetTextColor.
+    font        The font the text is drawn in, by name (the property
+                editor's dropdown): Fio UI unless another is chosen.
+    text_colour Black (the default) or White. Like the image, the words
+                tint the surface: black is black, white doubles its
+                brightness (white on a mid-tone wall).
+    text_scale  Text Size: 1.0 (the default) fills as much of the box as the
+                words can; down to 0.1, smaller, to fit inside an image.
+    text_offset_x, text_offset_y
+                Text Offset: the words moved from the centre, right and up,
+                by up to half the box (-0.5 to 0.5) -- into a plate's panel.
+    emissive    Glows, as a screen or a lit sign does: the whole image is
+                painted in its own colours whatever light falls on it, and
+                its face emits light -- into the room in front of it, not onto
+                the wall it is on -- in the main colour of its image (the one
+                most of it is) times its tint.
+                Off (the default) it is not a light at all and costs nothing.
+    emissive_intensity, emissive_radius
+                How bright that light is and how far it reaches, as a
+                Light's intensity and radius. Read only while emissive.
+    """
+    #: No sprite in the 3D view: what the decal paints is how it shows there
+    #: (placed, selected, dragged and nudged with the Decal tool). The 2D
+    #: views mark it with :data:`ICON_PATH` instead.
+    pixmap_path = None
+    #: The 2D views' marker: the Asset Browser's DECAL button icon.
+    ICON_PATH = "assets/decal_button.png"
+    #: The Decal tool's selection; selected decals draw tinted.
+    editor_selected = False
+    EDITOR_PRIMARY_PROPERTIES = (
+        'texture', 'width', 'height', 'depth',
+        'yaw', 'pitch', 'roll', 'mirrored', 'opacity', 'tint', 'text', 'font', 'text_colour',
+        'text_scale', 'text_offset_x', 'text_offset_y',
+        'emissive', 'emissive_intensity', 'emissive_radius',
+    )
+
+    def __init__(self, pos=None, properties=None):
+        super().__init__(pos, properties)
+        self.properties['type'] = 'decal'
+        # Wet or Image is the image's name (wet / puddle), not a setting:
+        # an older map's decal_type is dropped.
+        self.properties.pop('decal_type', None)
+        self.properties.setdefault('texture', self.default_texture())
+        self.properties.setdefault('width', 128.0)
+        self.properties.setdefault('height', 128.0)
+        self.properties.setdefault('depth', 32.0)
+        self.properties.setdefault('yaw', 0.0)
+        self.properties.setdefault('pitch', -90.0)
+        self.properties.setdefault('roll', 0.0)
+        self.properties.setdefault('mirrored', False)
+        self.properties.setdefault('opacity', 1.0)
+        self.properties.setdefault('tint', [1.0, 1.0, 1.0])
+        self.properties.setdefault('text', '')
+        self.properties.setdefault('font', 'Fio UI')
+        self.properties.setdefault('text_colour', 'Black')
+        self.properties.setdefault('text_scale', 1.0)
+        self.properties.setdefault('text_offset_x', 0.0)
+        self.properties.setdefault('text_offset_y', 0.0)
+        self.properties.setdefault('emissive', False)
+        self.properties.setdefault('emissive_intensity', 1.0)
+        self.properties.setdefault('emissive_radius', 256.0)
+
+    def get_icon_pixmap(self):
+        """The 2D views' marker: the same icon as the Asset Browser's DECAL
+        button (``assets/decal_button.png``)."""
+        return self._pixmap_for_path(self.ICON_PATH)
+
+    @staticmethod
+    def default_texture():
+        """A sensible first image: any that is not blood (gore's own) nor a
+        wet mask, else whatever there is."""
+        try:
+            from engine.decal_textures import images, is_wet_image
+            names = images()[1]
+        except Exception:
+            return ''
+        from engine.decal_text import is_entry
+        files = [n for n in names if not is_entry(n)]      # not a sign's text
+        plain = [n for n in files
+                 if not n.lower().startswith('blood_') and not is_wet_image(n)]
+        return (plain or files or [''])[0]
+
+    def throw_direction(self):
+        """The unit direction the decal is thrown in (into the surface)."""
+        import math
+        yaw = math.radians(float(self.properties.get('yaw', 0.0) or 0.0))
+        pitch = math.radians(float(self.properties.get('pitch', -90.0) or 0.0))
+        return (math.cos(pitch) * math.cos(yaw), math.sin(pitch),
+                -math.cos(pitch) * math.sin(yaw))
+
+
+class Monster(Thing):
+    """Enemy entity with subtypes (human, flying)."""
+    pixmap_path = "assets/sprites/monsters/human/idle.png"   # fallback
+    EDITOR_PRIMARY_PROPERTIES = (
+        'monster_type',
+        'monster_id',
+        'angle',
+        'health',
+        'damage',
+        'awake',
+        'sprite_width',
+        'sprite_height',
+    )
+    _subtype_sprites = {}  # cache keyed by full sprite path (includes dead/alive state)
+    _icon_cache = {}       # 1.2.6.0: cache for 2D view icons (60×60)
+
+    # PERF: get_sprite_path used to run up to 5 os.path.isfile() calls every
+    # time it was called — and it is called per Monster whenever the entity
+    # projection resolves a monster's sprite. This cache memoises the resolved
+    # (idle, dead, shoot) default paths by (monster_type, variant) so the
+    # filesystem only sees the stats once per distinct monster configuration.
+    # Keyed tuple: (mtype, variant)
+    # Stored tuple: (default_idle, default_dead, default_shoot)
+    _default_path_cache = {}
+    # Separate cache for custom-path validity — the Customise dialog can set
+    # arbitrary paths per-monster. Caches the result of the existence check so
+    # subsequent frames don't re-stat the file.
+    # Keyed tuple: (abs_path,) -> bool
+    _custom_path_exists_cache = {}
+    # Cache the project_root lookup once per class; it never changes at runtime.
+    _cached_project_root = None
+
+    def editor_label_lines(self):
+        name = self.properties.get('name')
+        return (name,) if name else ()
+
+    def __init__(self, pos=None, properties=None):
+        super().__init__(pos, properties)
+        self.properties.setdefault('type', 'monster')
+
+        from engine.monster_constants import MONSTER_TYPES, MONSTER_VARIANTS
+        monster_type = self.properties.get('monster_type', 'human')
+        if monster_type not in MONSTER_TYPES:
+            monster_type = 'human'
+        self.properties['monster_type'] = monster_type
+
+        self.properties.setdefault('monster_id', 0)
+        self.properties.setdefault('angle', 0.0)
+        self.properties.setdefault('health', 100)
+        self.properties.setdefault('damage', 10)
+
+        # --- Wake / AI behaviour ---
+        self.properties.setdefault('triggered', False)
+        self.properties.setdefault('wake_on_sight', True)
+        self.properties.setdefault('awake', False)
+
+        # --- Patrol behaviour (requires a PathNode as patrol_target) ---
+        # When patrol=True and patrol_target names a valid PathNode, the
+        # monster will walk toward that node whenever the player is NOT in
+        # sight range. Sight/chase always overrides patrol.
+        self.properties.setdefault('patrol', False)
+        self.properties.setdefault('patrol_target', '')
+        # patrol_mode: how the monster traverses a chain of nodes:
+        #   'loop'      — A→B→C→A→B→C (wraps via first node in chain)
+        #   'ping_pong' — A→B→C→B→A→B→C (reverses at each dead-end)
+        #   'once'      — A→B→C  then holds at the last node
+        self.properties.setdefault('patrol_mode', 'loop')
+
+        # --- Sprite variant (alternate skin) ---
+        # '<None>' = base sprites in assets/sprites/monsters/<type>/
+        # 'variant1' etc = assets/sprites/monsters/<type>/variant1/
+        variant = self.properties.get('variant', '<None>')
+        valid_variants = ('<None>', *MONSTER_VARIANTS.get(monster_type, ()))
+        if variant not in valid_variants:
+            variant = '<None>'
+        self.properties['variant'] = variant
+
+        # --- Set default sprite dimensions based on monster_type ---
+        from engine.monster_constants import MONSTER_SPRITE_SIZES, MONSTER_SPRITE_SIZE_DEFAULT
+        mtype = monster_type
+        default_w, default_h = MONSTER_SPRITE_SIZES.get(mtype, MONSTER_SPRITE_SIZE_DEFAULT)
+        self.properties.setdefault('sprite_width', default_w)
+        self.properties.setdefault('sprite_height', default_h)
+
+    @classmethod
+    def _get_project_root(cls) -> str:
+        """Return the project root path, computed once per process."""
+        if cls._cached_project_root is None:
+            try:
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                cls._cached_project_root = os.path.abspath(
+                    os.path.join(script_dir, os.pardir))
+            except Exception:
+                cls._cached_project_root = os.getcwd()
+        return cls._cached_project_root
+
+    @classmethod
+    def _path_exists_cached(cls, abs_path: str) -> bool:
+        """os.path.isfile wrapper that memoises the result. Call
+        invalidate_sprite_caches() if sprite files change on disk at runtime."""
+        cached = cls._custom_path_exists_cache.get(abs_path)
+        if cached is None:
+            cached = asset_exists(abs_path)
+            cls._custom_path_exists_cache[abs_path] = cached
+        return cached
+
+    @classmethod
+    def _get_default_paths(cls, mtype: str, variant: str):
+        """Return (idle, dead, shoot) default sprite paths for this
+        (monster_type, variant) pair. Filesystem stats happen only on the
+        first call per unique key; results are cached thereafter."""
+        key = (mtype, variant)
+        cached = cls._default_path_cache.get(key)
+        if cached is not None:
+            return cached
+
+        project_root = cls._get_project_root()
+
+        base_idle  = f"assets/sprites/monsters/{mtype}/idle.png"
+        base_dead  = f"assets/sprites/monsters/{mtype}/dead.png"
+        base_shoot = f"assets/sprites/monsters/{mtype}/shoot.png"
+
+        if variant and variant != '<None>':
+            var_idle  = f"assets/sprites/monsters/{mtype}/{variant}/idle.png"
+            var_dead  = f"assets/sprites/monsters/{mtype}/{variant}/dead.png"
+            var_shoot = f"assets/sprites/monsters/{mtype}/{variant}/shoot.png"
+            default_idle  = var_idle  if cls._path_exists_cached(os.path.join(project_root, var_idle))  else base_idle
+            default_dead  = var_dead  if cls._path_exists_cached(os.path.join(project_root, var_dead))  else base_dead
+            default_shoot = var_shoot if cls._path_exists_cached(os.path.join(project_root, var_shoot)) else base_shoot
+        else:
+            default_idle  = base_idle
+            default_dead  = base_dead
+            default_shoot = base_shoot
+
+        # Verify default dead/shoot files exist; fall back to idle if not
+        if not cls._path_exists_cached(os.path.join(project_root, default_dead)):
+            default_dead = default_idle
+        if not cls._path_exists_cached(os.path.join(project_root, default_shoot)):
+            default_shoot = default_idle
+
+        result = (default_idle, default_dead, default_shoot)
+        cls._default_path_cache[key] = result
+        return result
+
+    @staticmethod
+    def _resolve_sprite(custom_path: str, default_path: str, project_root: str) -> str:
+        """
+        Return *custom_path* when the file exists on disk, otherwise return
+        *default_path*.  Falls back silently — the caller guarantees the
+        default path is the safest possible choice.
+
+        Uses the class-level existence cache so repeated calls don't re-stat.
+        """
+        if custom_path:
+            abs_custom = os.path.join(project_root, custom_path)
+            if Monster._path_exists_cached(abs_custom):
+                return custom_path
+            print(f"[Monster] Custom sprite not found, using default: {custom_path}")
+        return default_path
+
+    def get_sprite_path(self) -> str:
+        """
+        Return the sprite path for the current monster type and state.
+        Priority: dead > shooting > idle.
+
+        When a variant is set (anything other than '<None>'), the sprite
+        subfolder changes:
+          base:    assets/sprites/monsters/<type>/<frame>.png
+          variant: assets/sprites/monsters/<type>/<variant>/<frame>.png
+        If the variant file is missing on disk, falls back to the base path.
+
+        Custom sprites set via the Customise dialog are tried first.
+        Any missing custom file is logged once and falls back to the
+        appropriate default sprite for this monster_type automatically.
+
+        PERF: this used to do up to 5 os.path.isfile() calls every time, on a
+        hot path (called per-Monster per-frame). The default path resolution
+        is now memoised in the class-level _default_path_cache keyed by
+        (monster_type, variant), and custom-path existence is memoised in
+        _custom_path_exists_cache.
+        """
+        mtype       = self.properties.get('monster_type', 'human')
+        variant     = self.properties.get('variant', '<None>')
+        is_dead     = self.properties.get('dead', False)
+        is_shooting = self.properties.get('is_shooting', False)
+
+        source = getattr(self, '_asset_source', None)
+        if source is not None:
+            state = 'dead' if is_dead else 'shoot' if is_shooting else 'idle'
+            custom = self.properties.get('custom_' + state, '')
+            base = f'assets/sprites/monsters/{mtype}'
+            candidates = [custom]
+            if variant and variant != '<None>':
+                candidates.append(f'{base}/{variant}/{state}.png')
+            candidates += [f'{base}/{state}.png', f'{base}/idle.png']
+            return next((p for p in candidates if p and source.has_asset(p)), f'{base}/idle.png')
+
+        project_root = Monster._get_project_root()
+        default_idle, default_dead, default_shoot = Monster._get_default_paths(mtype, variant)
+
+        if is_dead:
+            return self._resolve_sprite(
+                self.properties.get('custom_dead', ''), default_dead, project_root)
+        elif is_shooting:
+            return self._resolve_sprite(
+                self.properties.get('custom_shoot', ''), default_shoot, project_root)
+        else:
+            return self._resolve_sprite(
+                self.properties.get('custom_idle', ''), default_idle, project_root)
+
+    def get_instance_pixmap(self):
+        """Return the icon matching this gate's current logic type."""
+        logic_type = str(
+            self.properties.get('logic_type', 'AND')
+        ).strip().lower()
+
+        if logic_type not in ('and', 'or', 'xor', 'nand', 'nor'):
+            logic_type = 'and'
+
+        cache_key = f"LogicGate:{logic_type}"
+
+        if cache_key in self._pixmap_cache:
+            return self._pixmap_cache[cache_key]
+
+        try:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            project_root = os.path.abspath(os.path.join(script_dir, os.pardir))
+            image_path = os.path.join(
+                project_root,
+                "assets",
+                "sprites",
+                f"logic_{logic_type}.png"
+            )
+
+            if asset_exists(image_path):
+                pixmap = load_pixmap(image_path)
+                if not pixmap.isNull():
+                    self._pixmap_cache[cache_key] = pixmap
+                    return pixmap
+        except Exception:
+            pass
+
+        # Fall back to the generic LogicGate icon.
+        return super().get_instance_pixmap()
+
+    def get_icon_pixmap(self):
+        """Return a generic small monster icon for 2D views."""
+        icon_path = "assets/sprites/monster.png"   # 60×60 icon
+        try:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            project_root = os.path.abspath(os.path.join(script_dir, os.pardir))
+            abs_path = os.path.join(project_root, icon_path)
+            if asset_exists(abs_path):
+                pix = load_pixmap(abs_path)
+                if not pix.isNull():
+                    return pix
+        except Exception:
+            pass
+        # Fallback: scale the full sprite down
+        # Use get_instance_pixmap() instead of super().get_icon_pixmap()
+        return self.get_instance_pixmap()
+
+    @classmethod
+    def clear_sprite_cache(cls):
+        """Clear all sprite-related caches."""
+        cls._subtype_sprites.clear()
+        cls._default_path_cache.clear()
+        cls._custom_path_exists_cache.clear()
+        # Invalidate the base class cache for Monster’s default pixmap
+        if cls.__name__ in Thing._pixmap_cache:
+            del Thing._pixmap_cache[cls.__name__]
+
+    @classmethod
+    def invalidate_icon_cache(cls):
+        """Clear the 2D icon cache (called after sprite_2d changes)."""
+        cls._icon_cache.clear()
+
+
+
+class Trigger(Thing):
+    """Non-visible trigger volume (for point-entity triggers)."""
+    EDITOR_PRIMARY_PROPERTIES = (
+        'action',
+    )
+    pixmap_path = None
+    
+    def __init__(self, pos=None, properties=None):
+        super().__init__(pos, properties)
+        self.properties.setdefault('type', 'trigger')
+        self.properties.setdefault('action', 'on_enter')
+
+
+# Prop is a core engine primitive shared with the headless player, so it is
+# defined once in engine/prop_entity.py and exposed here lazily (see the
+# module-level __getattr__ at the end of this file).
+
+
+# =============================================================================
+# LOGIC ENTITIES
+# =============================================================================
+
+class LogicRelay(Thing):
+    """
+    A relay that fires OnTrigger when its Trigger input is called.
+    Can be enabled/disabled. Useful for creating reusable trigger chains.
+    """
+    pixmap_path = "assets/sprites/logic_relay.png"
+    EDITOR_PRIMARY_PROPERTIES = (
+        'disabled',
+        'fire_once',
+    )
+    
+    def __init__(self, pos=None, properties=None):
+        super().__init__(pos, properties)
+        self.properties['type'] = 'logic_relay'
+        self.properties.setdefault('disabled', False)
+        self.properties.setdefault('fire_once', False)
+    
+    def get_instance_pixmap(self):
+        pix = super().get_instance_pixmap()
+        if pix:
+            return pix
+        return LogicGate.get_pixmap()
+
+
+class LogicGate(Thing):
+    """
+    Multi-input logic gate (AND, OR, XOR, NAND, NOR).
+    Fires OnTrigger when gate condition is met.
+    """
+    pixmap_path = "assets/sprites/logic_gate.png"
+    EDITOR_PRIMARY_PROPERTIES = (
+        'logic_type',
+        'initial_state',
+    )
+    
+    def __init__(self, pos=None, properties=None):
+        super().__init__(pos, properties)
+        self.properties['type'] = 'logic_gate'
+        self.properties.setdefault('logic_type', 'AND')
+        self.properties.setdefault('initial_state', 'off')
+
+    def get_instance_pixmap(self):
+        l_type = self.properties.get('logic_type', 'and').lower()
+        expected_path = f"assets/sprites/logic_{l_type}.png"
+        
+        if expected_path in self._pixmap_cache:
+            return self._pixmap_cache[expected_path]
+            
+        try:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            project_root = os.path.abspath(os.path.join(script_dir, os.pardir))
+            abs_path = os.path.join(project_root, expected_path)
+            
+            if asset_exists(abs_path):
+                pix = load_pixmap(abs_path)
+                if not pix.isNull():
+                    self._pixmap_cache[expected_path] = pix
+                    return pix
+        except Exception:
+            pass
+            
+        return super().get_instance_pixmap()
+
+
+class LogicTimer(Thing):
+    """
+    Timer that fires OnTimer at a set interval.
+    Can be enabled/disabled.
+    """
+    pixmap_path = "assets/sprites/logic_timer.png"
+    EDITOR_PRIMARY_PROPERTIES = (
+        'interval',
+        'timer_enabled',
+        'start_on',
+        'one_shot',
+    )
+    
+    def __init__(self, pos=None, properties=None):
+        super().__init__(pos, properties)
+        self.properties['type'] = 'logic_timer'
+        self.properties.setdefault('interval', 1.0)
+        self.properties.setdefault('timer_enabled', False)
+        self.properties.setdefault('start_on', False)
+        # A one-shot timer fires once and switches itself off, so a delayed
+        # one-off event does not need the chain it drives to remember to stop
+        # it.  Defaults off: an existing timer keeps repeating as it always did.
+        self.properties.setdefault('one_shot', False)
+    
+    def get_instance_pixmap(self):
+        pix = super().get_instance_pixmap()
+        if pix:
+            return pix
+        return LogicGate.get_pixmap()
+
+
+class LogicCommand(Thing):
+    """Runs a console command when its RunCommand input fires.
+
+    Lets map logic drive the console via the I/O system: wire a trigger brush's
+    OnTrigger (or any output) to this entity's RunCommand input. The command
+    string comes from the connection's parameter, or falls back to the entity's
+    'command' property when the parameter is blank. Example command: "cam 2".
+    """
+    pixmap_path = "assets/sprites/logic_command.png"
+    EDITOR_PRIMARY_PROPERTIES = (
+        'command',
+        'disabled',
+    )
+
+    def __init__(self, pos=None, properties=None):
+        super().__init__(pos, properties)
+        self.properties['type'] = 'logic_command'
+        self.properties.setdefault('command', '')
+        self.properties.setdefault('disabled', False)
+
+    def get_instance_pixmap(self):
+        pix = super().get_instance_pixmap()
+        if pix:
+            return pix
+        return LogicGate.get_pixmap()
+
+
+class LevelChanger(Thing):
+    """Entity that loads a new level when triggered."""
+    pixmap_path = "assets/sprites/levelchanger.png"
+    EDITOR_PRIMARY_PROPERTIES = (
+        'target_map',
+        'delay',
+        'fade_time',
+        'show_radius',
+        'radius',
+        'usable',
+        'generate_level',
+    )
+
+    def __init__(self, pos=None, properties=None):
+        super().__init__(pos, properties)
+        self.properties['type'] = 'levelchanger'
+        self.properties.setdefault('target_map', 'maps/Simple_Map_Test.json')
+        self.properties.setdefault('delay', 0.0)
+        self.properties.setdefault('fade_time', 0.5)
+        self.properties.setdefault('show_radius', False)
+        self.properties.setdefault('radius', 128.0)
+        self.properties.setdefault('usable', False)
+        # The PlayerStart (by name) to spawn at in the target map; empty for
+        # its primary start.
+        self.properties.setdefault('destination_spawn', '')
+        # Instead of target_map, generate a new random level (with the
+        # procedural generator's ``generator_params``) and go there.
+        self.properties.setdefault('generate_level', False)
+
+        # An explicit window to signal (tests set one). Otherwise it is found
+        # when the level change fires: an entity holding the MainWindow could
+        # not be cloned or copied (deepcopy reached the window), and kept the
+        # window alive from the world.
+        self._main_window = None
+
+    def on_input(self, input_name: str, parameter: str = ""):
+        """Called by I/O system and by ent_fire."""
+        entity_name = self.properties.get('name', 'LevelChanger')
+        map_name = (parameter or self.properties.get('target_map', '')).strip()
+
+        debug_log("IO", f"LevelChanger '{entity_name}' on_input('{input_name}'), map='{map_name}'")
+
+        if input_name == "ChangeLevel":
+            return self.change_level(map_name)
+
+        debug_log("Warning", f"LevelChanger '{entity_name}': unknown input '{input_name}'")
+        return False
+
+    @staticmethod
+    def map_path(target):
+        """The ``maps/...json`` path a target map names, or None if it is outside.
+
+        A bare name gets ``.json`` and the ``maps/`` folder; a target that
+        climbs back out of the folder is refused.  target_map is authored map
+        data (packages included), and the loaded map becomes the editor's save
+        target.
+        """
+        target = (target or '').strip().replace('\\', '/')
+        if not target:
+            return None
+        if not target.lower().endswith('.json'):
+            target += '.json'
+        if not target.startswith('maps/'):
+            target = f"maps/{target}"
+        target = posixpath.normpath(target)
+        return target if target.startswith('maps/') else None
+
+    def destination(self, parameter: str = ""):
+        """``(map path, destination spawn)`` this LevelChanger sends the player to.
+
+        *parameter* (a ChangeLevel input's) names another map instead; the
+        authored ``destination_spawn`` belongs to ``target_map``, so another
+        map is entered at its primary start. The map path is None if it is
+        missing or outside the maps folder.
+        """
+        authored = self.map_path(self.properties.get('target_map', ''))
+        target = self.map_path(parameter) if parameter and parameter.strip() else authored
+        spawn = ''
+        if target is not None and target == authored:
+            spawn = str(self.properties.get('destination_spawn') or '')
+        return target, spawn
+
+    def generates_level(self, parameter: str = ""):
+        """True when this sends the player to a newly generated level.
+
+        A ChangeLevel input that names a map goes to that map instead.
+        """
+        return (bool(self.properties.get('generate_level'))
+                and not (parameter or '').strip())
+
+    def generator_params(self):
+        """The procedural generator settings for the level this generates."""
+        params = self.properties.get('generator_params')
+        return dict(params) if isinstance(params, dict) else {}
+
+    def _find_main_window(self):
+        main_window = getattr(self, '_main_window', None)
+        if main_window:
+            return main_window
+        try:
+            from PyQt5.QtWidgets import QApplication
+            for w in QApplication.topLevelWidgets():
+                if w.__class__.__name__ == 'MainWindow':
+                    return w
+        except Exception as e:
+            debug_log("Error", f"LevelChanger QApplication lookup failed: {e}")
+        return None
+
+    def change_level(self, parameter: str = ""):
+        """Load a new map when triggered."""
+
+        if self.generates_level(parameter):
+            main_window = self._find_main_window()
+            if not main_window or not hasattr(main_window, 'generate_level_signal'):
+                debug_log("Error", "LevelChanger could not find MainWindow!")
+                return False
+            # Queued to the UI thread, as load_level_signal is.
+            main_window.generate_level_signal.emit(self.generator_params())
+            debug_log("IO", f"LevelChanger '{self.properties.get('name', 'LevelChanger')}' "
+                            "requested a generated level")
+            return True
+
+        target_map, destination_spawn = self.destination(parameter)
+        if target_map is None:
+            requested = (parameter or '').strip() or self.properties.get('target_map', '')
+            if not str(requested).strip():
+                debug_log("Error", "LevelChanger has no target_map and no parameter was provided!")
+            else:
+                debug_log("Error", f"LevelChanger target '{requested}' is outside the maps folder")
+            return False
+
+        debug_log("IO", f"LevelChanger target resolved → '{target_map}'"
+                        + (f", spawn '{destination_spawn}'" if destination_spawn else ""))
+
+        main_window = self._find_main_window()
+        if not main_window:
+            debug_log("Error", "LevelChanger could not find MainWindow!")
+            return False
+
+        # Use signal instead of direct call
+        if hasattr(main_window, 'load_level_signal'):
+            try:
+                main_window.load_level_signal.emit(target_map, destination_spawn)
+                debug_log("IO", f"LevelChanger emitted load_level_signal('{target_map}')")
+                return True
+            except Exception as e:
+                debug_log("Error", f"LevelChanger failed to emit signal: {e}")
+                import traceback
+                traceback.print_exc()
+                return False
+        else:
+            debug_log("Error", "MainWindow has no load_level_signal!")
+            return False
+
+
+# =============================================================================
+# AI / NAVIGATION ENTITIES
+# =============================================================================
+
+class PathNode(Thing):
+    """
+    Navigation waypoint for monster AI patrol behaviour and general-purpose
+    path chains (mover waypoints, cinematic cameras, teleport destinations,
+    spawn points).
+
+    Combines the role of Source's `path_corner` (a point monsters navigate to)
+    with `info_node` (a hint that says "this is a valid AI position").
+
+    Properties:
+      - radius (float, world units): monsters try to stay within this distance
+        of the node once they arrive. Shown as a preview circle in 2D views
+        when `show_radius` is toggled on, identical in behaviour to how Light
+        and Speaker expose their influence radius.
+      - show_radius (bool): toggle the preview circle in the 2D viewport.
+      - affects_type (str): which monster types can use this node as a patrol
+        target. One of 'human', 'flying', 'both'. Monsters whose monster_type
+        does not match are rejected at pathfinding time (and the rejection is
+        logged to the debug console under the 'Pathfinding' category).
+      - next_node (str): name of the next PathNode in the patrol chain.
+        Leave empty for a dead-end node (the monster will hold position
+        or reverse direction depending on the monster's patrol_mode).
+      - wait_time (float, seconds): how long a monster pauses at this node
+        before moving to next_node. 0 = no wait (pass through immediately).
+      - speed (float, multiplier): speed factor applied while an entity is
+        heading toward this node. 1.0 = normal speed, 0.5 = half speed,
+        2.0 = double, etc.
+
+    PathNodes are invisible at runtime — they are editor-only aids that the
+    monster AI consults during _update_monsters in the logic thread.
+    """
+    # No billboard sprite — PathNodes render as small orange cubes in 3D
+    # and as filled orange squares in 2D viewports.
+    pixmap_path = None
+
+    AFFECTS_TYPES = ('human', 'flying', 'both')
+
+    def __init__(self, pos=None, properties=None):
+        super().__init__(pos, properties)
+        self.properties['type'] = 'path_node'
+        self.properties.setdefault('radius', 256.0)
+        self.properties.setdefault('show_radius', False)
+        self.properties.setdefault('affects_type', 'both')
+        self.properties.setdefault('next_node', '')
+        self.properties.setdefault('wait_time', 0.0)
+        self.properties.setdefault('speed', 1.0)
+
+    def get_radius(self) -> float:
+        """Radius in world units — read by the 2D preview and the monster AI."""
+        try:
+            return float(self.properties.get('radius', 256.0))
+        except (TypeError, ValueError):
+            return 256.0
+
+    def get_affects_type(self) -> str:
+        """Normalised affects_type string. Invalid values fall back to 'both'."""
+        val = str(self.properties.get('affects_type', 'both')).lower().strip()
+        if val not in PathNode.AFFECTS_TYPES:
+            return 'both'
+        return val
+
+    def get_wait_time(self) -> float:
+        """Wait time in seconds at this node."""
+        try:
+            return max(0.0, float(self.properties.get('wait_time', 0.0)))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def get_speed(self) -> float:
+        """Speed multiplier for entities approaching this node."""
+        try:
+            return max(0.01, float(self.properties.get('speed', 1.0)))
+        except (TypeError, ValueError):
+            return 1.0
+
+
+    def get_next_node_name(self) -> str:
+        """Return the name of the next node in the chain, or ''."""
+        return str(self.properties.get('next_node', '') or '').strip()
+
+    def accepts_monster_type(self, monster_type: str) -> bool:
+        """Return True if a monster of *monster_type* may patrol to this node."""
+        affects = self.get_affects_type()
+        if affects == 'both':
+            return True
+        return affects == (monster_type or '').lower()
+
+
+# =============================================================================
+# CINEMATIC / SPAWNING ENTITIES
+# =============================================================================
+
+class LogicCamera(Thing):
+    """
+    Cinematic camera that lerps along a PathNode chain when triggered.
+    Player input is suppressed for the duration of the sequence.
+    """
+    pixmap_path = "assets/sprites/logic_camera.png"
+
+    def __init__(self, pos=None, properties=None):
+        super().__init__(pos, properties)
+        self.properties['type'] = 'logic_camera'
+        # Optional authored cutscene JSON. When set, this takes precedence over PathNode playback.
+        self.properties.setdefault('cutscene_file', '')
+        # Name of the first PathNode in the chain (legacy camera mode)
+        self.properties.setdefault('path_target', '')
+        # World-units per second along the chain
+        self.properties.setdefault('speed', 200.0)
+        # If set, overrides the player's FOV during the sequence
+        self.properties.setdefault('fov_override', 0.0)
+        # If True the camera looks at the *next* node; if False it
+        # follows the path's forward direction.
+        self.properties.setdefault('look_ahead', True)
+        # Seconds to keep an explicit LookAt focus before returning to the path.
+        # 0 means hold the target indefinitely.
+        self.properties.setdefault('lookat_return_time', 5.0)
+
+
+class LogicSpawner(Thing):
+    """
+    Instantiates a new entity at a PathNode's coordinates when triggered.
+    """
+    pixmap_path = "assets/sprites/logic_spawner.png"
+
+    def __init__(self, pos=None, properties=None):
+        super().__init__(pos, properties)
+        self.properties['type'] = 'logic_spawner'
+        # Entity class name to spawn (key into ENTITY_TYPES)
+        self.properties.setdefault('spawn_type', 'Monster')
+        # PathNode whose position is used as the spawn point
+        self.properties.setdefault('target_node', '')
+        # Max entities this spawner will ever create (0 = unlimited)
+        self.properties.setdefault('max_spawn', 0)
+        # Extra properties merged into the spawned entity
+        self.properties.setdefault('spawn_properties', {})
+        # Entities made by one Spawn, and how far around the spawn point
+        # they are scattered (0: all on it)
+        self.properties.setdefault('spawn_count', 1)
+        self.properties.setdefault('spawn_radius', 0.0)
+
+
+# =============================================================================
+# SHAKE ENTITY
+# =============================================================================
+
+class Shake(Thing):
+    """Shakes the screen when triggered (its Shake input, from any I/O -- a
+    trigger brush's OnTrigger, a button, a timer). Purely visual: the camera
+    view wobbles, dying away over ``duration`` seconds; the player, physics
+    and the world are untouched (engine.shake).
+
+    Properties: ``intensity`` 0..1 (how hard), ``duration`` seconds.
+    """
+    pixmap_path = "assets/sprites/shake.png"
+
+    def __init__(self, pos=None, properties=None):
+        super().__init__(pos, properties)
+        from engine.shake import SHAKE_DEFAULTS
+        self.properties['type'] = 'shake'
+        for key, value in SHAKE_DEFAULTS.items():
+            self.properties.setdefault(key, value)
+
+
+# =============================================================================
+# PORTAL ENTITY
+# =============================================================================
+
+class Portal(Thing):
+    """
+    A rectangular world portal for non-Euclidean environmental design,
+    inspired by Prey (2006).
+
+    Two Portal entities are linked by name via the portal_target property.
+    When the player looks through Portal A they see the world rendered from
+    the perspective of Portal B (using stencil-buffer masking in the
+    renderer).  Walking through A teleports the player to B with position,
+    velocity, and view-angle all correctly transformed by the rotational
+    delta between the two portal normals.
+
+    Properties
+    ----------
+    portal_target  (str)   Name of the paired Portal entity.
+    width          (float) Aperture width in world units.  Default 128.
+    height         (float) Aperture height in world units.  Default 256.
+    rotation       (list)  [yaw_degrees, pitch_degrees, roll_degrees].
+                           All three orient the aperture: pitch tilts it off
+                           vertical (pitch = ±90 gives a floor/ceiling portal)
+                           and roll spins it about its facing axis.  The view
+                           through the portal and the teleport both honour the
+                           full orientation.
+    active         (bool)  When False the portal acts as a solid wall.
+                           Toggle at runtime via Enable/Disable/Toggle inputs.
+                           Linked portals (either targets the other, and
+                           chained links) share one active state: setting it
+                           on one sets it on all (editor.portal_links).
+    color          (list)  [r, g, b] 0-255 rim/glow tint.  Default white.
+    show_rim       (bool)  Draw outline.
+    glasses        (bool)  Looking into this portal shows your own glasses
+                           reflected back at you, like a mirror.  Default on.
+    fade_distance  (float) How far away the view through the portal is
+                           drawn. It fades out over the last quarter of this
+                           distance, showing what is behind the portal, and
+                           is not rendered at all beyond it.  Default 2048.
+
+    I/O outputs
+    -----------
+    OnPlayerEnter  Fired once per transit when the player passes through.
+    OnEnabled      Fired when the portal is sent Enable.
+    OnDisabled     Fired when the portal is sent Disable.
+    OnToggled      Fired when the portal is sent Toggle.
+
+    I/O inputs
+    ----------
+    Enable         Sets active = True on this portal and its linked
+                   portals, and fires OnEnabled on this one.
+    Disable        Sets active = False on the same group; fires OnDisabled.
+    Toggle         Flips the group's active state; fires OnToggled.
+
+    Non-Euclidean design tips
+    -------------------------
+    * Infinite corridor  — face both portals toward each other in a short
+      hallway.
+    * Floor/ceiling drop — pitch a portal to ±90° so it lies flat; the player
+      falls in and is flung out of the paired portal along its normal.  (Gravity
+      itself stays world-down — the transit reorients position, velocity and
+      view, not the world's up-axis.)
+    * Loop room          — four portals forming a closed square so exiting any
+      wall re-enters the opposite one.
+    * Size distortion    — make the apertures different sizes; the scene
+      appears scaled when viewed through the smaller end.
+    """
+
+    #: Portals have no editor sprite: the aperture wireframe is how the
+    #: editor shows them.
+    pixmap_path = None
+    EDITOR_PRIMARY_PROPERTIES = (
+    'portal_target',
+    'width',
+    'height',
+    'angle',
+    'active',
+    'portal_direction',
+    'color',
+    'show_rim',
+    'glasses',
+    'fade_distance',
+    )
+
+    DEFAULT_WIDTH  = 128.0
+    DEFAULT_FADE_DISTANCE = 2048.0
+    DEFAULT_HEIGHT = 256.0
+
+    # Transit cooldown prevents rapid back-and-forth oscillation (seconds).
+    TRANSIT_COOLDOWN = 0.5
+
+    # Duration of a full fade-in or fade-out transition (seconds).
+    #: Rendered opacity, advanced per tick; journalled so the render
+    #: projection re-reads it only while it is actually changing.
+    _fade_alpha = TrackedAttribute(1.0)
+
+    FADE_DURATION = 1.0
+
+    # Minimum projectile exit clearance along the destination normal. Player
+    # transit uses a near-zero plane epsilon so crossing remains visually continuous.
+    EXIT_CLEARANCE = 8.0
+
+    def __init__(self, pos=None, properties=None):
+        super().__init__(pos, properties)
+        self.properties['type'] = 'portal'
+
+        # Link to the other portal half
+        self.properties.setdefault('portal_target', '')
+
+        # Aperture geometry
+        self.properties.setdefault('width',  self.DEFAULT_WIDTH)
+        self.properties.setdefault('height', self.DEFAULT_HEIGHT)
+
+        # How far away its view is drawn (faded out over the last quarter).
+        self.properties.setdefault('fade_distance', self.DEFAULT_FADE_DISTANCE)
+
+        # Orientation — [yaw_degrees, pitch_degrees, roll_degrees]
+        self.properties.setdefault('rotation', [0.0, 0.0, 0.0])
+        self.properties.setdefault('angle', 0.0)
+
+        # Runtime state
+        self.properties.setdefault('active', True)
+
+        # Portal directionality: controls which way the portal renders
+        # "forward"  = This portal sees out of its target (one-way)
+        # "reverse"  = Target portal sees out of this one (one-way)
+        # "both"     = Both directions render (default)
+        self.properties.setdefault('portal_direction', 'both')
+
+        # Visual rim
+        self.properties.setdefault('color',    [255, 255, 255])
+        self.properties.setdefault('show_rim', True)
+
+        # Reflect the viewer's own glasses when they look into this portal.
+        self.properties.setdefault('glasses', True)
+
+        # Parenting: attach this portal to a mover brush by name.
+        # When parent_mover is non-empty the logic thread moves this
+        # portal to (mover.pos + parent_offset) every tick during play.
+        self.properties.setdefault('parent_mover', '')
+        self.properties.setdefault('parent_offset', [0.0, 0.0, 0.0])
+
+        # FIX: New properties for local position and yaw offset (supports rotation)
+        self.properties.setdefault('parent_local_pos', None)   # None = use parent_offset (legacy)
+        self.properties.setdefault('parent_local_yaw', 0.0)
+
+        # Internal transit cooldown (not saved to map file)
+        self._transit_cooldown = 0.0
+        # Last signed distance of player from this portal's plane (for edge detection)
+        self._last_player_side = None
+
+        # Fade state (runtime only, never serialised to map JSON).
+        # _fade_alpha: current rendered opacity 0.0 (invisible) → 1.0 (fully visible)
+        # _fade_target: opacity we are animating toward
+        _start_active = self.is_active()
+        self._fade_alpha: float = 1.0 if _start_active else 0.0
+        self._fade_target: float = self._fade_alpha
+
+    # ── Geometry helpers ──────────────────────────────────────────────────────
+
+    def get_width(self) -> float:
+        try:
+            return max(16.0, float(self.properties.get('width', self.DEFAULT_WIDTH)))
+        except (TypeError, ValueError):
+            return self.DEFAULT_WIDTH
+
+    def get_height(self) -> float:
+        try:
+            return max(16.0, float(self.properties.get('height', self.DEFAULT_HEIGHT)))
+        except (TypeError, ValueError):
+            return self.DEFAULT_HEIGHT
+
+    def _rotation_component(self, index: int) -> float:
+        rot = self.properties.get('rotation', [0.0, 0.0, 0.0])
+        try:
+            return float(rot[index])
+        except (TypeError, ValueError, IndexError):
+            return 0.0
+
+    def get_yaw_radians(self) -> float:
+        """Return the portal's yaw (facing direction) in radians."""
+        return math.radians(self._rotation_component(0))
+
+    def get_yaw_degrees(self) -> float:
+        """Return the portal's yaw (facing direction) in degrees."""
+        return self._rotation_component(0)
+
+    def get_pitch_radians(self) -> float:
+        """Pitch in radians. Non-zero pitch tilts the aperture off vertical
+        (e.g. a floor/ceiling portal uses pitch = ±90)."""
+        return math.radians(self._rotation_component(1))
+
+    def get_pitch_degrees(self) -> float:
+        return self._rotation_component(1)
+
+    def get_roll_radians(self) -> float:
+        """Roll in radians (spin about the portal's facing axis)."""
+        return math.radians(self._rotation_component(2))
+
+    def get_roll_degrees(self) -> float:
+        return self._rotation_component(2)
+
+    def set_yaw_degrees(self, yaw: float) -> None:
+        self.properties['rotation'][0] = yaw
+        self.properties['angle'] = yaw
+        touch(self)
+
+
+    def get_basis(self):
+        """Return the portal frame from the shared engine-level transform."""
+        return _portal_basis_from_rotation(
+            self.properties.get(
+                'rotation',
+                [self.properties.get('angle', 0.0), 0.0, 0.0],
+            )
+        )
+
+    def set_parent_local_transform(self, mover_pos, mover_yaw) -> None:
+        """Compute and store local position and yaw offset from the mover's current transform."""
+        self.properties['parent_local_pos'] = [
+            self.pos[0] - mover_pos[0],
+            self.pos[1] - mover_pos[1],
+            self.pos[2] - mover_pos[2]
+        ]
+        self.properties['parent_local_yaw'] = self.get_yaw_degrees() - mover_yaw
+
+    def get_normal(self):
+        """
+        Return the outward-facing unit normal of this portal as a 3-tuple
+        (x, y, z).  The normal points toward the viewer side of the portal
+        (the face the player approaches from).  Supports full yaw/pitch/roll
+        orientation, so floor/ceiling and tilted portals report a normal that
+        actually points up/down.
+        """
+        return self.get_basis()[2]
+
+
+    def get_corners_world(self):
+        """Return the shared engine-level aperture corners."""
+        return _portal_corners(
+            self.pos, self.get_basis(), self.get_width(), self.get_height()
+        )
+
+    def map_point(self, dest, x: float, y: float, z: float):
+        """Map a world point through the shared engine transform."""
+        return _portal_map_point(
+            self.pos, self.get_basis(), dest.pos, dest.get_basis(), (x, y, z)
+        )
+
+
+    def map_direction(self, dest, x: float, y: float, z: float):
+        """Map a world direction through the shared engine transform."""
+        return _portal_map_direction(
+            self.get_basis(), dest.get_basis(), (x, y, z)
+        )
+
+
+    def contains_point(self, x: float, y: float, z: float, margin: float = 0.0) -> bool:
+        """Return whether a point lies inside the shared aperture shape."""
+        return _portal_contains_point(
+            self.pos, self.get_basis(), self.get_width(), self.get_height(),
+            (x, y, z), margin,
+        )
+
+    def tick_fade(self, delta: float) -> None:
+        """Advance _fade_alpha toward _fade_target.  Called every logic tick."""
+        if self._fade_alpha == self._fade_target:
+            return
+        step = delta / max(self.FADE_DURATION, 0.001)
+        if self._fade_target > self._fade_alpha:
+            self._fade_alpha = min(self._fade_target, self._fade_alpha + step)
+        else:
+            self._fade_alpha = max(self._fade_target, self._fade_alpha - step)
+
+    def is_active(self) -> bool:
+        v = self.properties.get('active', True)
+        if isinstance(v, bool):
+            return v
+        return str(v).lower() not in ('false', '0', 'no')
+
+    def get_parent_local_pos(self) -> list:
+        """Return local position relative to the parent mover's origin.
+        Uses parent_local_pos when set; falls back to legacy parent_offset.
+        """
+        local = self.properties.get('parent_local_pos')
+        if local is not None:
+            return local[:3]
+        return self.properties.get('parent_offset', [0.0, 0.0, 0.0])
+
+    def get_parent_local_yaw(self) -> float:
+        return float(self.properties.get('parent_local_yaw', 0.0))
+
+    # ── I/O interface ─────────────────────────────────────────────────────────
+    # Enable / Disable / Toggle are handled by the registered portal input
+    # handlers (see editor/io_handlers.py: portal_enable / portal_disable /
+    # portal_toggle), which fire the declared OnEnabled / OnDisabled / OnToggled
+    # outputs and drive the fade via _fade_target. No on_input() override is
+    # defined here so the runtime IOManager and the console 'ent_fire' path stay
+    # consistent (both dispatch through those handlers).
+
+
+
+# =============================================================================
+# PERSISTENT STATE ENTITY
+# =============================================================================
+
+class LogicState(Thing):
+    """Fio's persistent state primitive: named values that survive the level.
+
+    A ``LogicState`` holds keyed values under a *store name*, answers questions
+    about them, and turns every change into an ordinary I/O event.  That is the
+    whole of it.  It does not know what a door is, it never runs, and nothing
+    about it is evaluated per frame — state is looked at because a connection
+    asked it to be.
+
+    Behaviour is composed around it rather than built into it::
+
+        Monster.OnDeath -> LogicState.Increment("killed")
+                        -> OnValueChanged
+                        -> LogicState.Compare("killed>=5")
+                        -> OnTrue -> Door.Open
+
+    Nothing in that chain knows about the rest of it, and the engine has no idea
+    what the five kills *mean*.  The map supplies the composition; the game
+    supplies the meaning.
+
+    Values are typed
+    ----------------
+    ``string``, ``int``, ``float``, ``bool``, ``null`` and ``uuid`` (see
+    :mod:`editor.state_values`).  I/O parameters are text, so a value's type is
+    inferred from what is written — ``5`` is an integer, ``true`` a boolean —
+    and can be stated outright when inference is not wanted::
+
+        SetValue    door_code:string=007
+
+    Legacy stores held only strings and are left exactly as they were: nothing
+    re-types data on load, because comparison and arithmetic already understand
+    ``"5"``.  An old map behaves the same or better, never worse.
+
+    Persistence
+    -----------
+    Values live in a process-wide registry keyed by ``store_name``, so two
+    stores sharing a name in different levels are the same store, and a level
+    transition carries their contents across.  Plugins reach the same registry
+    through ``api.global_store``.  It is one registry, and this class does not
+    own it — it reads and writes it like anything else does.
+
+    Properties
+    ----------
+    store_name
+        Which store this entity is a view of.  Defaults to the entity name.
+    initial_data
+        Designer-authored defaults, used when the store does not exist yet.
+    capacity
+        How many keys this store accepts.  Defaults to :data:`MAX_PAIRS`, so a
+        map that never sets it behaves exactly as before.
+
+    Inputs and outputs are declared in :mod:`editor.io_system` and implemented
+    in :mod:`editor.io_handlers`; see ``editor/LOGIC.md`` for the whole model.
+    """
+    pixmap_path = "assets/sprites/logic_state.png"
+
+    #: Type token written to map files.
+    map_type = 'logicstate'
+
+    # Class-level registry of persistent stores across level transitions.
+    # Keyed by store_name, stores the dict of values. Survives as long as
+    # the Python process lives (i.e., across level loads within one session).
+    _persistent_registry = {}
+
+    #: Default capacity.  A per-entity ``capacity`` property may raise it; the
+    #: default is unchanged so existing maps hit ``OnStoreFull`` where they
+    #: always did.
+    MAX_PAIRS = 25
+
+    #: Prefix for object-local keys (see :meth:`object_key`).  Chosen because a
+    #: designer-authored key never starts with it, so object-local state and
+    #: world state share one store without either being able to shadow the
+    #: other.
+    OBJECT_KEY_PREFIX = '@'
+
+    def __init__(self, pos=None, properties=None):
+        super().__init__(pos, properties)
+        self.properties['type'] = 'logic_state'
+        self.properties.setdefault('store_name', self.properties.get('name', ''))
+
+        # initial_data holds the designer-specified defaults.
+        # Stored as a dict; serialised to/from JSON as needed.
+        self.properties.setdefault('initial_data', {})
+
+        # Runtime data — merged from persistent registry + initial_data
+        self._runtime_data = {}
+        self._sync_from_persistent()
+
+    # ------------------------------------------------------------------
+    # Persistence plumbing
+    # ------------------------------------------------------------------
+
+    @property
+    def capacity(self):
+        """How many keys this store accepts, never below one."""
+        try:
+            return max(1, int(self.properties.get('capacity', self.MAX_PAIRS)))
+        except (TypeError, ValueError):
+            return self.MAX_PAIRS
+
+    @property
+    def store_name(self):
+        """The name of the store this entity is a view of."""
+        return str(self.properties.get('store_name', '') or '')
+
+    def _sync_from_persistent(self):
+        """Load values from the persistent registry, falling back to initial_data."""
+        store_name = self.store_name
+        if store_name and store_name in LogicState._persistent_registry:
+            self._runtime_data = _sv.load_store(
+                LogicState._persistent_registry[store_name])
+        else:
+            # Copy initial_data so we don't mutate the property directly.
+            self._runtime_data = _sv.load_store(
+                self.properties.get('initial_data', {}))
+
+    def _sync_to_persistent(self):
+        """Write current runtime values back to the persistent registry."""
+        store_name = self.store_name
+        if store_name:
+            LogicState._persistent_registry[store_name] = dict(self._runtime_data)
+
+    @classmethod
+    def reset_stores(cls, things=()):
+        """Forget every store, and put the stores in *things* back to their
+        authored ``initial_data``.
+
+        The registry carries values from level to level while a game runs.
+        That is a play session's memory, so whoever starts or ends a session
+        calls this: without it a playtest's values were still there on the
+        next Play, were written into the map by the next save, and replaced
+        the ``initial_data`` of any map opened later that used the same store
+        name. The registry is cleared in place: plugins hold a reference to it.
+        """
+        cls._persistent_registry.clear()
+        for thing in things:
+            if isinstance(thing, cls):
+                thing._sync_from_persistent()
+                thing._sync_to_persistent()
+
+    # ------------------------------------------------------------------
+    # Reading
+    # ------------------------------------------------------------------
+
+    #: Sentinel returned for a key that is not there.  A plain string, and the
+    #: same one the pre-2.4 store used, so a map that wired a connection
+    #: against it still matches.
+    MISSING = "<missing>"
+
+    def get_value(self, key, default=MISSING):
+        """The value stored under *key*, or *default*.
+
+        Returns the value with its type intact — an ``int`` key comes back an
+        ``int``.  Callers that need the wire form use
+        :func:`editor.state_values.format_value`.
+        """
+        return self._runtime_data.get(str(key).strip(), default)
+
+    def has_key(self, key) -> bool:
+        """Whether *key* is present, regardless of its value.
+
+        A key holding ``null`` exists; that is the difference between a flag
+        that was cleared and one that was never set.
+        """
+        return str(key).strip() in self._runtime_data
+
+    def value_type(self, key) -> str:
+        """The state type of *key*'s value, or ``'null'`` when it is absent."""
+        if not self.has_key(key):
+            return 'null'
+        return _sv.type_of(self.get_value(key, None))
+
+    def get_all_pairs(self):
+        """A copy of every key/value pair."""
+        return dict(self._runtime_data)
+
+    def get_pair_count(self):
+        """How many pairs are stored."""
+        return len(self._runtime_data)
+
+    # ------------------------------------------------------------------
+    # Writing
+    # ------------------------------------------------------------------
+
+    def apply_value(self, key, value, value_type=None):
+        """Store *value* under *key*; the full result of one write.
+
+        Returns ``(ok, changed, stored)``:
+
+        ``ok``
+            False when the write could not happen — a blank key, a full store,
+            or text that does not denote a value of the requested type.
+        ``changed``
+            Whether the stored value is different from what was there.  This is
+            the distinction the event model is built on: ``OnValueSet`` fires
+            for every accepted write, ``OnValueChanged`` only when the world
+            actually changed, so a chain can be driven by real transitions
+            without needing a watcher to notice them.
+        ``stored``
+            The typed value now in the store.
+
+        A string *value* is typed by :func:`editor.state_values.parse` unless
+        *value_type* names the type outright.
+        """
+        key = str(key).strip()
+        if not key:
+            return False, False, None
+
+        if value_type:
+            typed, ok = _sv.coerce(value, value_type)
+            if not ok:
+                return False, False, None
+        else:
+            typed = _sv.parse(value)
+
+        existed = key in self._runtime_data
+        if not existed and len(self._runtime_data) >= self.capacity:
+            return False, False, None
+
+        previous = self._runtime_data.get(key, self.MISSING)
+        changed = (not existed) or not _same_value(previous, typed)
+        self._runtime_data[key] = typed
+        if changed:
+            self._sync_to_persistent()
+        return True, changed, typed
+
+    def set_value(self, key, value, value_type=None) -> bool:
+        """Store *value* under *key*.  True unless the write was refused.
+
+        The pre-2.4 signature, kept because plugins and the I/O manager call it.
+        Use :meth:`apply_value` when the caller cares whether anything changed.
+        """
+        ok, _changed, _stored = self.apply_value(key, value, value_type)
+        return ok
+
+    def clear_key(self, key) -> bool:
+        """Remove *key*.  True if it was there."""
+        key = str(key).strip()
+        if key in self._runtime_data:
+            del self._runtime_data[key]
+            self._sync_to_persistent()
+            return True
+        return False
+
+    def clear_all(self):
+        """Remove every key."""
+        self._runtime_data.clear()
+        self._sync_to_persistent()
+
+    def copy_from(self, other_store_name) -> bool:
+        """Copy every pair from another store by name.  True if it existed."""
+        other = LogicState._persistent_registry.get(str(other_store_name))
+        if other is None:
+            return False
+        capacity = self.capacity
+        for k, v in _sv.load_store(other).items():
+            if len(self._runtime_data) >= capacity and k not in self._runtime_data:
+                break
+            self._runtime_data[k] = v
+        self._sync_to_persistent()
+        return True
+
+    def copy_value(self, source_key, dest_key, source_store=None):
+        """Copy one value between keys, optionally from another store.
+
+        Returns ``(ok, changed, stored)`` like :meth:`apply_value`; ``ok`` is
+        False when the source key does not exist, so a copy of nothing is a
+        no-op rather than a write of ``"<missing>"``.
+        """
+        source_key = str(source_key).strip()
+        if source_store:
+            data = LogicState._persistent_registry.get(str(source_store))
+            if data is None or source_key not in data:
+                return False, False, None
+            value = _sv.load_store(data)[source_key]
+        else:
+            if not self.has_key(source_key):
+                return False, False, None
+            value = self.get_value(source_key, None)
+        return self.apply_value(dest_key, value)
+
+    # ------------------------------------------------------------------
+    # Arithmetic
+    # ------------------------------------------------------------------
+
+    def arithmetic(self, key, operation, operand):
+        """Apply one arithmetic operation to *key* in place.
+
+        Returns ``(ok, changed, stored)``.  A key that is absent (or holds
+        something non-numeric) counts as zero, so ``Increment`` on a fresh
+        counter yields one without the map having to seed it first.
+        """
+        key = str(key).strip()
+        if not key:
+            return False, False, None
+        current = self.get_value(key, 0)
+        if current is self.MISSING:
+            current = 0
+        new_value, ok = _sv.arithmetic(current, operation, operand)
+        if not ok:
+            return False, False, current
+        return self.apply_value(key, new_value)
+
+    def clamp(self, key, low, high):
+        """Confine *key* to ``[low, high]``.  ``(ok, changed, stored)``."""
+        key = str(key).strip()
+        if not key:
+            return False, False, None
+        current = self.get_value(key, 0)
+        if current is self.MISSING:
+            current = 0
+        return self.apply_value(key, _sv.clamp(current, low, high))
+
+    def toggle(self, key):
+        """Invert *key* as a boolean.  ``(ok, changed, stored)``.
+
+        A key that was never set toggles to ``True``, which is the only useful
+        reading of "turn this flag the other way" for a flag that is not there.
+        """
+        key = str(key).strip()
+        if not key:
+            return False, False, None
+        current = self.get_value(key, None)
+        if current is self.MISSING:
+            current = None
+        return self.apply_value(key, _sv.toggled(current))
+
+    def increment(self, key, amount=1):
+        """Add *amount* to *key*, returning the new value.
+
+        The pre-2.4 signature and return type, kept for callers that only want
+        the number.
+        """
+        _ok, _changed, value = self.arithmetic(key, 'add', amount)
+        return value if value is not None else 0
+
+    def decrement(self, key, amount=1):
+        """Subtract *amount* from *key*, returning the new value."""
+        return self.increment(key, -_sv.to_number(amount, 1))
+
+    # ------------------------------------------------------------------
+    # Queries
+    # ------------------------------------------------------------------
+
+    def compare(self, key, operator, expected):
+        """Answer one question about *key*.  ``(found, result)``.
+
+        *expected* is typed the same way a stored value is, so ``"5"`` from a
+        connection parameter compares numerically against a stored ``5`` and
+        ``"true"`` compares as a boolean against a stored flag.  When the key is
+        missing, *found* is False and the caller fires ``OnKeyNotFound`` instead
+        of guessing what the comparison would have meant.
+
+        This is the whole of Fio's conditional logic.  Everything more
+        complicated — two conditions, a negation, a sequence — is a
+        :class:`LogicGate`, a :class:`LogicRelay` and more connections, which is
+        cheaper than an expression language and visible in the I/O editor.
+        """
+        key = str(key).strip()
+        if key not in self._runtime_data:
+            return False, False
+        actual = self._runtime_data[key]
+        return True, _sv.compare(actual, _sv.parse(expected), operator)
+
+    # ------------------------------------------------------------------
+    # Object-local state
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def object_key(cls, entity_id, key) -> str:
+        """The store key holding *key* for the object with UUID *entity_id*.
+
+        Object-local state is not a second database and not a second entity
+        framework: it is ordinary keys in this same store, namespaced by the
+        object's UUID.  So it persists, saves, transitions levels and shows up
+        in the Property Manager exactly like every other value, and a dormant
+        entity's state is simply data that outlives the entity's dormancy.
+        """
+        return '%s%s/%s' % (cls.OBJECT_KEY_PREFIX, entity_id, str(key).strip())
+
+    def set_object_value(self, entity_id, key, value, value_type=None):
+        """Store a value against one object's UUID.  ``(ok, changed, stored)``."""
+        if not entity_id:
+            return False, False, None
+        return self.apply_value(self.object_key(entity_id, key), value, value_type)
+
+    def get_object_value(self, entity_id, key, default=MISSING):
+        """Read a value stored against one object's UUID."""
+        if not entity_id:
+            return default
+        return self.get_value(self.object_key(entity_id, key), default)
+
+    def clear_object_state(self, entity_id) -> int:
+        """Forget every value held against one object.  Returns how many."""
+        if not entity_id:
+            return 0
+        prefix = '%s%s/' % (self.OBJECT_KEY_PREFIX, entity_id)
+        doomed = [k for k in self._runtime_data if k.startswith(prefix)]
+        for key in doomed:
+            del self._runtime_data[key]
+        if doomed:
+            self._sync_to_persistent()
+        return len(doomed)
+
+    # ------------------------------------------------------------------
+    # Serialisation
+    # ------------------------------------------------------------------
+
+    def to_dict(self):
+        """Serialise, embedding the live values so a save is self-contained."""
+        # Ensure persistent registry is up to date before serialising
+        self._sync_to_persistent()
+        result = super().to_dict()
+        result['runtime_data'] = _sv.save_store(self._runtime_data)
+        return result
+
+    @staticmethod
+    def from_dict(data):
+        """Deserialise, restoring the embedded values into the registry."""
+        thing = Thing.from_dict(data)
+        if thing is not None and isinstance(thing, LogicState):
+            runtime = data.get('runtime_data')
+            if isinstance(runtime, dict):
+                thing._runtime_data = _sv.load_store(runtime)
+                thing._sync_to_persistent()
+            else:
+                thing._sync_from_persistent()
+        return thing
+
+
+def _same_value(a, b) -> bool:
+    """Whether two stored values are the same value *and* the same type.
+
+    ``1`` and ``True`` compare equal in Python and are not the same state, so
+    change detection has to ask about the type as well — otherwise setting a
+    counter to ``1`` over a flag of ``True`` would report "unchanged" and the
+    chain hanging off ``OnValueChanged`` would never run.
+    """
+    if a is None or b is None:
+        return a is None and b is None
+    if isinstance(a, bool) != isinstance(b, bool):
+        return False
+    return type(a) is type(b) and a == b
+
+
+
+# =============================================================================
+# ENTITY REGISTRY
+# =============================================================================
+
+# All placeable entity types for the editor
+ENTITY_TYPES = {
+    'PlayerStart': PlayerStart,
+    'Light': Light,
+    'LightVolume': LightVolume,
+    'Speaker': Speaker,
+    'ReflectionProbe': ReflectionProbe,
+    'Decal': Decal,
+    'Monster': Monster,
+    'LogicRelay': LogicRelay,
+    'LogicGate': LogicGate,
+    'LogicTimer': LogicTimer,
+    'LogicCommand': LogicCommand,
+    'LevelChanger': LevelChanger,
+    'PathNode': PathNode,
+    'LogicCamera': LogicCamera,
+    'LogicSpawner': LogicSpawner,
+    'Shake': Shake,
+    'Portal': Portal,
+    'LogicState': LogicState,
+}
+
+# Effect is a core primitive defined in engine/ (the head-less player needs it)
+# and it imports this module, so it can only be fetched now that Thing exists.
+# When the process imported engine.effect_entity *first*, this module is being
+# run by that import and the class does not exist yet; effect_entity then
+# registers itself as soon as it is defined (see the end of that module).
+_effect_class = getattr(importlib.import_module('engine.effect_entity'), 'Effect', None)
+if _effect_class is not None:
+    ENTITY_TYPES['Effect'] = _effect_class
+
+# Categories for editor UI
+ENTITY_CATEGORIES = {
+    'Gameplay': ['PlayerStart', 'Monster', 'Prop', 'LevelChanger'],
+    'Environment': ['Light', 'LightVolume', 'Effect', 'Speaker', 'ReflectionProbe', 'Portal', 'Decal', 'Shake'],
+    'Logic': ['LogicRelay', 'LogicGate', 'LogicTimer', 'LogicCommand', 'LogicCamera', 'LogicSpawner', 'LogicState'],
+    'AI': ['PathNode'],
+}
+
+
+# =============================================================================
+# CORE ENTITIES DEFINED OUTSIDE THIS MODULE
+# =============================================================================
+#
+# Core primitives that the headless player also needs (currently Prop) live in
+# engine/, subclassing this module's Thing when the editor tier is present.
+# They cannot be imported at the top of this file (they import it), so they are
+# loaded on first use: by name via __getattr__ (``from editor.things import
+# Prop``), and before map deserialization via _load_core_entity_types() so the
+# subclass walk in Thing.from_dict can resolve their type tokens.
+
+_CORE_ENTITY_MODULES = {
+    'Prop': 'engine.prop_entity',
+    'Effect': 'engine.effect_entity',
+}
+
+
+def _load_core_entity_types():
+    import importlib
+    for module_name in set(_CORE_ENTITY_MODULES.values()):
+        importlib.import_module(module_name)
+
+
+def __getattr__(name):
+    module_name = _CORE_ENTITY_MODULES.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+    value = getattr(importlib.import_module(module_name), name)
+    globals()[name] = value
+    registry = globals().get('ENTITY_TYPES')
+    if isinstance(registry, dict):
+        registry[name] = value
+    return value

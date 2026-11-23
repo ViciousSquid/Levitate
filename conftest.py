@@ -1,0 +1,804 @@
+"""Repo-wide pytest configuration.
+
+This file exists so that *every* Fio test — the unified suite under ``tests/``
+and the tests the plugin and player packages ship with — runs under the same
+rules:
+
+* Qt is forced onto the offscreen platform plugin, so nothing needs a display
+  server;
+* the RNGs Fio's procedural code reaches for are reseeded before each test, so
+  a failure reproduces;
+* the process-wide singletons Fio uses (the plugin manager, the I/O revision
+  counter, the ``Thing`` name counters) are reset between tests, so a test
+  cannot be made to pass or fail by whatever ran before it;
+* the ``gl`` tier skips itself with a readable reason when no OpenGL context
+  can be created, rather than erroring somewhere deep in PyOpenGL.
+
+See ``tests/README.md`` for how the tiers are meant to be run.
+"""
+
+import ast
+import os
+import random
+import sys
+
+import pytest
+
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+# Must be set before anything imports PyQt5: a QApplication built against the
+# real platform plugin aborts the process when there is no display.  A display
+# *is* honoured when one is present, because the offscreen plugin cannot create
+# an OpenGL context — the visual tier needs the real one (under Xvfb in CI).
+if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    # The headless Linux Qt tier has no X11/GLX display. Use EGL for
+    # context-free PyOpenGL imports there; Windows and macOS must keep their
+    # native PyOpenGL platform backends.
+    if sys.platform.startswith("linux"):
+        os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+# Seal the render table's transform columns (engine/render_table.py): a write
+# that bypasses the change log raises. A test-time check; play does not pay it.
+os.environ.setdefault("FIO_SEAL_COLUMNS", "1")
+# Qt writes its runtime files here; without it every Qt test prints a warning.
+os.environ.setdefault("XDG_RUNTIME_DIR", os.path.join("/tmp", "fio-test-runtime"))
+try:
+    os.makedirs(os.environ["XDG_RUNTIME_DIR"], mode=0o700, exist_ok=True)
+except OSError:  # pragma: no cover - read-only /tmp is not a test failure
+    pass
+
+# Fio's GL format as the application default, before any test builds the
+# QApplication -- as main.py does. Editor windows' own contexts take the
+# default; on macOS the 3D view's core-profile context cannot share with a
+# legacy one, and Qt then rebuilds the view's context (and Fio's renderer)
+# whenever the editor window is shown again (engine/gl_format.py). No vsync:
+# a headless display may never come round to the swap.
+try:
+    from PyQt5.QtWidgets import QApplication as _QApplication
+    if _QApplication.instance() is None:
+        from engine.gl_format import set_default_surface_format
+        set_default_surface_format(0)
+except ImportError:  # pragma: no cover - PyQt5 absent: the Qt tiers skip
+    pass
+
+#: Seed used for every test that does not ask for another.  Property/fuzz tests
+#: derive their own seeds from this so a whole run is reproducible from one
+#: number.
+DEFAULT_SEED = 20240914
+
+
+# ---------------------------------------------------------------------------
+# Options
+# ---------------------------------------------------------------------------
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--run-benchmarks", action="store_true", default=False,
+        help="run the renderer/engine benchmarks (they report timings and are "
+             "excluded from the normal suite)")
+    parser.addoption(
+        "--run-soak", action="store_true", default=False,
+        help="run the soak tier (long repeated cycles that check memory, "
+             "resource counts and per-cycle cost stay flat; excluded from the "
+             "normal suite). FIO_SOAK_SCALE multiplies the cycle counts.")
+
+
+def pytest_collection_modifyitems(config, items):
+    opt_in = (
+        ("benchmark", "--run-benchmarks",
+         "benchmark tier: pass --run-benchmarks to run it"),
+        ("soak", "--run-soak", "soak tier: pass --run-soak to run it"),
+    )
+    for keyword, option, reason in opt_in:
+        if config.getoption(option):
+            continue
+        skip = pytest.mark.skip(reason=reason)
+        for item in items:
+            if keyword in item.keywords:
+                item.add_marker(skip)
+
+
+# ---------------------------------------------------------------------------
+# Collection isolation
+# ---------------------------------------------------------------------------
+
+def _module_marked_qt_or_gl(tree):
+    """True when a module-level ``pytestmark`` applies the ``qt`` or ``gl`` tier."""
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets = [node.target]
+        else:
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in targets):
+            continue
+        for sub in ast.walk(node.value):
+            if (isinstance(sub, ast.Attribute) and sub.attr in ("qt", "gl")
+                    and isinstance(sub.value, ast.Attribute)
+                    and sub.value.attr == "mark"):
+                return True
+    return False
+
+
+def pytest_ignore_collect(collection_path, config):
+    """Do not import Qt/GL test modules in the dependency-light CI tier."""
+    if not os.environ.get("FIO_HEADLESS_TIER"):
+        return None
+    try:
+        if not collection_path.is_file() or collection_path.suffix != ".py":
+            return None
+        tree = ast.parse(collection_path.read_text(encoding="utf-8"),
+                         filename=str(collection_path))
+    except (OSError, UnicodeDecodeError, SyntaxError):
+        return None
+    # A module marked ``pytestmark = pytest.mark.qt`` (or ``gl``) as a whole has
+    # no test this tier would select, but it may still reach Qt transitively at
+    # import time (``editor.things`` imports PyQt5), so do not import it at all.
+    if _module_marked_qt_or_gl(tree):
+        return True
+    nodes = ast.walk(tree)
+    for node in nodes:
+        if isinstance(node, ast.Import):
+            roots = [alias.name.split('.')[0] for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            roots = [node.module.split('.')[0]] if node.module else []
+        else:
+            continue
+        if "PyQt5" in roots or "OpenGL" in roots:
+            return True
+    # Let pytest's own hook apply --ignore and norecursedirs. Returning False
+    # here stops this first-result hook before pytest can check those rules.
+    return None
+
+
+# ---------------------------------------------------------------------------
+# M4's change records
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _no_missed_change_record():
+    """With the oracle recording (``FIO_RENDER_ORACLE=record``), a test that
+    leaves a missed change record behind fails: a writer it exercised did not
+    report what it wrote (engine/change_detection.py)."""
+    from engine import change_detection
+    del change_detection.MISSES[:]
+    yield
+    misses = list(change_detection.MISSES)
+    del change_detection.MISSES[:]
+    if misses:
+        pytest.fail("missed change records (%d): %s" % (len(misses), misses[:3]))
+
+
+# ---------------------------------------------------------------------------
+# Autosaves
+# ---------------------------------------------------------------------------
+
+#: Where the editor writes its autosaves (MainWindow._write_autosave): the
+#: open level's ``maps/<name>_autosave.json`` -- on its timer, and before a
+#: level change in Play with unsaved edits.
+_AUTOSAVE_GLOB = os.path.join(_ROOT, "maps", "*_autosave.json")
+#: When this test session began (autosaves older than this predate it).
+SESSION_STARTED_NS = __import__("time").time_ns()
+
+
+def _autosaves():
+    """``{path: (mtime, size)}`` of the autosaves in the checkout's maps/."""
+    import glob
+    found = {}
+    for path in glob.glob(_AUTOSAVE_GLOB):
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        found[path] = (stat.st_mtime_ns, stat.st_size)
+    return found
+
+
+@pytest.fixture(autouse=True)
+def _no_autosaves_left_behind():
+    """Remove every autosave a test writes, as soon as the test is over.
+
+    A test that runs the editor can autosave into the checkout's maps/ (a
+    level change in Play with unsaved edits does, at once). The file stayed
+    there: git ignores it, but every later test that lists maps/ -- the
+    brush-semantics snapshot of the shipped maps -- found a map too many and
+    failed. An autosave this test created or rewrote is deleted; one that was
+    already there untouched is left alone (it may be someone's unsaved work
+    from the editor run in this checkout).
+    """
+    before = _autosaves()
+    yield
+    remove_new_autosaves(before)
+
+
+def remove_new_autosaves(before, found=None):
+    """Delete the autosaves in *found* (default: maps/ now) that are not in
+    *before* (``{path: (mtime, size)}``) as they were; return their paths."""
+    removed = []
+    for path, stamp in (_autosaves() if found is None else found).items():
+        if before.get(path) != stamp:
+            try:
+                os.remove(path)
+            except OSError:
+                continue
+            removed.append(path)
+    return removed
+
+
+# ---------------------------------------------------------------------------
+# Determinism
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _deterministic_rngs():
+    """Reseed the global RNGs before every test.
+
+    Fio's procedural generators, the Tidy plugin's placement and several engine
+    paths use :mod:`random`; NumPy's legacy global RNG shows up in the terrain
+    code.  Seeding them here means a failure in a generated test reproduces from
+    the seed printed in its id rather than from "whatever ran before it".
+    """
+    random.seed(DEFAULT_SEED)
+    try:
+        import numpy as np
+        np.random.seed(DEFAULT_SEED & 0xFFFFFFFF)
+    except Exception:  # pragma: no cover - numpy is a hard dep in practice
+        pass
+    yield
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _plugins_loaded_before_isolation():
+    """Load the plugins once, before any per-test registry snapshot is taken.
+
+    ``_isolate_process_singletons`` restores ``IO_REGISTRY`` to whatever it held
+    at the *start of each test*, so a test that registers a fake entity type
+    cannot leak it into the next one. But plugin registration is a
+    once-per-process event: ``PluginManager.discover_and_load`` early-outs on
+    ``self._loaded``. So if the first ``load_plugins()`` of the process happened
+    inside a test, that test's teardown rolled the registry back to before the
+    plugins registered and nothing ever registered them again -- every later
+    test saw a plugin that is loaded and enabled but whose I/O and entity
+    declarations had silently vanished.
+
+    That is why ``plugins/tidy/tests/test_smoke.py::test_plugin_loads_and_registers``
+    passes alone and fails when another tidy test runs first. Loading here, at
+    session scope, puts the plugin registrations *inside* every per-test
+    snapshot, so restoring a snapshot preserves them while still dropping
+    anything an individual test added.
+
+    Guarded: the headless CI tier has no PyQt5, so plugin import can fail there.
+    That tier simply runs without plugins, exactly as before.
+    """
+    try:
+        from plugins.manager import load_plugins
+        load_plugins()
+    except Exception:
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _isolate_process_singletons(_plugins_loaded_before_isolation):
+    """Undo the process-wide state a test can leave behind.
+
+    Fio keeps several deliberate singletons: the plugin manager, the I/O
+    revision counter and its cached reverse index, ``IO_REGISTRY`` (the
+    process-wide schema of every entity type's inputs and outputs), and
+    ``Thing._counters`` (which is what makes entity names unique).  A test that
+    adds a connection, registers an entity type or places an entity changes what
+    the *next* test sees, which is exactly the kind of order dependence that
+    makes a suite untrustworthy.  Everything here is restored, not merely
+    cleared, so a test that deliberately sets one of them up still sees its own
+    value.
+
+    ``IO_REGISTRY`` matters more than it looks: several tests register a fake
+    entity type to exercise the registration path, and a leftover fake is a type
+    declaring inputs that nothing implements — which is precisely what the I/O
+    conformance tests exist to catch, so a leak there shows up as a failure
+    about Fio's own entities.
+    """
+    io_system = sys.modules.get("editor.io_system")
+    saved_rev = getattr(io_system, "_io_revision", None) if io_system else None
+    saved_registry = dict(io_system.IO_REGISTRY) if io_system else None
+    counters = None
+    things = sys.modules.get("editor.things")
+    if things is not None:
+        counters = dict(things.Thing._counters)
+    plugin_state = _snapshot_plugin_state()
+    # The editor sets the application font from settings.ini when a window is
+    # built (MainWindow.update_global_font). It is process-wide: left changed,
+    # it changes how the next test's windows lay out.
+    app_font = _application_font()
+
+    yield
+
+    if app_font is not None:
+        from PyQt5.QtWidgets import QApplication
+        QApplication.setFont(app_font)
+    _restore_plugin_state(plugin_state)
+
+    io_system = sys.modules.get("editor.io_system")
+    if io_system is not None:
+        # Always invalidate the cached reverse index: it is keyed partly by
+        # ``id(list)``, and a freed list's address is readily reused.
+        io_system._target_index_cache = None
+        io_system._target_index_key = None
+        if saved_rev is not None:
+            io_system._io_revision = saved_rev
+        if saved_registry is not None:
+            io_system.IO_REGISTRY.clear()
+            io_system.IO_REGISTRY.update(saved_registry)
+            # Derived from the registry, so it has to go back with it.
+            if hasattr(io_system, "_declared_outputs_cache"):
+                io_system._declared_outputs_cache.clear()
+            # Restoring the registry to its pre-test state also undoes anything
+            # the plugins declared into it, and plugin registration is a
+            # once-per-process event that will not run again. Ask the manager
+            # to replay its recorded registrations so a plugin can never be
+            # left loaded and enabled but silently undeclared.
+            _reapply_plugin_registrations()
+    things = sys.modules.get("editor.things")
+    if things is not None and counters is not None:
+        things.Thing._counters.clear()
+        things.Thing._counters.update(counters)
+
+
+def _application_font():
+    """The QApplication's font, if Qt is loaded and an application exists."""
+    widgets = sys.modules.get("PyQt5.QtWidgets")
+    if widgets is None or widgets.QApplication.instance() is None:
+        return None
+    from PyQt5.QtGui import QFont
+    return QFont(widgets.QApplication.font())
+
+
+def _reapply_plugin_registrations():
+    """Put back the declarations a registry restore stripped from the plugins."""
+    manager_module = sys.modules.get("plugins.manager")
+    if manager_module is None:
+        return
+    try:
+        manager_module.get_manager().reapply_registrations()
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
+def _snapshot_plugin_state():
+    """Which plugins are on, and which of those a level switched on.
+
+    The plugin manager is a process-wide singleton by design, so a test that
+    enables a plugin (or loads a map that auto-enables one) changes what every
+    later test sees.  Only the *toggles* are snapshotted - the loaded plugin
+    list itself is expensive to rebuild and is meant to be shared.
+    """
+    manager_module = sys.modules.get("plugins.manager")
+    if manager_module is None:
+        return None
+    try:
+        manager = manager_module.get_manager()
+    except Exception:  # pragma: no cover - defensive
+        return None
+    return (manager,
+            {plugin: bool(getattr(plugin, "enabled", True))
+             for plugin in manager.plugins},
+            set(manager._auto_enabled),
+            # The manager's recorded registrations are process-wide state like
+            # any other singleton here. A test that registers something -- the
+            # plugin-API tests do -- would otherwise have it replayed into
+            # every later test by reapply_registrations(), which is a leak the
+            # replay itself makes permanent.
+            list(getattr(manager, "_io_registrations", [])),
+            # Services a plugin provides for one play session (Big World's
+            # "bigworld" and "savegame.restore") are process-wide too: a test
+            # that starts a session without stopping it would otherwise hand
+            # its stale session to every later save/restore.
+            dict(getattr(manager, "services", {})))
+
+
+def _restore_plugin_state(snapshot):
+    if snapshot is None:
+        return
+    manager, enabled, auto_enabled, io_registrations, services = snapshot
+    for plugin, was_enabled in enabled.items():
+        plugin.enabled = was_enabled
+    # Written directly, so the manager's caches keyed on the enabled set (the
+    # wants_tick() answer above all) must be told it changed.
+    if hasattr(manager, "_enabled_generation"):
+        manager._enabled_generation += 1
+    manager._auto_enabled.clear()
+    manager._auto_enabled.update(auto_enabled)
+    if hasattr(manager, "_io_registrations"):
+        manager._io_registrations[:] = io_registrations
+    if hasattr(manager, "services"):
+        manager.services.clear()
+        manager.services.update(services)
+
+
+# ---------------------------------------------------------------------------
+# Qt
+# ---------------------------------------------------------------------------
+
+#: Tracebacks of exceptions that escaped a Qt callback during the current test.
+_QT_CALLBACK_ERRORS = []
+
+#: Modal dialogs the current test opened, as ``(kind, detail)`` pairs.
+_MODAL_DIALOGS = []
+
+
+def _qt_callback_excepthook(exc_type, exc, tb):
+    """Record an exception escaping a Qt slot or virtual instead of aborting.
+
+    With the default ``sys.excepthook`` PyQt5 calls ``qFatal`` for such an
+    exception, which kills the whole pytest process: one bug in one slot hid
+    every later result. The application installs its own hook in ``main.py``;
+    the suite needs the same protection, but must still fail the test.
+    """
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc, tb)
+        return
+    import traceback
+    text = "".join(traceback.format_exception(exc_type, exc, tb))
+    _QT_CALLBACK_ERRORS.append(text)
+    sys.stderr.write(text)
+
+
+def _install_modal_guard():
+    """Make modal dialogs return at once rather than block the run forever.
+
+    A ``QMessageBox.warning`` or ``QDialog.exec_`` reached by a test opens a
+    nested event loop that nothing will ever close: under a display server
+    the suite hangs until the CI timeout. Each one is recorded and answered
+    with its "cancel" result; a test that cares about the answer monkeypatches
+    the dialog itself, which takes precedence over this.
+    """
+    try:
+        from PyQt5.QtWidgets import QDialog, QFileDialog, QInputDialog, QMessageBox
+    except Exception:  # headless tier: no Qt, nothing can block
+        return
+
+    def answer(kind, result):
+        def dialog(*args, **kwargs):
+            detail = args[2] if len(args) > 2 else kwargs.get("text", "")
+            _MODAL_DIALOGS.append((kind, str(detail)[:200]))
+            return result
+        return staticmethod(dialog)
+
+    QMessageBox.warning = answer("QMessageBox.warning", QMessageBox.Ok)
+    QMessageBox.information = answer("QMessageBox.information", QMessageBox.Ok)
+    QMessageBox.critical = answer("QMessageBox.critical", QMessageBox.Ok)
+    QMessageBox.question = answer("QMessageBox.question", QMessageBox.No)
+    QFileDialog.getOpenFileName = answer("QFileDialog.getOpenFileName", ("", ""))
+    QFileDialog.getOpenFileNames = answer("QFileDialog.getOpenFileNames", ([], ""))
+    QFileDialog.getSaveFileName = answer("QFileDialog.getSaveFileName", ("", ""))
+    QFileDialog.getExistingDirectory = answer("QFileDialog.getExistingDirectory", "")
+    QInputDialog.getText = answer("QInputDialog.getText", ("", False))
+    QInputDialog.getItem = answer("QInputDialog.getItem", ("", False))
+    QInputDialog.getInt = answer("QInputDialog.getInt", (0, False))
+    QInputDialog.getDouble = answer("QInputDialog.getDouble", (0.0, False))
+
+    def exec_(self, *args, **kwargs):
+        _MODAL_DIALOGS.append((type(self).__name__ + ".exec_", ""))
+        return QDialog.Rejected
+    QDialog.exec_ = exec_
+    QDialog.exec = exec_
+
+
+def pytest_configure(config):
+    sys.excepthook = _qt_callback_excepthook
+    _install_modal_guard()
+
+
+def pytest_runtest_setup(item):
+    """Give the Qt tier the editor's style before its first widget exists.
+
+    Several modules create the QApplication themselves; installing the style
+    later, over widgets an earlier module left alive, restyles them in place.
+    The OpenGL tier sets its surface format first, so it is left alone.
+    """
+    if item.get_closest_marker("qt") is None or item.get_closest_marker("gl") is not None:
+        return
+    try:
+        from PyQt5.QtWidgets import QApplication
+    except ImportError:
+        return
+    app = QApplication.instance()
+    if app is not None and getattr(app, "_fio_editor_style_installed", False):
+        return
+    if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from editor.desktop_style import install_editor_style, prepare_qt
+    prepare_qt()
+    global _STYLED_QT_APP
+    # Held for the session: an unreferenced QApplication is destroyed.
+    _STYLED_QT_APP = app or QApplication([])
+    install_editor_style(_STYLED_QT_APP)
+
+
+_STYLED_QT_APP = None
+
+
+@pytest.fixture(autouse=True)
+def _no_runtime_transform_outlives_its_test():
+    """A brush's runtime transform (unified brush model, Stage 2b) lives in a
+    process-wide runtime source -- the editor's mover preview, the tests'
+    :mod:`tests.helpers.runtime` -- not in the brush; clear them so a moved or
+    spinning brush never leaks into the next test."""
+    yield
+    from engine import brush_placement
+    brush_placement.PREVIEW.clear()
+    try:
+        from tests.helpers import runtime
+    except ImportError:
+        return
+    runtime.release()
+
+
+@pytest.fixture(autouse=True)
+def _qt_callback_errors_fail_the_test():
+    """Fail the test during which an exception escaped a Qt callback."""
+    _QT_CALLBACK_ERRORS.clear()
+    _MODAL_DIALOGS.clear()
+    yield
+    # A test that swaps the hook (to exercise install_excepthook) must not
+    # leave the suite running with the application's non-failing one.
+    sys.excepthook = _qt_callback_excepthook
+    if _QT_CALLBACK_ERRORS:
+        errors = list(_QT_CALLBACK_ERRORS)
+        _QT_CALLBACK_ERRORS.clear()
+        pytest.fail("exception escaped a Qt callback:\n" + errors[0],
+                    pytrace=False)
+    _fail_on_a_held_modifier()
+
+
+def _fail_on_a_held_modifier():
+    """Fail a test that leaves Qt believing a modifier key is still down.
+
+    Qt keeps one keyboard state for the whole process. A synthetic Ctrl+Z sent
+    as ``QTest.keyClick(w, Qt.Key_Z, Qt.ControlModifier)`` never releases Ctrl,
+    and every later test then runs with Ctrl held: the editor's plain
+    shortcuts (the Surface Inspector's T, for one) ignore themselves. The
+    state is reset so the next test starts clean, and this test is failed.
+    """
+    qt_widgets = sys.modules.get("PyQt5.QtWidgets")
+    if qt_widgets is None or qt_widgets.QApplication.instance() is None:
+        return
+    held = int(qt_widgets.QApplication.keyboardModifiers())
+    if not held:
+        return
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtTest import QTest
+    from PyQt5.QtWidgets import QWidget
+    probe = QWidget()
+    for key in (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta):
+        QTest.keyRelease(probe, key)
+    probe.deleteLater()
+    pytest.fail("the test left modifier keys held (Qt state %#x); send the "
+                "modifier's own press and release, as a keyboard does" % held,
+                pytrace=False)
+
+
+_SETTINGS_INI = os.path.join(_ROOT, "settings.ini")
+
+
+@pytest.fixture(scope="session")
+def _settings_dir(tmp_path_factory):
+    """Where each test's own settings.ini is kept (one file per test)."""
+    from tests.helpers import settings_isolation
+    settings_isolation.install()
+    return tmp_path_factory.mktemp("settings")
+
+
+_settings_serial = [0]
+
+
+@pytest.fixture(autouse=True)
+def _each_test_has_its_own_settings_ini(_settings_dir):
+    """Editor windows a test builds read and save a settings.ini of the
+    test's own: a fresh copy of the tracked defaults, never the tracked file
+    (tests/helpers/settings_isolation.py). No test sees another's settings,
+    and no run -- however many run at once -- writes the shipped file.
+
+    The redirect is installed at the source, before the editor is imported,
+    so it holds for every window whatever the test imports.
+    """
+    from tests.helpers import settings_isolation
+    _settings_serial[0] += 1
+    settings_isolation.use(settings_isolation.fresh_copy(
+        _settings_dir / ("settings-%d.ini" % _settings_serial[0])))
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _tracked_settings_ini_untouched():
+    """Fail a test that changed the tracked settings.ini.
+
+    Windows keep their settings in the test's own copy, so a change here is
+    a leak to fix. It is reported, not written back: restoring a snapshot
+    taken at the start of a test is what let concurrent runs overwrite each
+    other's restores (and once left the file empty).
+    """
+    try:
+        with open(_SETTINGS_INI, "rb") as fh:
+            before = fh.read()
+    except OSError:
+        before = None
+    yield
+    if before is None:
+        return
+    try:
+        with open(_SETTINGS_INI, "rb") as fh:
+            after = fh.read()
+    except OSError:  # pragma: no cover - read-only checkout
+        return
+    if after != before:
+        pytest.fail("this test changed the tracked settings.ini (an editor window "
+                    "saved there instead of its own copy)", pytrace=False)
+
+
+@pytest.fixture(autouse=True)
+def _qt_tests_get_an_application(request):
+    """Give every ``qt``-marked test the session ``QApplication``.
+
+    Building a QWidget with no QApplication is a hard abort in Qt, not an
+    exception, so a test that constructs a window without asking for
+    ``qt_app`` passed only when an earlier test had happened to create one,
+    and took the whole process down when run on its own.
+    """
+    if request.node.get_closest_marker("qt") is not None:
+        request.getfixturevalue("qt_app")
+
+
+@pytest.fixture
+def modal_dialogs():
+    """The modal dialogs the current test opened (auto-answered)."""
+    return _MODAL_DIALOGS
+
+
+@pytest.fixture
+def main_window(qt_app, tmp_path, monkeypatch):
+    """Construct the real editor host for tests that exercise editor machinery.
+
+    The window uses the repository root for assets/plugins while its mutable
+    settings live in a per-test temporary working directory. This is an actual
+    editor.main_window.MainWindow rather than a sliced/fake host, so tests
+    cross the same ownership boundaries as the editor itself.
+    """
+    from editor.main_window import MainWindow
+
+    monkeypatch.chdir(tmp_path)
+    window = MainWindow(_ROOT)
+    window.show()
+    qt_app.processEvents()
+    if qt_app.platformName() == "offscreen":
+        # The editor always has a logic thread: initializeGL starts it after
+        # building the renderer. Offscreen there is no GL context and no
+        # initializeGL, so start it the same way.
+        window.view_3d._start_logic_thread()
+    try:
+        yield window
+    finally:
+        window.unsaved_changes = False
+        window.close()
+        window.deleteLater()
+        _flush_deferred_deletes(qt_app)
+
+
+@pytest.fixture
+def fio_session(qt_app):
+    """Open real Fio sessions on maps: ``fio_session("maps/X.json")``.
+
+    See :class:`tests.helpers.session.FioTestSession`. Every session opened
+    through this is closed after the test, even if it fails.
+    """
+    from tests.helpers.session import FioTestSession
+    opened = []
+
+    def open_session(level, **kwargs):
+        session = FioTestSession(qt_app, level, **kwargs)
+        opened.append(session)
+        return session
+
+    yield open_session
+    for session in reversed(opened):
+        session.close()
+
+
+def _flush_deferred_deletes(qt_app):
+    """Actually destroy widgets handed to ``deleteLater``.
+
+    ``processEvents`` does not deliver ``DeferredDelete`` events posted
+    outside an event loop, so every closed MainWindow -- its GL context,
+    renderer, textures and threads -- stayed alive for the rest of the run:
+    about 120 MB per test, until the Qt tier was OOM-killed partway through.
+    """
+    import gc
+    from PyQt5.QtCore import QEvent
+    qt_app.processEvents()
+    qt_app.sendPostedEvents(None, QEvent.DeferredDelete)
+    gc.collect()
+    qt_app.sendPostedEvents(None, QEvent.DeferredDelete)
+
+
+@pytest.fixture(scope="session")
+def qt_app():
+    """The one ``QApplication`` for the whole session.
+
+    Qt allows exactly one per process and destroying it invalidates every
+    widget built against it, so this is session-scoped and never torn down.
+    """
+    pytest.importorskip("PyQt5", reason="PyQt5 is not installed")
+    from PyQt5.QtWidgets import QApplication
+    from editor.desktop_style import prepare_qt, install_editor_style
+    prepare_qt()
+    app = QApplication.instance() or QApplication([])
+    install_editor_style(app)
+    yield app
+
+
+# ---------------------------------------------------------------------------
+# OpenGL tier
+# ---------------------------------------------------------------------------
+
+_GL_PROBE = None
+
+
+def gl_availability():
+    """``(ok, reason)`` for whether a real GL context can be created here.
+
+    Probed once per process, in a child-free way: creating and destroying a
+    hidden ``QOpenGLContext`` against an offscreen surface is what the visual
+    tier itself does, so a successful probe means the tier can actually run.
+    """
+    global _GL_PROBE
+    if _GL_PROBE is not None:
+        return _GL_PROBE
+    try:
+        from PyQt5.QtGui import QOffscreenSurface, QOpenGLContext, QSurfaceFormat
+        from PyQt5.QtWidgets import QApplication
+    except Exception as exc:
+        _GL_PROBE = (False, "PyQt5 OpenGL bindings unavailable: %s" % exc)
+        return _GL_PROBE
+    app = QApplication.instance() or QApplication([])
+    platform = app.platformName()
+    if platform == "offscreen":
+        _GL_PROBE = (False,
+                     "the Qt platform plugin in use is 'offscreen', which cannot "
+                     "create an OpenGL context - run under a display "
+                     "(xvfb-run), and make sure nothing has set "
+                     "QT_QPA_PLATFORM=offscreen for the session")
+        return _GL_PROBE
+    fmt = QSurfaceFormat()
+    fmt.setVersion(3, 3)
+    fmt.setProfile(QSurfaceFormat.CoreProfile)
+    fmt.setDepthBufferSize(24)
+    fmt.setStencilBufferSize(8)
+    surface = QOffscreenSurface()
+    surface.setFormat(fmt)
+    surface.create()
+    if not surface.isValid():
+        _GL_PROBE = (False, "no usable offscreen surface (no GPU/driver in this environment)")
+        return _GL_PROBE
+    ctx = QOpenGLContext()
+    ctx.setFormat(fmt)
+    if not ctx.create():
+        _GL_PROBE = (False, "QOpenGLContext.create() failed (no GL driver)")
+        return _GL_PROBE
+    if not ctx.makeCurrent(surface):
+        _GL_PROBE = (False, "could not make a GL context current")
+        return _GL_PROBE
+    ctx.doneCurrent()
+    _GL_PROBE = (True, "")
+    return _GL_PROBE
+
+
+@pytest.fixture(autouse=True)
+def _skip_without_gl(request):
+    """Skip ``gl``-marked tests with a readable reason instead of erroring."""
+    if request.node.get_closest_marker("gl") is None:
+        return
+    ok, reason = gl_availability()
+    if not ok:
+        pytest.skip("OpenGL tier unavailable: %s" % reason)

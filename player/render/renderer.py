@@ -1,0 +1,917 @@
+"""OpenGL ES 3 world renderer with ZIP-backed textures and touch overlay.
+
+Only the passes actually used by the player are compiled. CPU scene data is
+retained so buffers and textures can be rebuilt after Android context loss.
+"""
+
+from __future__ import annotations
+
+from typing import Dict
+
+from .uniforms import location as uniform_location
+
+from .gles_context import compile_program
+from .overlay import OverlayRenderer
+from . import glmath
+from engine.shaders import MAX_LIGHTS_PLAYER
+
+
+class GLESRenderer:
+    """Owns GL programs and draws each frame."""
+
+    def __init__(self, *, gles=True, quality=None):
+        from collections import OrderedDict
+        from .quality import REFERENCE
+        from ..platform.adaptive import AdaptiveResolution
+        self.quality = quality or REFERENCE
+        self.adaptive = AdaptiveResolution(scale=self.quality.render_scale)
+        self._animation_lru = OrderedDict()
+        self._texture_names = {}
+        self._static_vaos = set()
+        self._target = None
+        self.panel_width = self.panel_height = 1
+        self.gles = gles
+        self.programs: Dict[str, int] = {}
+        self.width = 1
+        self.height = 1
+        self._triangle_vao = None
+        self._triangle_vbo = None
+        self._scene = None
+        self._start_time = 0.0
+        self._batches = []
+        self._textures = {}
+        self._lights = []
+        self._embedded = {}
+        self._draw_sources = {}
+        self._bounds = {}
+        self._tints = {}
+        self._terrain = None
+        #: The GL side of ``_terrain`` (player/render/terrain_gl.py).
+        self._terrain_gl = None
+        self._projection = None
+        self._images = None
+        self._context_lost = False
+        self._ui_key = None
+        self._ui_texture = self._ui_vao = self._ui_vbo = None
+        self._billboard_vao = self._billboard_vbo = None
+        self.overlay = OverlayRenderer()
+        self.shadows = None
+        self.light_buffer = None
+        self.fog_volumes = None
+        self.water = None
+        self.decals = None
+        #: The decals published for the frame being drawn (render()).
+        self._frame_decals = None
+        from engine.logic_render import LogicRender
+        self._fallback_runtime = LogicRender(None)
+        self._fallback_runtime.view_distance.distance = self.quality.view_distance
+        self.frame_stats = {}
+
+    # ------------------------------------------------------------------
+    # GL lifecycle
+    # ------------------------------------------------------------------
+    def on_gl_ready(self) -> None:
+        """(Re)build all GL resources. Safe to call again after context loss."""
+        import time
+
+        from ..gles_shaders import build_gles_shader_set
+        from . import world_shaders
+
+        gl = _gl()
+        from .uniforms import clear
+        clear()
+        from .target import ScaledTarget
+        self._target = ScaledTarget(gl)
+        self._animation_lru.clear()
+        self._context_lost = True
+        self._ui_key = None
+        self._ui_texture = self._ui_vao = self._ui_vbo = None
+        self._billboard_vao = self._billboard_vbo = None
+        self._start_time = time.perf_counter()
+
+        sources = build_gles_shader_set(prefer_arm=True)
+        if not self.gles:
+            from engine.shaders import DEFAULT_SHADERS
+            sources = DEFAULT_SHADERS
+        from ..gles_shaders import for_desktop
+        world_vertex = world_shaders.VERTEX if self.gles else for_desktop(world_shaders.VERTEX)
+        world_fragment = world_shaders.fragment(self.quality) if self.gles else for_desktop(world_shaders.fragment(self.quality))
+        # Unused desktop passes can exceed mobile sampler limits.
+        self.programs = {
+            "simple": compile_program(sources["simple.vert"], sources["simple.frag"]),
+            "world": compile_program(world_vertex, world_fragment),
+        }
+        # Object names from a lost context must never be reused or deleted.
+        self._batches = []
+        self._textures = {}
+        self._tints = {}
+        print(f"[GLES] compiled {len(self.programs)} shader programs: "
+              f"{sorted(self.programs)}")
+
+        gl.glEnable(gl.GL_DEPTH_TEST)
+        gl.glClearColor(0.06, 0.07, 0.09, 1.0)
+        self._build_reference_triangle()
+        self.overlay.on_gl_ready(self.programs)
+        from .shadows import ShadowAtlas, MOBILE_SHADOW_TILE, PLAYER_SHADOW_TILE
+        self.shadows = ShadowAtlas(self.gles, tile=MOBILE_SHADOW_TILE if self.quality.name == "mobile" else PLAYER_SHADOW_TILE)
+        from .lighting import LightBuffer
+        self.light_buffer = LightBuffer(gl, self.programs['world'])
+        from .fog import FogVolumes
+        self.fog_volumes = FogVolumes(gl, self.gles, steps=self.quality.fog_steps)
+        from .water import WaterSurfaces
+        self.water = WaterSurfaces(gl, self.gles,
+                                   subdivisions=8 if self.quality.name == 'mobile' else 16)
+        from .decals import PlayerDecals
+        if self.decals:
+            self.decals.forget()        # a lost context's names are never reused
+        self.decals = PlayerDecals(gl, self.gles)
+
+        if self._scene is not None:
+            self._upload_scene()
+        self._context_lost = False
+
+    def resize(self, width: int, height: int) -> None:
+        self.panel_width = self.width = max(1, width)
+        self.panel_height = self.height = max(1, height)
+        _gl().glViewport(0, 0, self.width, self.height)
+
+    # ------------------------------------------------------------------
+    # Reference triangle (milestone 1)
+    # ------------------------------------------------------------------
+    def _build_reference_triangle(self) -> None:
+        import ctypes
+
+        import numpy as np
+
+        gl = _gl()
+        verts = np.array(
+            [0.0, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0],
+            dtype=np.float32,
+        )
+        self._triangle_vao = gl.glGenVertexArrays(1)
+        gl.glBindVertexArray(self._triangle_vao)
+        self._triangle_vbo = gl.glGenBuffers(1)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._triangle_vbo)
+        gl.glBufferData(gl.GL_ARRAY_BUFFER, verts.nbytes, verts, gl.GL_STATIC_DRAW)
+        gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, gl.GL_FALSE, 0, ctypes.c_void_p(0))
+        gl.glEnableVertexAttribArray(0)
+        gl.glBindVertexArray(0)
+
+    def _draw_reference_triangle(self) -> None:
+        import time
+
+        gl = _gl()
+        prog = self.programs.get("simple")
+        if prog is None or self._triangle_vao is None:
+            return
+        gl.glUseProgram(prog)
+
+        t = time.perf_counter() - self._start_time
+        aspect = self.width / max(1, self.height)
+        model = glmath.rotate_z(t)
+        view = glmath.identity()
+        proj = glmath.ortho(-aspect, aspect, -1.0, 1.0, -1.0, 1.0)
+
+        _set_mat4(gl, prog, "model", model)
+        _set_mat4(gl, prog, "view", view)
+        _set_mat4(gl, prog, "projection", proj)
+        _set_vec3(gl, prog, "color", (0.20, 0.85, 0.70))
+        _set_float(gl, prog, "alpha", 1.0)
+
+        gl.glBindVertexArray(self._triangle_vao)
+        gl.glDrawArrays(gl.GL_TRIANGLES, 0, 3)
+        gl.glBindVertexArray(0)
+
+    # ------------------------------------------------------------------
+    # Per-frame
+    # ------------------------------------------------------------------
+    def render(self, render_state=None) -> None:
+        gl = _gl()
+        scale = self.adaptive.scale if self.quality.adaptive else self.quality.render_scale
+        scaled = self._scene is not None and scale < .999
+        self.width, self.height = self.panel_width, self.panel_height
+        # Decals read a copy of the world's depth, which only the offscreen
+        # target can give portably: a frame with any draws through it.
+        from .decals import has_decals
+        world = self._scene.get('world') if self._scene else None
+        frame = getattr(world, 'decal_frame', None)
+        self._frame_decals = frame() if frame else None
+        offscreen = scaled or has_decals(self._frame_decals)
+        if scaled:
+            self.adaptive.scale = scale
+            self.width, self.height = self.adaptive.render_size(self.panel_width, self.panel_height)
+        if offscreen:
+            self._target.begin(self.width, self.height)
+        else:
+            gl.glViewport(0, 0, self.width, self.height)
+        gl.glEnable(gl.GL_DEPTH_TEST)
+        gl.glDepthMask(True)
+        gl.glDisable(gl.GL_SCISSOR_TEST)
+        gl.glDisable(gl.GL_CULL_FACE)
+        if self._scene is not None:
+            distance = self._render_runtime().view_distance
+            color = distance.fog_color if distance.fog_enabled else (0.06, 0.07, 0.09)
+            gl.glClearColor(*color, 1.)
+        gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
+        if self._scene is not None:
+            self.render_scene(render_state)
+        else:
+            self._draw_reference_triangle()
+        if offscreen:
+            self._target.present(self.panel_width, self.panel_height)
+        self.frame_stats.update(render_width=self.width, render_height=self.height,
+                                render_scale=scale, quality=self.quality.name)
+
+    def render_overlay(self, controls, inp, w: int, h: int) -> None:
+        """Draw the on-screen touch controls over the scene (call last)."""
+        self.overlay.render(controls, inp, w, h)
+
+    # ------------------------------------------------------------------
+    # World geometry
+    # ------------------------------------------------------------------
+    def load_scene(self, map_data: dict, package=None, world=None) -> None:
+        """Build brush batches and upload their ZIP-backed textures."""
+        if self._terrain and (world is None or self._terrain is not world.terrain):
+            self._release_terrain()
+        from .projection import EntityProjection
+        self._projection = EntityProjection() if world else None
+        self._scene = {"map": map_data, "package": package, "world": world}
+        if world:
+            # Set each new level's simulation and rendering horizon together.
+            # ViewDistance also derives the projection far plane and fog range.
+            world.logic.render_runtime.view_distance.distance = self.quality.view_distance
+        self._upload_scene()
+
+    def _render_runtime(self):
+        world = self._scene.get('world') if self._scene else None
+        return world.logic.render_runtime if world else self._fallback_runtime
+
+    def _release_terrain(self):
+        """Free the GL side of the terrain drawn (the context is current).
+        After a lost context its names are already gone and are only dropped."""
+        if self._terrain_gl is not None and not self._context_lost:
+            self._terrain_gl.cleanup()
+        self._terrain_gl = None
+        self._terrain = None
+
+    def clear_scene(self):
+        gl = _gl()
+        self._release_terrain()
+        if self.water:
+            self.water.clear()
+        for vao, vbo, _, _ in self._batches:
+            gl.glDeleteVertexArrays(1, [vao])
+            gl.glDeleteBuffers(1, [vbo])
+        for texture in self._textures.values():
+            gl.glDeleteTextures([texture])
+        self._batches, self._textures, self._draw_sources, self._tints = [], {}, {}, {}
+        self._bounds = {}
+        self._texture_names.clear()
+        self._animation_lru.clear()
+        self._static_vaos.clear()
+        self._scene = None
+
+    def close(self):
+        self.clear_scene()
+        if self._target:
+            self._target.close()
+        if self.shadows:
+            self.shadows.close()
+        if self.light_buffer:
+            self.light_buffer.close()
+        if self.fog_volumes:
+            self.fog_volumes.close()
+        if self.water:
+            self.water.close()
+        if self.decals:
+            self.decals.close()
+        gl = _gl()
+        for vao in (self._triangle_vao, self._ui_vao, self._billboard_vao, self.overlay._disc_vao):
+            if vao:
+                gl.glDeleteVertexArrays(1, [vao])
+        for vbo in (self._triangle_vbo, self._ui_vbo, self._billboard_vbo, self.overlay._disc_vbo):
+            if vbo:
+                gl.glDeleteBuffers(1, [vbo])
+        if self._ui_texture:
+            gl.glDeleteTextures([self._ui_texture])
+        for program in self.programs.values():
+            gl.glDeleteProgram(program)
+        self.programs.clear()
+
+    def _add_batches(self, batches, source=None):
+        import ctypes
+        import numpy as np
+        gl = _gl()
+        for name, vertices in batches.items():
+            tint = (1, 1, 1, 1)
+            if isinstance(name, tuple):
+                name, tint = name
+            vao = gl.glGenVertexArrays(1)
+            vbo = gl.glGenBuffers(1)
+            gl.glBindVertexArray(vao)
+            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, vbo)
+            gl.glBufferData(gl.GL_ARRAY_BUFFER, vertices.nbytes, vertices, gl.GL_STATIC_DRAW)
+            for attribute, size, offset in ((0, 3, 0), (1, 3, 12), (2, 2, 24)):
+                gl.glVertexAttribPointer(attribute, size, gl.GL_FLOAT, gl.GL_FALSE, 32, ctypes.c_void_p(offset))
+                gl.glEnableVertexAttribArray(attribute)
+            self._batches.append((vao, vbo, self._load_texture(name), vertices.size // 8))
+            self._tints[vao] = tint
+            self._texture_names[vao] = name
+            if source is None or source[0] == 'static':
+                self._static_vaos.add(vao)
+            positions = vertices.reshape(-1, 8)[:, :3]
+            low, high = positions.min(0), positions.max(0)
+            self._bounds[vao] = ((low+high)*.5, (high-low)*.5)
+            if source:
+                self._draw_sources[vao] = source
+
+    def _upload_scene(self):
+        from .scene import extract_lights
+        from engine.change_journal import JOURNAL
+        gl = _gl()
+        for vao, vbo, texture, count in self._batches:
+            gl.glDeleteVertexArrays(1, [vao])
+            gl.glDeleteBuffers(1, [vbo])
+        for texture in self._textures.values():
+            gl.glDeleteTextures([texture])
+        self._batches, self._textures, self._draw_sources, self._embedded = [], {}, {}, {}
+        self._tints = {}
+        self._bounds = {}
+        self._texture_names.clear()
+        self._static_vaos.clear()
+        self._animation_lru.clear()
+        if self.shadows:
+            self.shadows.invalidate()
+        from .assets import Images
+        self._images = Images(self._scene.get('package'), self._embedded)
+        if self.light_buffer:
+            # Cookie images come from the played package, as textures do.
+            package = self._scene.get('package')
+            self.light_buffer.forget_cookies()
+            self.light_buffer.read = (
+                lambda path, package=package, embedded=self._embedded:
+                embedded.get(path) or (package.read_asset(path) if package else None))
+        world = self._scene.get('world')
+        data = world.render_map() if world else self._scene['map']
+        self._lights = extract_lights(data)
+        self.water.load(data.get('brushes', []))
+        # Stationary materials share spatial batches; doors and movers retain
+        # their identities, transforms and live culling bounds.
+        from .scene import spatial_batches
+        for groups, source in spatial_batches(data.get('brushes', []),
+                                               self.quality.static_cell_size, self._images.size):
+            self._add_batches(groups, source)
+        if world:
+            from .models import batches as model_batches
+            from engine.entity_table import classify_slots
+            table = self._projection.update(world)
+            models, sprites = classify_slots(table, table.all_slots, table.hidden, True, False)
+            model_ids, sprite_ids = set(map(int, models)), set(map(int, sprites))
+            for row, thing in enumerate(world.state.things):
+                if row in model_ids:
+                    groups, embedded = model_batches(thing.properties['model_path'], self._scene['package'])
+                    self._embedded.update(embedded)
+                    manual = thing.properties.get('texture')
+                    tint = thing.properties.get('tint', (1, 1, 1))
+                    tint = tuple(float(v)/255 if max(tint)>1 else float(v) for v in tint)
+                    groups = {(manual or texture, tuple(color[i]*tint[i] for i in range(3))+(color[3],)): vertices
+                              for (texture, color), vertices in groups.items()}
+                    self._add_batches(groups, ('model', thing, None))
+                elif row in sprite_ids or row in table.effect_slots:
+                    import numpy as np
+                    quad = np.asarray([[x, y, 0, 0, 0, 1, x + .5, y + .5]
+                                       for x, y in ((-.5, -.5), (.5, -.5), (.5, .5), (-.5, -.5), (.5, .5), (-.5, .5))], dtype=np.float32).reshape(-1)
+                    self._add_batches({'': quad}, ('effect' if row in table.effect_slots else 'sprite', thing, row))
+            if world.terrain:
+                self._prepare_terrain(world)
+            self._entity_ids = tuple(id(t) for t in world.state.things)
+        JOURNAL.subscribe(self)
+        JOURNAL.drain(self)
+        gl.glBindVertexArray(0)
+
+    def _prepare_terrain(self, world):
+        """Give *world*'s terrain its GL side: a ``TerrainGL`` whose programs
+        are compiled for this context and whose ground textures are this
+        renderer's. The terrain itself holds no GL and is never rebuilt."""
+        from ..gles_shaders import translate, for_desktop
+        from .terrain_gl import PlayerTerrainGL
+        if (self._terrain is world.terrain and self._terrain_gl is not None
+                and not self._context_lost):
+            self._load_terrain_textures()
+            return
+        # Another terrain, or the same one after a lost context: what was
+        # built for the old context is freed (or, lost, only forgotten).
+        self._release_terrain()
+
+        def compiler(vertex, fragment):
+            if self.gles:
+                vertex, fragment = translate(vertex, 'vertex'), translate(fragment, 'fragment')
+            else:
+                vertex, fragment = for_desktop(vertex), for_desktop(fragment)
+            return compile_program(vertex, fragment)
+        self._terrain = world.terrain
+        self._terrain_gl = PlayerTerrainGL(compiler)
+        self._load_terrain_textures()
+        self._terrain_gl._init_shader()
+        if not self._terrain_gl.shader_program:
+            raise RuntimeError('Terrain shaders could not be compiled')
+
+    def _load_terrain_textures(self):
+        terrain_gl = self._terrain_gl
+        for attribute, name in (('grass_tex', 'grass'), ('rock_tex', 'rock'),
+                                ('sand_tex', 'sand'), ('snow_tex', 'snow')):
+            setattr(terrain_gl, attribute,
+                    self._load_texture(f'assets/textures/terrain/{name}.jpg'))
+
+    def _draw_billboards(self, billboards, prog, view, eye):
+        """Camera-facing images that are not scene entities.
+
+        Plugins publish these per frame -- other Deathmatch spectators are
+        drawn as their chosen glasses, as on desktop. Each entry is
+        ``(position, image name, (width, height))``. Returns the count drawn.
+        """
+        if not billboards:
+            return 0
+        import ctypes
+        import numpy as np
+        gl = _gl()
+        if self._billboard_vao is None:
+            quad = np.asarray([[x, y, 0, 0, 0, 1, x + .5, y + .5]
+                               for x, y in ((-.5, -.5), (.5, -.5), (.5, .5), (-.5, -.5), (.5, .5), (-.5, .5))],
+                              dtype=np.float32)
+            self._billboard_vao = gl.glGenVertexArrays(1)
+            self._billboard_vbo = gl.glGenBuffers(1)
+            gl.glBindVertexArray(self._billboard_vao)
+            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._billboard_vbo)
+            gl.glBufferData(gl.GL_ARRAY_BUFFER, quad.nbytes, quad, gl.GL_STATIC_DRAW)
+            for attribute, size, offset in ((0, 3, 0), (1, 3, 12), (2, 2, 24)):
+                gl.glVertexAttribPointer(attribute, size, gl.GL_FLOAT, gl.GL_FALSE, 32, ctypes.c_void_p(offset))
+                gl.glEnableVertexAttribArray(attribute)
+        gl.glUseProgram(prog)
+        gl.glUniform1i(uniform_location(gl, prog, 'unlit'), 1)
+        gl.glUniform1i(uniform_location(gl, prog, 'lightCount'), 0)
+        gl.glUniform4f(uniform_location(gl, prog, 'tint'), 1, 1, 1, 1)
+        gl.glActiveTexture(gl.GL_TEXTURE0)
+        gl.glEnable(gl.GL_BLEND)
+        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+        gl.glDepthMask(False)
+        gl.glDisable(gl.GL_CULL_FACE)
+        gl.glBindVertexArray(self._billboard_vao)
+        right, up = np.asarray(view)[0, :3], np.asarray(view)[1, :3]
+        drawn = 0
+        far = self._render_runtime().view_distance.far_plane
+        for position, name, (width, height) in billboards:
+            position = np.asarray(position, dtype=float)
+            if float(np.sum((position - eye) ** 2)) > far * far:
+                continue
+            model = glmath.identity()
+            model[:3, 0] = right * float(width)
+            model[:3, 1] = up * float(height)
+            model[:3, 2] = np.cross(right, up)
+            model[:3, 3] = position
+            _set_mat4(gl, prog, 'model', model)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, self._load_texture(name))
+            gl.glDrawArrays(gl.GL_TRIANGLES, 0, 6)
+            drawn += 1
+        gl.glBindVertexArray(0)
+        gl.glDepthMask(True)
+        gl.glDisable(gl.GL_BLEND)
+        return drawn
+
+    def _load_texture(self, name, clock=None, loop=True, phase=0):
+        from PIL import Image
+        from .assets import upload_rgba, GifFrames
+        gl = _gl()
+        frame, images = self._images.frame_info(name, clock, loop, phase)
+        animated = len(images) > 1
+        key = (name, frame) if animated else name
+        if key in self._textures:
+            if animated:
+                self._animation_lru.move_to_end(key)
+            return self._textures[key]
+        image = images.get_frame(frame, phase) if isinstance(images,GifFrames) else images[frame]
+        limit = min(2048, int(gl.glGetIntegerv(gl.GL_MAX_TEXTURE_SIZE)))
+        image = image.copy()
+        image.thumbnail((limit, limit))
+        image = image.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+        texture = gl.glGenTextures(1)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, texture)
+        upload_rgba(gl, image)
+        mipmaps = not animated or self.quality.animation_mipmaps
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER,
+                            gl.GL_LINEAR_MIPMAP_LINEAR if mipmaps else gl.GL_LINEAR)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_REPEAT)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_REPEAT)
+        if mipmaps:
+            gl.glGenerateMipmap(gl.GL_TEXTURE_2D)
+        self._textures[key] = texture
+        if animated:
+            self._animation_lru[key] = None
+            # Phase-shifted instances share frame textures without repeatedly
+            # overwriting one another. Keep GPU memory bounded independently
+            # of the CPU GIF decoder cache.
+            while len(self._animation_lru) > 8:
+                old, _ = self._animation_lru.popitem(last=False)
+                gl.glDeleteTextures([self._textures.pop(old)])
+        return texture
+
+    def _sprite_image(self, table, row, camera_pos=None):
+        from engine.monster_facing import sprite_keys_for_view
+        key = sprite_keys_for_view(table, [row], camera_pos)[0]
+        recipe = table.sprite_recipes()[int(key)]
+        package = self._scene.get('package')
+        for _, filename, folder, _ in recipe or ():
+            if filename:
+                name = 'assets/'+folder.strip('/')+'/'+filename
+                if package and package.has_asset(name):
+                    return name
+        item = table.things[row]
+        return item.get_sprite_path() if hasattr(item, 'get_sprite_path') else ''
+
+    def _effect_texture(self, table, row):
+        from .projection import effect_image
+        name, elapsed, phase = effect_image(table, row)
+        if int(table.effect_type[row]) != 1:
+            return self._load_texture(name, elapsed, bool(table.effect_custom_loop[row]), phase), 1., (1,1,1,1)
+        import math
+        from engine.effect_entity import EXPLOSION_FRAME_COUNT as frames, explosion_cell_box
+        t = max(0., min(1., float(table.effect_elapsed[row])/max(.001,float(table.effect_lifetime[row]))))
+        skip = max(0., min(.9, float(table.effect_skip[row])))
+        t = skip + (1. - skip) * t                 # explosion_skip: start partway in
+        index = min(frames-1, int(t*frames))
+        key = name+'#explosion'+str(index)
+        if key not in self._images.cache:
+            atlas = self._images.frames(name)[0][0]
+            box = explosion_cell_box(index, atlas.width, atlas.height)
+            self._images.cache[key] = ([atlas.crop(box)], [.1])
+        q = max(0., min(1., t/.28)); growth = 1+2*q*q*(3-2*q)
+        fade = max(0., min(1., (t-.7)/.3)); alpha = 1-fade*fade*(3-2*fade)
+        strength = float(table.effect_params[row,1])*(1+math.exp(-t*t*48)*2.2)
+        tint = tuple((.65+.35*float(c))*strength for c in table.effect_color[row])+(alpha,)
+        return self._load_texture(key, 0), growth, tint
+
+    def render_scene(self, render_state) -> None:
+        import math
+        import numpy as np
+
+        state = render_state or {}
+        world = self._scene.get('world')
+        if world:
+            from engine.change_journal import JOURNAL, OVERFLOW, STATE
+            changes = JOURNAL.drain(self)
+            brush_ids = {id(b) for b in world.brushes if not (b.get('is_mover') or b.get('is_door'))}
+            if changes is OVERFLOW or any(oid in brush_ids and flags & STATE for oid, flags in changes.items()) or tuple(id(t) for t in world.state.things) != self._entity_ids:
+                self._upload_scene()
+            from .projection import lights
+            table = self._projection.update(world)
+            distance = world.logic.render_runtime.view_distance
+            horizon = distance.visual_horizon
+            if not distance.fog_enabled:
+                # With no radial fog, the far-plane corners are the furthest
+                # visible points, including wide landscape aspect ratios.
+                tangent = math.tan(math.radians(state.get('fov',70))*.5)
+                horizon = distance.far_plane * math.sqrt(1+tangent*tangent*(1+(self.width/self.height)**2))
+            self._lights = lights(table, state.get('cam_pos', (0,0,0)),
+                                  player_position=world.player.pos,
+                                  cutscene=bool(world.logic.cutscene_runtime.state),
+                                  visible_horizon=horizon)
+        from .visibility import CameraVisibility, environment
+        runtime = self._render_runtime()
+        distance = runtime.view_distance
+        gl = _gl()
+        self.shadows.eye = state.get('cam_pos', (0,0,0))
+        shadow_indices = self.shadows.prepare(self._lights, self._batches, self._draw_sources, self.width, self.height, self._bounds)
+        prog = self.programs["world"]
+        gl.glUseProgram(prog)
+        self.shadows.bind(prog, shadow_indices)
+        gl.glUniform1i(uniform_location(gl, prog, 'unlit'), 0)
+        eye = np.asarray(state.get("cam_pos", (0, 64, 0)), dtype=np.float32)
+        front = glmath.front_from_angles(state.get("cam_yaw", -90), state.get("cam_pitch", 0))
+        view = state.get("view", glmath.look_at(eye, eye + front))
+        projection = glmath.perspective(math.radians(state.get("fov", 70)),
+                                        self.width/self.height, .5, distance.far_plane)
+        visibility = CameraVisibility(runtime, view, projection, eye)
+        env = environment(distance, eye)
+        _set_environment(gl, prog, env)
+        _set_mat4(gl, prog, "view", view)
+        _set_mat4(gl, prog, "projection", projection)
+        drawn = culled = 0
+        gl.glUniform1i(uniform_location(gl, prog, "lightCount"), len(self._lights))
+        self.light_buffer.upload(self._lights, shadow_indices)
+        gl.glActiveTexture(gl.GL_TEXTURE0)
+        gl.glUniform1i(uniform_location(gl, prog, "diffuse"), 0)
+        ordered = sorted(self._batches, key=lambda b: (self._draw_sources.get(b[0], ('',))[0] in ('sprite','effect'),
+                         (-sum((float(self._draw_sources[b[0]][1].pos[i])-eye[i])**2 for i in range(3))
+                          + (0.001 if self._draw_sources[b[0]][1].properties.get('_sprite_overlay') else 0))
+                         if self._draw_sources.get(b[0], ('',))[0] in ('sprite','effect') else self._texture_names[b[0]]))
+        last_state = last_lights = last_texture = None
+        max_batch_lights = 0
+        surfaces_drawn = False
+        water_draws = 0
+        decal_draws = 0
+
+        def draw_surfaces():
+            nonlocal decal_draws
+            # Terrain belongs in the scene capture; transparent billboards
+            # follow water so foreground effects remain in front of it.
+            if world and world.terrain and self._terrain_gl is not None:
+                import glm
+                camera = glm.vec3(*eye)
+                # Streaming, LOD and chunk building, then the immutable frame
+                # the GL side draws (engine/terrain_frame.py).
+                world.terrain.advance(camera, visibility.planes)
+                self._terrain_gl.render(
+                    world.terrain.publish(),
+                    glm.mat4(*projection.T.flatten()), glm.mat4(*view.T.flatten()), camera,
+                    frustum_planes=visibility.planes, env_uniforms=env)
+            # Decals lie on everything opaque -- brushes, models, terrain --
+            # and under water and the billboards drawn after it.
+            if self.decals is not None:
+                decal_draws = self.decals.render(view, projection, eye, self._frame_decals,
+                                                 self.width, self.height, self._target)
+            import time
+            return self.water.render(view, projection, eye, visibility, env, self._lights,
+                                     time.perf_counter()-self._start_time, self.width, self.height)
+
+        for vao, vbo, texture, count in ordered:
+            source = self._draw_sources.get(vao)
+            model = glmath.identity()
+            tint = self._tints[vao]
+            transparent = bool(source and source[0] in ('sprite', 'effect'))
+            if transparent and not surfaces_drawn:
+                water_draws = draw_surfaces()
+                surfaces_drawn = True
+                gl.glUseProgram(prog)
+                gl.glActiveTexture(gl.GL_TEXTURE0)
+                last_state = last_lights = last_texture = None
+            if source and source[0] != 'static':
+                kind, item, origin = source
+                if kind == 'brush':
+                    if item.get('hidden'):
+                        continue
+                    model = glmath.translate(*(item['pos'][i] - origin[i] for i in range(3)))
+                else:
+                    if item.properties.get('hidden') or getattr(item, 'collected', False):
+                        continue
+                    if kind in ('sprite', 'effect'):
+                        row = origin
+                        width, height = table.sprite_size[row]
+                        position = np.array(table.pos[row], dtype=float)
+                        if kind == 'effect':
+                            # PARTICLES (family 4) is an emitter alone, which
+                            # this renderer does not draw.
+                            if (not table.effect_alive[row]
+                                    or int(table.effect_type[row]) == 4):
+                                continue
+                            growth = 1.
+                            if int(table.effect_type[row]) == 1:
+                                t = max(0., min(1., float(table.effect_elapsed[row])/max(.001,float(table.effect_lifetime[row]))))
+                                q = max(0., min(1., t/.28))
+                                growth = 1+2*q*q*(3-2*q)
+                            width, height = width*growth, height*growth
+                            if int(table.effect_type[row]) == 1:
+                                position[1] += height*.5
+                        else:
+                            tint = (1,1,1,float(table.render_alpha[row]))
+                        view = state.get('view', glmath.look_at(eye, eye + front))
+                        yaw = float(table.sprite_fixed_yaw[row])
+                        right, up = view[0,:3], view[1,:3]
+                        if yaw > -9999:
+                            right, up = np.array((math.cos(yaw),0,-math.sin(yaw))), np.array((0,1,0))
+                        model[:3, 0] = right * width
+                        model[:3, 1] = up * height
+                        model[:3, 2] = np.cross(right, up)
+                        model[:3, 3] = position
+                    else:
+                        model = glmath.entity_matrix(item.pos, item.properties)
+            if source and source[0] == 'static':
+                # Retain a cell if any authored brush centre is in range; the
+                # merged AABB centre may lie beyond the distance boundary.
+                centers = source[1]
+                offset = centers[:,(0,2)] - eye[[0,2]]
+                position = centers[np.argmin(np.sum(offset*offset,axis=1))]
+            else:
+                position = (source[1]['pos'] if source[0] == 'brush' else source[1].pos) if source else self._bounds[vao][0]
+            if not visibility.visible(self._bounds[vao], model, position):
+                culled += 1
+                continue
+            if transparent:
+                if source[0] == 'effect':
+                    texture, _, tint = self._effect_texture(table, origin)
+                else:
+                    texture = self._load_texture(self._sprite_image(table, origin, eye))
+            else:
+                texture = self._load_texture(self._texture_names[vao])
+            draw_state = (transparent, vao in self._static_vaos or bool(source and source[0] == 'brush'))
+            if draw_state != last_state:
+                gl.glUniform1i(uniform_location(gl, prog, 'unlit'), int(transparent))
+                gl.glDepthMask(not transparent)
+                if transparent:
+                    gl.glEnable(gl.GL_BLEND)
+                    gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+                else:
+                    gl.glDisable(gl.GL_BLEND)
+                if draw_state[1]:
+                    gl.glEnable(gl.GL_CULL_FACE)
+                    gl.glFrontFace(gl.GL_CCW)
+                    gl.glCullFace(gl.GL_BACK)
+                else:
+                    gl.glDisable(gl.GL_CULL_FACE)
+                last_state = draw_state
+            if self.quality.lights_per_batch < MAX_LIGHTS_PLAYER:
+                from .lighting import batch_lights
+                center, half = self._bounds[vao]
+                chosen = () if transparent else batch_lights(self._lights, model[:3,:3] @ center + model[:3,3],
+                            np.abs(model[:3,:3]) @ half, self.quality.lights_per_batch)
+                max_batch_lights = max(max_batch_lights, len(chosen))
+                if chosen != last_lights:
+                    gl.glUniform1i(uniform_location(gl, prog, 'lightCount'), len(chosen))
+                    if chosen:
+                        gl.glUniform1iv(uniform_location(gl, prog, 'lightIndices'), len(chosen), np.asarray(chosen, dtype=np.int32))
+                    last_lights = chosen
+            drawn += 1
+            _set_mat4(gl, prog, 'model', model)
+            gl.glUniform4f(uniform_location(gl, prog, 'tint'), *tint)
+            if texture != last_texture:
+                gl.glBindTexture(gl.GL_TEXTURE_2D, texture)
+                last_texture = texture
+            gl.glBindVertexArray(vao)
+            gl.glDrawArrays(gl.GL_TRIANGLES, 0, count)
+        # Finish opaque state before the surface passes when there were no
+        # billboards to trigger them inside the ordered loop.
+        gl.glDepthMask(True)
+        gl.glDisable(gl.GL_BLEND)
+        gl.glDisable(gl.GL_CULL_FACE)
+        gl.glBindVertexArray(0)
+        if not surfaces_drawn:
+            water_draws = draw_surfaces()
+        billboards = self._draw_billboards(state.get('billboards', ()), prog, view, eye)
+        self.frame_stats = {'drawn_batches': drawn, 'culled_batches': culled,
+                            'billboards': billboards,
+                            'water_brushes': water_draws,
+                            'decals': decal_draws,
+                            'decals_culled': self.decals.culled if self.decals else 0,
+                            'view_distance': distance.effective_distance,
+                            'fog_start': env['uFogStart'], 'fog_end': env['uFogEnd'],
+                            'lights': len(self._lights), 'shadow_lights': len(shadow_indices),
+                            'max_batch_lights': max_batch_lights if self.quality.lights_per_batch < MAX_LIGHTS_PLAYER else len(self._lights),
+                            **self.shadows.stats,
+                            'effect_batches': sum(1 for source in self._draw_sources.values()
+                                                  if source[0] == 'effect')}
+        gl.glDepthMask(True)
+        gl.glDisable(gl.GL_BLEND)
+        gl.glDisable(gl.GL_CULL_FACE)
+        gl.glBindVertexArray(0)
+        import time
+        brushes = world.brushes if world else self._scene['map'].get('brushes',[])
+        self.frame_stats['fog_volumes'] = self.fog_volumes.render(
+            brushes, view, projection, eye, visibility, time.perf_counter()-self._start_time)
+
+    def render_ui(self, state, width, height, has_world=True):
+        import ctypes
+        import numpy as np
+        from PIL import Image
+        from ..menu import root_page
+
+        gl = _gl()
+        page = state.get('menu') or root_page(has_world)
+        key = (tuple(state.get('game_hud', {}).items()), state.get('hud', ''), state.get('paused', False),
+               width, height, has_world, state.get('control_buttons', ()),
+               page if state.get('paused') else None, state.get('plugin_ui_key'))
+        if key != self._ui_key:
+            self._ui_key = key
+            image = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+            if state.get('paused'):
+                paint_menu(image, page)
+            else:
+                paint_hud(image, state, self._images)
+            if self._ui_texture:
+                gl.glDeleteTextures([self._ui_texture])
+            self._ui_texture = gl.glGenTextures(1)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, self._ui_texture)
+            from .assets import upload_rgba
+            upload_rgba(gl, image)
+            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
+            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
+        if self._ui_vao is None:
+            self._ui_vao = gl.glGenVertexArrays(1)
+            self._ui_vbo = gl.glGenBuffers(1)
+            vertices = np.array([[x, y, 0, 0, 0, 1, x, y]
+                                 for x, y in ((0, 0), (1, 0), (1, 1), (0, 0), (1, 1), (0, 1))], dtype=np.float32)
+            gl.glBindVertexArray(self._ui_vao)
+            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._ui_vbo)
+            gl.glBufferData(gl.GL_ARRAY_BUFFER, vertices.nbytes, vertices, gl.GL_STATIC_DRAW)
+            for attribute, count, offset in ((0, 3, 0), (1, 3, 12), (2, 2, 24)):
+                gl.glVertexAttribPointer(attribute, count, gl.GL_FLOAT, gl.GL_FALSE, 32, ctypes.c_void_p(offset))
+                gl.glEnableVertexAttribArray(attribute)
+        prog = self.programs['world']
+        gl.glUseProgram(prog)
+        _set_mat4(gl, prog, 'model', glmath.scale(width, height, 1))
+        _set_mat4(gl, prog, 'view', glmath.identity())
+        _set_mat4(gl, prog, 'projection', glmath.ortho(0, width, height, 0))
+        gl.glUniform1i(uniform_location(gl, prog, 'unlit'), 1)
+        gl.glUniform1i(uniform_location(gl, prog, 'uFogEnabled'), 0)
+        gl.glDisable(gl.GL_CULL_FACE)
+        gl.glUniform4f(uniform_location(gl, prog, 'tint'), 1, 1, 1, 1)
+        gl.glUniform1i(uniform_location(gl, prog, 'lightCount'), 0)
+        gl.glActiveTexture(gl.GL_TEXTURE0)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self._ui_texture)
+        gl.glUniform1i(uniform_location(gl, prog, 'diffuse'), 0)
+        gl.glDisable(gl.GL_DEPTH_TEST)
+        gl.glEnable(gl.GL_BLEND)
+        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+        gl.glBindVertexArray(self._ui_vao)
+        gl.glDrawArrays(gl.GL_TRIANGLES, 0, 6)
+        gl.glBindVertexArray(0)
+        gl.glDisable(gl.GL_BLEND)
+        gl.glEnable(gl.GL_DEPTH_TEST)
+
+
+# ----------------------------------------------------------------------
+# Small uniform helpers (kept local so the module has no hard GL import)
+# ----------------------------------------------------------------------
+def _gl():
+    import OpenGL.GL as gl
+    return gl
+
+
+def _set_mat4(gl, prog, name, mat) -> None:
+    loc = uniform_location(gl, prog, name)
+    if loc != -1:
+        gl.glUniformMatrix4fv(loc, 1, gl.GL_FALSE, glmath.column_major(mat))
+
+
+def _set_vec3(gl, prog, name, vec) -> None:
+    loc = uniform_location(gl, prog, name)
+    if loc != -1:
+        gl.glUniform3f(loc, float(vec[0]), float(vec[1]), float(vec[2]))
+
+
+def _set_float(gl, prog, name, value) -> None:
+    loc = uniform_location(gl, prog, name)
+    if loc != -1:
+        gl.glUniform1f(loc, float(value))
+
+
+def _set_environment(gl, program, values):
+    for name, value in values.items():
+        if isinstance(value, int):
+            gl.glUniform1i(uniform_location(gl, program, name), value)
+        elif isinstance(value, float):
+            _set_float(gl, program, name, value)
+        else:
+            _set_vec3(gl, program, name, value)
+
+
+def paint_menu(image, page):
+    """Draw a pause-menu page; the same layout resolves taps (player.menu)."""
+    from PIL import ImageDraw, ImageFont
+    from ..menu import layout
+    width, height = image.size
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default(size=max(14, min(28, height // 28)))
+    small = ImageFont.load_default(size=max(12, min(22, height // 36)))
+    draw.rectangle((0, 0, width, height), fill=(10, 14, 22, 215))
+    placed = layout(page, width, height)
+    title_y = (placed[0][2][1] if placed else height * .3) - max(28, height * .06)
+    draw.text((width / 2, title_y), page.title, font=font, anchor='mm', fill='white')
+    fills = {'button': (45, 65, 90, 255), 'selected': (40, 120, 110, 255),
+             'field': (25, 32, 44, 255), 'disabled': (35, 40, 48, 255)}
+    for _, label, (x, y, w, h), style in placed:
+        if style == 'label':
+            draw.text((x + w / 2, y + h / 2), label, font=small, anchor='mm', fill=(200, 210, 220))
+            continue
+        draw.rounded_rectangle((x, y, x + w, y + h), radius=8, fill=fills.get(style, fills['button']),
+                               outline=(140, 160, 180, 255) if style != 'disabled' else (70, 75, 85, 255),
+                               width=2)
+        color = 'white' if style != 'disabled' else (120, 125, 135)
+        if style == 'field':
+            draw.text((x + 14, y + h / 2), label, font=font, anchor='lm', fill=color)
+        else:
+            draw.text((x + w / 2, y + h / 2), label, font=font, anchor='mm', fill=color)
+    if page.status:
+        draw.multiline_text((width / 2, height * .965), page.status, font=small, anchor='md',
+                            align='center', fill=(200, 210, 220))
+
+
+def paint_hud(image, state, images):
+    """The in-play HUD, plugin panels and touch-control labels."""
+    from PIL import ImageDraw, ImageFont
+    from .hud import paint
+    width, height = image.size
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default(size=max(14, min(28, height // 28)))
+    paint(image, state, images)
+    if not state.get('game_hud'):
+        draw.multiline_text((18, 14), state.get('hud', ''), font=font, fill='white')
+    if state.get('arena'):
+        from ..plugin_ui import scoreboard
+        scoreboard.paint(image, state['arena'], full=state.get('arena_full', False))
+    if state.get('bigworld'):
+        from ..plugin_ui import bigworld
+        bigworld.paint(image, state['bigworld'])
+    labels = {'weapon': 'Weapon', 'scores': 'Scores', 'restart': 'Restart'}
+    for action, x, y in state.get('control_buttons', ()):
+        draw.text((x * width, y * height), labels.get(action, action.title()), font=font, anchor='mm',
+                  fill='white', stroke_width=1, stroke_fill='black')

@@ -1,0 +1,1621 @@
+"""
+State Manager
+
+Manages all the data for the current level being edited, including:
+- Brushes (solid geometry)
+- Things (entities)
+- Undo/redo history
+- Serialization/deserialization with I/O connections
+"""
+
+import json
+import copy
+import datetime
+import uuid
+import threading
+from collections import deque
+from .things import PlayerStart, Thing
+from editor.things import update_all_counters_from_entities
+from engine import player_starts as start_rules
+from engine.row_list import row_list
+
+#: EditorState attributes that hold a row set (see EditorState.__setattr__).
+_ROW_SETS = frozenset(("brushes", "things"))
+
+# Import I/O system for serialization
+try:
+    from .io_system import OutputConnection, get_connections
+    IO_AVAILABLE = True
+except ImportError:
+    IO_AVAILABLE = False
+
+# Convex-brush geometry helpers (angled brushes & clipping).  NumPy-only, safe
+# to import head-less / off the GL thread.
+from engine.brush_geometry import (
+    GEO_RUNTIME_KEYS, clip_brush as _geo_clip_brush,
+    rotate_brush as _geo_rotate_brush, brush_has_geometry as _geo_has_geometry,
+    is_axis_aligned_box as _geo_is_box, drop_geometry as _geo_drop_geometry,
+)
+from engine.brush_faces import (
+    CANONICAL_MAP_VERSION, drop_tag_copies as _drop_tag_copies,
+    migrate_legacy as _migrate_legacy_faces)
+from engine.brush_placement import (
+    PLAY_STATE_KEYS as _PLAY_STATE_KEYS, RUNTIME_CACHE_KEYS as _PLACEMENT_CACHE_KEYS,
+    MAP_VERSION, drop_play_state as _drop_play_state, localise_legacy as _localise_legacy,
+    normalise_loaded as _normalise_placement, note_authored_change as _note_authored_change)
+
+# Keys written to brush dicts by the renderer/geometry layer at runtime.
+# They hold GLM/NumPy objects (not JSON-serialisable) and must be stripped
+# before any serialisation path: undo stack, file save, or deepcopy-for-JSON.
+# GEO_RUNTIME_KEYS covers the convex-geometry cache and mesh-collision data
+# attached to angled brushes during play.
+# Runtime-only AABB cache keys written by the physics/AI hot paths (see
+# engine.constants.brush_aabb_bounds). Stripped on save/undo like the rest.
+from engine.constants import AABB_RUNTIME_KEYS
+from engine.items import ITEM_IDS, ItemDefinitions
+from engine.view_filters import ViewFilters
+from engine.level_validation import validate_level
+
+_RENDERER_PRIVATE_KEYS = frozenset({
+    '_mat_cache_key', '_mat_cache',      # model matrix cache (renderer)
+    '_nmat_cache_key', '_nmat_cache',    # normal matrix cache (renderer)
+    '_render_mesh', '_render_sig',       # angled-brush GPU mesh cache (renderer)
+}) | GEO_RUNTIME_KEYS | frozenset(AABB_RUNTIME_KEYS) | frozenset(_PLAY_STATE_KEYS) \
+    | frozenset(_PLACEMENT_CACHE_KEYS)
+# _PLAY_STATE_KEYS: what play used to write into a brush (original_pos,
+# _rot_angle, rotation_yaw). Since Stage 2b of the unified brush model play
+# writes none of them; a map or undo checkpoint never carries them.
+
+class _HistoryBase(str):
+    """The bottom entry of the undo stack after a load: where history begins.
+
+    Never restored -- undo keeps one entry and refuses to pop this one -- so
+    it holds no snapshot of the scene. Each load pushes its own instance, so
+    the editor's "has anything changed since" markers (which compare the top
+    entry by identity) tell one load from the next.
+    """
+
+    __slots__ = ()
+
+    def __new__(cls):
+        return super().__new__(cls, "")
+
+
+class _Checkpoint(str):
+    """An undo or redo entry: the scene as JSON, with the terrain paint
+    chunks held by reference beside it.
+
+    A painted chunk is a compressed blob of tens of kilobytes, and nearly
+    every checkpoint holds the same ones: only a paint stroke changes any.
+    Encoded into each entry's JSON, fifty entries held fifty copies. Here the
+    JSON names each chunk by its place in :attr:`blobs`, and entries share
+    the strings themselves (see :meth:`EditorState._history_entry`). Still a
+    ``str`` of JSON, so anything that reads an entry as one keeps working.
+    """
+
+    def __new__(cls, text, blobs=()):
+        entry = super().__new__(cls, text)
+        entry.blobs = tuple(blobs)
+        return entry
+
+
+#: The ``terrain_data`` lists of paint chunks (``{'coord', 'data'}``) whose
+#: ``data`` a checkpoint holds by reference, and the checkpoint key of each.
+_PAINT_HISTORY_KEYS = ('terrain_texture_paint', 'terrain_texture_paint_base')
+#: Where a checkpoint's paint chunk names its blob: ``[index, hash]``. The
+#: hash keeps two checkpoints with different paint from comparing equal.
+_BLOB_REF = '@blob'
+#: Shorter chunk data than this stays in the JSON: not worth a reference.
+_BLOB_MIN_CHARS = 256
+
+
+# Import lightmap bake state
+try:
+    from lightmap.bake_state import BakeState
+    LIGHTMAP_AVAILABLE = True
+except ImportError:
+    LIGHTMAP_AVAILABLE = False
+
+
+class EditorState:
+    """Manages all the data for the current level being edited."""
+
+    #: ``post_event(fn)`` runs *fn* once the UI event being handled has
+    #: finished. The main window installs one (a zero-delay timer); without a
+    #: UI event loop, edits are synchronous and nothing needs deferring.
+    post_event = None
+
+    #: What the undo history may hold, in bytes, before its oldest steps are
+    #: dropped (on top of the 50-step cap). A checkpoint is the whole scene:
+    #: 5.5 MB on a 20k-brush map, so fifty of them held about 270 MB.
+    UNDO_BYTE_BUDGET = 128 * 1024 * 1024
+    #: Undo steps kept whatever they cost, so a huge map still has a few.
+    UNDO_MIN_STEPS = 5
+
+    # The world's row sets, as RowLists (engine/row_list.py): a plain list
+    # assigned to ``brushes`` or ``things`` is taken as one, so the render
+    # and entity tables recognise an unchanged row set by its version
+    # instead of comparing every row each frame (M4). Assigning copies a
+    # plain list: keep using the attribute, not the list that was assigned.
+    # Only assignment is intercepted: the attributes stay plain, and reading
+    # them -- many times a tick -- costs what it always did.
+    def __setattr__(self, name, value):
+        if name in _ROW_SETS:
+            value = row_list(value)
+        object.__setattr__(self, name, value)
+
+    def __init__(self):
+        #: Coarse "something about the world changed" counter -- see
+        #: :meth:`mark_world_changed`.  Set before anything that bumps it can
+        #: run, because save_state() is reachable during construction.
+        self._render_dirty_lock = threading.RLock()
+        self.world_epoch = 0
+        # Object ids whose render-facing cold columns changed in the current
+        # editor transaction. _render_dirty_all is used for reload/undo,
+        # where the object identities themselves are replaced.
+        self._render_dirty_objects = set()
+        self._render_dirty_epoch_by_id = {}
+        self._render_dirty_all = False
+        self._render_dirty_all_epoch = -1
+        # Bounded replay history for double-buffered render projections.
+        self._render_dirty_history = deque(maxlen=32)
+        self.brushes = []
+        self.things = []
+        #: Big World maps keep only the cells near the editor camera live
+        #: (plugins/bigworld/editor_streaming.py); None for every other map.
+        self.editor_stream = None
+        # The multi-selection lives here rather than being bolted on by the
+        # main window, so undo/redo and scene loads can keep it pointing at
+        # objects that are actually in the scene.
+        self.selected_objects = []
+        #: Which kinds of object the editor shows (the Filter menu). View
+        #: state, never saved with the map; Play ignores it.
+        self.view_filters = ViewFilters()
+        #: What the item slots (gun1, gun2, custom1, custom2) are in this
+        #: world; the custom slots' definitions are saved with the map.
+        self.item_definitions = ItemDefinitions()
+        self.terrain_data = None
+        #: A callable that brings ``terrain_data`` up to date with the live
+        #: terrain, left by a tool that edits the terrain faster than it is
+        #: worth re-encoding it (sculpt dabs); see :meth:`defer_terrain_sync`.
+        self._terrain_sync = None
+        self._logic_graph_positions = {}  # Persisted node positions for the logic graph
+        self.created_at = ''              # ISO timestamp, set on first save
+        self.undo_stack = deque(maxlen=50)
+        self.redo_stack = []
+        # Every distinct paint blob the history holds, once (see
+        # _history_entry); rebuilt from the entries by _enforce_history_budget.
+        self._history_blobs = {}
+        #: What the history held at its last trim, in bytes (blobs once).
+        self.history_bytes = 0
+        # The redo branch the most recent save_state() cleared, so a checkpoint
+        # that guarded no change can be discarded without losing it.
+        self._discarded_redo = None
+
+        # Lightmap bake state — always present, even if baking is unavailable
+        self.bake_state = BakeState() if LIGHTMAP_AVAILABLE else None
+
+        # Initial empty state for the undo stack
+        self.save_state()
+
+    # =========================================================================
+    # LIGHTMAP HELPERS
+    # =========================================================================
+
+
+    def mark_render_dirty(self, *objects) -> None:
+        """Mark specific objects whose render-facing cold state changed."""
+        with self._render_dirty_lock:
+            if self._render_dirty_all:
+                # The global invalidation already covers every row, but remember
+                # the later epoch so a frame snapshot cannot consume an edit that
+                # happened after it was captured.
+                self._render_dirty_all_epoch = self.world_epoch
+                return
+            epoch = self.world_epoch
+            for obj in objects:
+                if obj is not None:
+                    obj_id = id(obj)
+                    self._render_dirty_objects.add(obj_id)
+                    self._render_dirty_epoch_by_id[obj_id] = epoch
+
+    def render_dirty_snapshot(self):
+        """Capture the render dirtiness and its epoch as one frame boundary."""
+        with self._render_dirty_lock:
+            if self._render_dirty_all:
+                dirty = None
+            else:
+                dirty = set(self._render_dirty_objects)
+            return self.world_epoch, dirty
+
+    def render_dirty_since(self, epoch, through_epoch=None):
+        """Return precise render dirtiness newer than *epoch*.
+
+        Each double-buffered render projection has its own last-published epoch.
+        The live frame journal is consumed after publication, so a second
+        projection needs replayable history rather than the already-cleared set.
+        A bounded history is sufficient for the alternating render buffers; if
+        a consumer falls behind it, return None for a safe global rebuild.
+        """
+        with self._render_dirty_lock:
+            current = self.world_epoch
+            limit = current if through_epoch is None else min(current, int(through_epoch))
+            if epoch is None:
+                return limit, None
+            epoch = int(epoch)
+            if epoch >= limit:
+                return limit, set()
+            history = getattr(self, "_render_dirty_history", ())
+            if not history:
+                return limit, None
+            oldest_epoch = history[0][0]
+            if epoch < oldest_epoch - 1:
+                return limit, None
+            dirty = set()
+            for change_epoch, objects in history:
+                if change_epoch <= epoch:
+                    continue
+                if change_epoch > limit:
+                    break
+                if objects is None:
+                    return limit, None
+                dirty.update(objects)
+            return limit, dirty
+
+    def clear_render_dirty(self, snapshot=None) -> None:
+        """Consume only render dirtiness covered by a previously captured snapshot."""
+        with self._render_dirty_lock:
+            if snapshot is None:
+                # Backward-compatible immediate consume for callers that do not
+                # participate in the frame-boundary protocol.
+                self._render_dirty_objects.clear()
+                self._render_dirty_epoch_by_id.clear()
+                self._render_dirty_all = False
+                self._render_dirty_all_epoch = -1
+                return
+
+            cutoff_epoch, _dirty = snapshot
+
+            # A later global invalidation belongs to a later frame and must survive.
+            if (self._render_dirty_all
+                    and self._render_dirty_all_epoch <= cutoff_epoch):
+                self._render_dirty_all = False
+                self._render_dirty_all_epoch = -1
+
+            # A row dirtied again after the snapshot has a later epoch and must not
+            # be consumed by this frame. This also handles the same object being
+            # edited twice across the snapshot boundary.
+            for obj_id in tuple(self._render_dirty_objects):
+                if self._render_dirty_epoch_by_id.get(obj_id, cutoff_epoch) <= cutoff_epoch:
+                    self._render_dirty_objects.discard(obj_id)
+                    self._render_dirty_epoch_by_id.pop(obj_id, None)
+
+    def mark_world_changed(self, objects=None) -> None:
+        """Bump the world revision and journal the affected render rows.
+
+        objects is the precise editor transaction path. A bare call remains
+        the conservative global invalidation used by external callers/tests.
+
+        A derived structure that resolves expensive per-object data -- the
+        renderer's dense projection above all -- has to know when to re-resolve
+        it without inspecting every object every frame.  This counter is that
+        signal: monotonic, one integer, and cheap enough to compare per frame.
+
+        It is bumped from three places, all of them here, so nothing outside
+        this module has to remember to call it:
+
+        * :meth:`save_state`, which every tool calls at the start of a gesture;
+        * :meth:`_invalidate_entity_caches`, which undo, redo, load and clear
+          go through;
+        * :meth:`mark_lighting_dirty`, which is what a tool holding one undo
+          checkpoint open across a burst of edits calls per edit -- the Surface
+          Inspector being the one that does.
+
+        Deliberately coarse.  It says *something* changed, not what; a consumer
+        that wants to be finer-grained tracks its own per-row dirty set on top.
+        """
+        # Readers caching derived bounds (collision rows, the physics grid's
+        # rows) check this stamp instead of looking at every mover per query.
+        _note_authored_change()
+        with self._render_dirty_lock:
+            self.world_epoch += 1
+            if objects is None or not objects:
+                self._render_dirty_objects.clear()
+                self._render_dirty_epoch_by_id.clear()
+                self._render_dirty_all = True
+                self._render_dirty_all_epoch = self.world_epoch
+                self._render_dirty_history.append((self.world_epoch, None))
+            else:
+                object_ids = frozenset(id(obj) for obj in objects if obj is not None)
+                self._render_dirty_history.append((self.world_epoch, object_ids))
+                self.mark_render_dirty(*objects)
+
+    def mark_lighting_dirty(self, objects=None) -> None:
+        """
+        Call whenever static geometry or static lights change so the next
+        Play automatically triggers a rebake.
+
+        Safe to call even when the lightmap system is unavailable.
+        """
+        # A tool that holds one undo checkpoint open across a burst of edits
+        # (the Surface Inspector) calls this per edit, so it is the signal that
+        # catches what save_state alone would miss.
+        if objects is None:
+            objects = self.selected_objects
+        self.mark_world_changed(objects)
+        if self.bake_state is not None:
+            self.bake_state.mark_dirty()
+
+    def get_static_brushes(self) -> list:
+        """Return the subset of brushes that participate in lightmap baking."""
+        return [b for b in self.brushes if b.get('lightmap_static', False)]
+
+    def mark_brush_static(self, brush: dict, static: bool) -> None:
+        """
+        Set or clear the lightmap_static flag on a single brush and mark the
+        bake dirty so the change is picked up on the next Play.
+        """
+        if brush.get('lightmap_static') == static:
+            return  # no change
+        brush['lightmap_static'] = static
+        self.mark_lighting_dirty([brush])
+
+    def count_static_brushes(self) -> int:
+        return sum(1 for b in self.brushes if b.get('lightmap_static', False))
+
+    # =========================================================================
+    # ANGLED BRUSHES  (convex geometry / clipping)
+    # =========================================================================
+
+    def brush_is_angled(self, brush: dict) -> bool:
+        """True if a brush carries convex geometry (i.e. has been clipped/angled)."""
+        return _geo_has_geometry(brush)
+
+    def clip_brush(self, brush: dict, normal, offset, keep_positive=False,
+                   texture=None, uv_scale=None) -> bool:
+        """Cut ``brush`` with a plane, turning it into an angled brush.
+
+        ``normal``/``offset`` define the plane ``dot(normal, p) == offset``; the
+        kept half is the inside (``<= offset``) side unless ``keep_positive``.
+        Pushes an undo state and returns ``True`` on success (``False`` and no
+        change if the cut would empty the brush).
+        """
+        self.save_state()
+        if _geo_clip_brush(brush, normal, offset, keep_positive=keep_positive,
+                           texture=texture, uv_scale=uv_scale):
+            self.mark_lighting_dirty([brush])
+            return True
+        # Nothing changed -> discard the undo snapshot we just pushed.
+        self.discard_last_checkpoint()
+        return False
+
+    def rotate_brush(self, brush: dict, angle_deg, axis, pivot=None) -> bool:
+        """Rotate ``brush`` about ``pivot`` (default: its centre), making it angled."""
+        self.save_state()
+        if _geo_rotate_brush(brush, angle_deg, axis, pivot=pivot):
+            self.mark_lighting_dirty([brush])
+            return True
+        self.discard_last_checkpoint()
+        return False
+
+    def reset_brush_to_box(self, brush: dict) -> None:
+        """Drop convex geometry, returning the brush to its axis-aligned box form."""
+        if not _geo_has_geometry(brush):
+            return
+        self.save_state()
+        # Tagged faces keep their material (it moves back to the per-tag
+        # dicts); the plane set and its caches go.
+        _geo_drop_geometry(brush)
+        self.mark_lighting_dirty([brush])
+
+    def simplify_brush_geometry(self, brush: dict) -> None:
+        """If a geometry brush is really an axis-aligned box, drop to pos/size."""
+        if _geo_has_geometry(brush) and _geo_is_box(brush):
+            _geo_drop_geometry(brush)
+
+    # =========================================================================
+    # SCENE MANAGEMENT
+    # =========================================================================
+
+    def edited_objects(self) -> tuple:
+        """The objects an editor tool may be writing in place right now.
+
+        A drag, a nudge or a component edit changes the selection for many
+        frames after one undo checkpoint, writing the dicts directly; the
+        render projection re-reads these rows every frame instead of every
+        row. Safe to call from the logic thread: the lists are copied.
+        """
+        return tuple(self.selected_objects)
+
+    def _invalidate_entity_caches(self):
+        """Tell anything caching per-object data that the objects are changing.
+
+        Undo, redo and loading a map all replace the brush dicts and Thing
+        instances rather than editing them, so a cache keyed on an object's
+        identity or contents cannot see it happen and would go on showing the
+        entities that used to be there.
+        """
+        with self._render_dirty_lock:
+            self._render_dirty_objects.clear()
+            self._render_dirty_epoch_by_id.clear()
+            self._render_dirty_all = True
+            self._render_dirty_all_epoch = self.world_epoch
+            self.mark_world_changed()
+        self._bump_io_revision()
+
+    @staticmethod
+    def _bump_io_revision():
+        if IO_AVAILABLE:
+            try:
+                from .io_system import bump_io_revision
+                bump_io_revision()
+            except ImportError:      # pragma: no cover - I/O system optional
+                pass
+
+    def clear_scene(self):
+        """Resets the scene to an empty state."""
+        from plugins.manager import get_manager
+        self.editor_stream = None
+        get_manager().disable_auto_enabled()
+        self.brushes.clear()
+        self.things.clear()
+        self._invalidate_entity_caches()
+        self.selected_objects = []
+        self.terrain_data = None
+        self._terrain_sync = None           # it was the old terrain's
+        self.view_filters.load_level_data({})
+        self.item_definitions.reset()
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.mark_lighting_dirty()
+        self.save_state()
+
+    def set_item_definition(self, item_id, definition):
+        """Redefine custom item slot *item_id* and re-sync the Props it shows on.
+
+        Raises ``engine.items.ItemDefinitionError`` if *definition* does not
+        compile; nothing changes then. Checkpoint first (``save_state``) to make
+        the change undoable.
+        """
+        self.item_definitions.set_custom(item_id, definition)
+        self.sync_item_props()
+
+    def sync_item_props(self):
+        """Point every item pickup's world sprite at its item's definition.
+
+        A Prop that gives an item shows that item: it references the item by
+        id (``collect_item``) and its sprite follows the definition. Returns the
+        Props that changed.
+        """
+        changed = []
+        for thing in self.things:
+            props = getattr(thing, 'properties', None)
+            if (not isinstance(props, dict) or props.get('type') != 'prop'
+                    or not props.get('collect_enabled')
+                    or props.get('collect_type') != 'item'):
+                continue
+            item_id = props.get('collect_item')
+            if item_id not in ITEM_IDS:
+                continue
+            sprite = self.item_definitions.definition(item_id).get('world_sprite')
+            if sprite and props.get('sprite_path') != sprite:
+                props['sprite_path'] = sprite
+                changed.append(thing)
+        if changed:
+            self.mark_world_changed(changed)
+        return changed
+
+    # -- PlayerStarts ---------------------------------------------------------
+
+    def player_starts(self):
+        return [t for t in self.things if isinstance(t, PlayerStart)]
+
+    def resolve_player_start(self, name=None):
+        """The PlayerStart to spawn at: the one named *name*, else the primary.
+
+        None if there is no such start; a missing named start is never
+        replaced by another.
+        """
+        starts = self.player_starts()
+        position = start_rules.pick_start([s.properties for s in starts], name or None)
+        return starts[position] if position is not None else None
+
+    def settle_player_starts(self):
+        """Hold this level's PlayerStarts to the primary invariant.
+
+        The first PlayerStart created in a level becomes primary, later ones
+        do not, a copy of the primary is not, and deleting the primary promotes
+        the earliest-created remaining start (see
+        :func:`engine.player_starts.settle`). The editor runs this after every
+        operation, so it lands in that operation's undo step. Returns the
+        starts that changed.
+        """
+        starts = self.player_starts()
+        changed = [starts[i] for i in start_rules.settle([s.properties for s in starts])]
+        if changed:
+            self.mark_world_changed(changed)
+        return changed
+
+    def set_primary_player_start(self, start):
+        """Make *start* this level's primary PlayerStart, and no other.
+
+        Checkpoint first (``save_state``) to make the change undoable.
+        """
+        changed = []
+        for other in self.player_starts():
+            primary = other is start
+            if other.properties.get('primary') is not primary:
+                other.properties['primary'] = primary
+                changed.append(other)
+        if changed:
+            self.mark_world_changed(changed)
+        return changed
+
+    def defer_terrain_sync(self, sync):
+        """*sync()* will copy the live terrain into ``terrain_data``; it is
+        run before anything reads the scene to keep it (a save, an autosave,
+        an undo checkpoint), or when the tool calls :meth:`sync_terrain`.
+
+        A sculpt dab used to re-encode the whole terrain into
+        ``terrain_data`` every time; now a stroke does it once, at its end,
+        and nothing that keeps the scene can see it out of date.
+        """
+        self._terrain_sync = sync
+
+    def sync_terrain(self):
+        """Run a deferred terrain sync, if one is pending."""
+        sync, self._terrain_sync = self._terrain_sync, None
+        if sync is not None:
+            sync()
+
+    def get_level_data(self):
+        """Serializes the current scene state into a dictionary."""
+        self.sync_terrain()
+        data = {
+            # 3: stable entity IDs and logic graph layout. 4: one material
+            # record per brush face (engine.brush_faces.CANONICAL_MAP_VERSION).
+            # 5: an angled brush's planes in its local frame, placed by its
+            # pos; its size is a copy, re-derived from the planes on load
+            # (engine.brush_placement.MAP_VERSION).
+            'version': MAP_VERSION,
+            'brushes': self._serialize_brushes(),
+            # Cutscene Wizard actors are live authoring entities. Their actual
+            # definitions live in the cutscene JSON and must never leak into
+            # the map when the user saves while the modeless wizard is open.
+            'things': [
+                t.to_dict() for t in self.things
+                if not bool(getattr(t, 'properties', {}).get('_cutscene_temporary'))
+            ]
+        }
+        if self.editor_stream is not None and not self.editor_stream.suspended:
+            self.editor_stream.merge(data['brushes'], data['things'])
+            data.update(self.editor_stream.all_data())
+            data['things'] = [r for r in data['things']
+                              if not r.get('properties', {}).get('_cutscene_temporary')]
+
+        # When this map was first written. Set once and carried forward on every
+        # later save, so it means "created" and not "saved most recently" — the
+        # file's own mtime already answers the second question.
+        if not getattr(self, 'created_at', ''):
+            self.created_at = datetime.datetime.now().isoformat(timespec='seconds')
+        data['created'] = self.created_at
+
+        # The custom item slots, where this world redefines them.
+        items = self.item_definitions.to_level_data()
+        if items:
+            data['items'] = items
+
+        # Include terrain data if present
+        if self.terrain_data:
+            data['terrain_data'] = self.terrain_data
+
+        # Visgroups and the cordon (Visgroups & Cordon window), when used.
+        filters = self.view_filters
+        if filters.visgroups or filters.cordon.enabled:
+            live = {str(b.get('id')) for b in data['brushes'] if b.get('id')}
+            live |= {str(t.get('properties', {}).get('id')) for t in data['things']
+                     if t.get('properties', {}).get('id')}
+            data.update(filters.to_level_data(live))
+
+        # Persist the scene hash so we can skip a rebake on reload
+        if self.bake_state is not None and self.bake_state.scene_hash:
+            data['lightmap_scene_hash'] = self.bake_state.scene_hash
+
+        # Persist logic graph node positions (if the window has been opened)
+        graph_positions = self._collect_logic_graph_positions()
+        if graph_positions:
+            data['logic_graph'] = {'node_positions': graph_positions}
+
+        return data
+
+    def stream_editor_camera(self, position, *, force=False):
+        """Publish camera-local cells; keep selected objects resident during edits."""
+        stream = self.editor_stream
+        if stream is None or stream.suspended or stream.whole_world:
+            return False
+        changed = stream.epoch != self.world_epoch
+        if not force and not changed and stream.same_cell(position):
+            return False
+        self.ensure_entity_ids()
+        stream.merge(self._serialize_brushes(), [t.to_dict() for t in self.things])
+        if changed:
+            from plugins.bigworld.config import config_from_properties
+            settings = next((t for t in self.things
+                             if t.properties.get('type') == 'bigworldsettings'), None)
+            cfg = config_from_properties(settings.properties) if settings else None
+            if cfg is None or not cfg['enabled'] or not cfg['editor_streaming']:
+                self.materialize_editor_world()
+                self.editor_stream = None
+                return True
+            stream.config = cfg
+            stream.manager.activation_radius = cfg['activation_radius']
+            stream.manager.deactivation_radius = cfg['deactivation_radius']
+            stream.reindex()
+        pinned = [self.get_entity_id(obj) for obj in self.selected_objects]
+        self._adopt_stream_records(stream.local_data(position, pinned=pinned))
+        stream.remember_resident(self)
+        return True
+
+    def _adopt_stream_records(self, records):
+        """Make exactly *records* live, reusing objects that already are."""
+        brushes = {b['id']: b for b in self.brushes}
+        things = {t.properties['id']: t for t in self.things}
+        new_brushes = [brushes[r['id']] if r['id'] in brushes else
+                       self._deserialize_brushes([r])[0] for r in records['brushes']]
+        new_things = []
+        for record in records['things']:
+            identity = record['properties']['id']
+            thing = things[identity] if identity in things else Thing.from_dict(record)
+            if thing is not None:
+                new_things.append(thing)
+        self.brushes, self.things = new_brushes, new_things
+        self._invalidate_entity_caches()
+
+    def materialize_editor_world(self):
+        """Hand the complete authored world to the existing Play lifecycle."""
+        stream = self.editor_stream
+        if stream is None or stream.suspended:
+            return
+        stream.merge(self._serialize_brushes(), [t.to_dict() for t in self.things])
+        self._adopt_stream_records(stream.all_data())
+        stream.suspended = True
+        stream.remember_resident(self)
+
+    def set_editor_whole_world(self, shown, position):
+        """Switch residency without replacing objects or adding undo entries."""
+        stream = self.editor_stream
+        if stream is None or stream.whole_world == bool(shown):
+            return False
+        if shown:
+            self.materialize_editor_world()
+            stream.suspended = False
+            stream.whole_world = True
+        else:
+            stream.whole_world = False
+            self.stream_editor_camera(position, force=True)
+        return True
+
+    def _collect_logic_graph_positions(self):
+        """The logic graph's node positions, for the map file.
+
+        Read from ``_logic_graph_positions``, which the graph window keeps up to
+        date (see ``LogicGraphScene.store_positions``). It used to try to reach
+        the open window through ``self._logic_graph_win`` — but that attribute
+        lives on the *main window*, not here, so the lookup always missed and
+        every save fell back to whatever had been loaded from disk. Laid-out
+        graphs were never saved.
+
+        Having the graph push instead of this pulling also means the positions
+        are right whether the window is open, has been closed, or was never
+        opened at all.
+        """
+        return self._logic_graph_positions
+
+    def _serialize_brushes(self):
+        """Serialize brushes with I/O connections."""
+        serialized = []
+
+        for brush in self.brushes:
+            # Ensure every brush has a stable ID
+            if 'id' not in brush:
+                brush['id'] = str(uuid.uuid4())
+
+            brush_copy = brush.copy()
+
+            # Strip renderer-internal cache keys (GLM objects, not JSON-safe)
+            for k in _RENDERER_PRIVATE_KEYS:
+                brush_copy.pop(k, None)
+
+            # Handle I/O connections
+            if IO_AVAILABLE and '_io_connections' in brush:
+                connections = brush['_io_connections']
+                serialized_conns = []
+
+                for conn in connections:
+                    if hasattr(conn, 'to_dict'):
+                        serialized_conns.append(conn.to_dict())
+                    elif isinstance(conn, dict):
+                        serialized_conns.append(conn)
+
+                if serialized_conns:
+                    brush_copy['io_connections'] = serialized_conns
+
+                # Remove internal _io_connections from serialized data
+                if '_io_connections' in brush_copy:
+                    del brush_copy['_io_connections']
+
+            serialized.append(brush_copy)
+
+        return serialized
+
+    def _deserialize_brushes(self, brushes_data, yield_hook=None, legacy=False,
+                             world_planes=False):
+        """Deserialize brushes with I/O connections.
+
+        *legacy* is true for brush records from a map saved before the
+        canonical face layout (map ``version`` below
+        ``engine.brush_faces.CANONICAL_MAP_VERSION``): their angled brushes'
+        per-tag material copies are migrated onto the planes by the
+        precedence rule. Records from anywhere else are canonical already; a
+        stray per-tag copy on an angled brush is dropped, never consulted.
+        """
+        result = []
+
+        for index, brush_data in enumerate(brushes_data):
+            if yield_hook is not None and index % 64 == 0:
+                yield_hook()
+            brush = brush_data.copy()
+
+            # Backfill stable ID for legacy maps
+            if 'id' not in brush:
+                brush['id'] = str(uuid.uuid4())
+
+            # Play state an older build saved into the map (Stage 2b):
+            # dropped, a box saved mid-motion put back where it was authored.
+            _drop_play_state(brush)
+
+            # One material record per face (engine.brush_faces). Boxes are
+            # untouched; nothing in *brushes_data* is modified.
+            if 'geometry' in brush:
+                if legacy:
+                    _migrate_legacy_faces(brush)
+                else:
+                    _drop_tag_copies(brush)
+                # Before map version 5 an angled brush's planes are in world
+                # space: re-expressed in its local frame about their own
+                # centre, which becomes its pos (a stale pos/size copy cannot
+                # misplace it). From version 5 they are local already and
+                # only the size copy (not saved) is re-derived.
+                if world_planes:
+                    _localise_legacy(brush)
+                else:
+                    _normalise_placement(brush)
+
+            # Restore I/O connections
+            if IO_AVAILABLE and 'io_connections' in brush:
+                io_data = brush.pop('io_connections')
+                connections = [OutputConnection.from_dict(d) for d in io_data]
+                brush['_io_connections'] = connections
+            elif 'io_connections' in brush:
+                # Without I/O system, store as raw data
+                brush['_io_connections'] = brush.pop('io_connections')
+            else:
+                # Ensure _io_connections exists
+                brush['_io_connections'] = []
+
+            result.append(brush)
+
+        return result
+
+    @staticmethod
+    def _dedupe_loaded_ids(brushes, things):
+        """Give every object after the first that shares a UUID one of its own.
+
+        Maps written by older editors (whose clone copied the source's id) can
+        hold several brushes under one UUID. The id is the object's *name* --
+        undo re-points the selection by it, I/O aims by it, saves restore by
+        it and the render tables key their rows on it -- so a shared one makes
+        all of those pick an arbitrary member. The first holder keeps the id,
+        so connections already aimed at it stay aimed at the same object.
+        """
+        seen = set()
+        for brush in brushes:
+            bid = brush.get('id')
+            if bid in seen:
+                brush['id'] = bid = str(uuid.uuid4())
+            seen.add(bid)
+        for thing in things:
+            props = getattr(thing, 'properties', None)
+            if not isinstance(props, dict):
+                continue
+            tid = props.get('id')
+            if tid is None:
+                continue
+            if tid in seen:
+                props['id'] = tid = str(uuid.uuid4())
+            seen.add(tid)
+
+    @staticmethod
+    def is_legacy_face_layout(level_data):
+        """Whether *level_data* predates the canonical face layout (an angled
+        face's material on its plane only): map ``version`` below
+        ``CANONICAL_MAP_VERSION``, or no version at all."""
+        try:
+            version = int(level_data.get('version') or 0)
+        except (TypeError, ValueError):
+            version = 0
+        return version < CANONICAL_MAP_VERSION
+
+    @staticmethod
+    def is_world_plane_layout(level_data):
+        """Whether *level_data* stores angled brushes' planes in world space
+        (map ``version`` below ``engine.brush_placement.MAP_VERSION``, or no
+        version at all): loading localises them."""
+        try:
+            version = int(level_data.get('version') or 0)
+        except (TypeError, ValueError):
+            version = 0
+        return version < MAP_VERSION
+
+    @staticmethod
+    def validate_level_data(level_data):
+        """Raise ``ValueError`` if *level_data* is not shaped like a map.
+
+        Structural only, and cheap, so a caller can reject a document before
+        it clears the current scene (see :mod:`engine.level_validation`).
+
+        A map written by a newer Fio is refused too. Loading it anyway read
+        a layout this build does not know as the current one, and the next
+        save stamped it with this build's version -- so the newer build
+        would then migrate data that had already been mangled.
+        """
+        validate_level(level_data)
+        version = level_data.get('version') if isinstance(level_data, dict) else None
+        if (isinstance(version, int) and not isinstance(version, bool)
+                and version > MAP_VERSION):
+            raise ValueError(
+                f"this map was saved by a newer version of Fio (map format "
+                f"{version}; this build reads up to {MAP_VERSION})")
+
+    def load_from_data(self, level_data, *, yield_hook=None, save_undo=True,
+                       validated=False, stream_editor=False):
+        """Populates the scene from a dictionary.
+
+        ``yield_hook`` is an optional cooperative callback used by long-running
+        imports. Normal editor loads remain unchanged.
+
+        ``validated`` is for a caller that has itself just passed *level_data*
+        through :meth:`validate_level_data`, unchanged since -- opening a map
+        validates it before touching the open level -- so every brush and
+        entity is not checked a second time. Every other caller leaves it
+        False and the map is validated here.
+
+        ``stream_editor`` lets a Big World map keep only the cells around the
+        editor camera live (see :mod:`plugins.bigworld.editor_streaming`).
+        """
+        # Everything is parsed before the scene is touched: a malformed map
+        # raises here and leaves the current scene exactly as it was, rather
+        # than half of one map mixed with half of another.
+        if not validated:
+            self.validate_level_data(level_data)
+        stream = None
+        if stream_editor and any(
+                str(r.get('type', r.get('properties', {}).get('type', '')))
+                .replace('_', '').lower() == 'bigworldsettings'
+                for r in level_data.get('things', [])):
+            from plugins.bigworld.editor_streaming import EditorCellStream
+            stream = EditorCellStream.for_level(level_data)
+        legacy = self.is_legacy_face_layout(level_data)
+        world_planes = self.is_world_plane_layout(level_data)
+        if stream is not None:
+            # Every record of the streamed world is migrated now, resident or
+            # not, so a later save writes the canonical layout throughout:
+            # no play state (Stage 2b), and a legacy file's faces.
+            records = stream.records['brushes']
+            replaced = False
+            for identity, record in list(records.items()):
+                if any(key in record for key in _PLAY_STATE_KEYS):
+                    record = dict(record)
+                    _drop_play_state(record)
+                    records[identity] = record
+                    replaced = True
+                if legacy and 'geometry' in record:
+                    record = dict(record)
+                    _migrate_legacy_faces(record)
+                    records[identity] = record
+                if world_planes and 'geometry' in record:
+                    record = dict(record)
+                    _localise_legacy(record)
+                    records[identity] = record
+                    # Filed before this ran, reading world planes as local:
+                    # re-filed below from where it is.
+                    replaced = True
+            if replaced:
+                # A box saved mid-motion is back at its authored placement, an
+                # angled brush is in its local frame: file each at home.
+                stream.reindex()
+        local = stream.local_data() if stream is not None else level_data
+        brushes_data = local.get('brushes') or []
+        things_data = local.get('things') or []
+
+        # A streamed world's records were localised above; a plain map's are
+        # localised as they are deserialised.
+        new_brushes = self._deserialize_brushes(brushes_data, yield_hook=yield_hook,
+                                                legacy=legacy,
+                                                world_planes=world_planes and stream is None)
+        new_things = []
+        for index, t_data in enumerate(things_data):
+            if yield_hook is not None and index % 25 == 0:
+                yield_hook()
+            thing = Thing.from_dict(t_data)
+            if thing is not None:
+                new_things.append(thing)
+
+        self._dedupe_loaded_ids(new_brushes, new_things)
+
+        legacy_models = [t for t in new_things if getattr(t, '_legacy_model', False)]
+        if legacy_models:
+            try:
+                from editor.io_system import retarget_legacy_model_inputs
+                retarget_legacy_model_inputs(new_brushes + new_things, legacy_models)
+            except ImportError:
+                pass
+
+        # Linked portals share one active state; a map whose pairs disagree
+        # (authored before that rule) loads with them agreeing.
+        from editor.portal_links import normalize_portal_groups
+        normalize_portal_groups(new_things)
+
+        # Published before the invalidation, for the reason restore_state
+        # gives: a frame between the two must not rebuild the outgoing world.
+        self.brushes = new_brushes
+        self.things = new_things
+        self.editor_stream = stream
+        self._invalidate_entity_caches()
+
+        self.terrain_data = level_data.get('terrain_data', None)
+        self._terrain_sync = None           # it was the old terrain's
+        self.view_filters.load_level_data(level_data)
+        self.item_definitions.load(level_data.get('items'))
+        self.sync_item_props()
+        # A map from before PlayerStarts had an explicit primary (or one
+        # edited by hand) is held to the invariant here, once: its starts are
+        # numbered in file order and the first becomes primary, as it was the
+        # spawn before. Saved, the map then carries both explicitly.
+        self.settle_player_starts()
+        # Absent in maps written before this existed; the overview falls back to
+        # the file's own timestamps rather than inventing one.
+        self.created_at = level_data.get('created', '')
+
+        # Store logic graph positions for later use by the graph window
+        self._logic_graph_positions = {}
+        lg = level_data.get('logic_graph', {})
+        if isinstance(lg, dict):
+            positions = lg.get('node_positions', {})
+            if isinstance(positions, dict):
+                self._logic_graph_positions = positions
+
+        # ===== NEW: Reset class counters based on loaded entity names =====
+        update_all_counters_from_entities(self.brushes + self.things)
+        if stream is not None:
+            # Names counted across the whole world, loaded cells or not.
+            from types import SimpleNamespace
+            update_all_counters_from_entities(
+                list(stream.records['brushes'].values()) + [
+                    SimpleNamespace(properties=r['properties'])
+                    for r in stream.records['things'].values()])
+
+        self.selected_objects = []
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+
+        # Restore lightmap bake state
+        if self.bake_state is not None:
+            saved_hash = level_data.get('lightmap_scene_hash', '')
+            if saved_hash:
+                # The scene has a saved hash — treat as dirty until the bake
+                # system verifies the hash at Play time.  (Stage 5 feature.)
+                self.bake_state.scene_hash = saved_hash
+            # Always treat a freshly loaded scene as dirty so the bake runs
+            # at least once before the first Play in this session.
+            self.bake_state.mark_dirty()
+
+        from plugins.manager import get_manager
+        get_manager().auto_enable_for_map(level_data)
+
+        if save_undo:
+            # The history's base: the bottom of the undo stack is never
+            # restored (undo always keeps one entry), so it need not be a
+            # checkpoint of the map just loaded -- serializing and encoding the
+            # whole scene, the most costly step of a load on a big map. The
+            # first edit checkpoints the scene as it is then, as every edit
+            # does. What a checkpoint does besides snapshot is done here.
+            self._bump_io_revision()
+            self._discarded_redo = None
+            self.undo_stack.append(_HistoryBase())
+
+        if stream is not None:
+            stream.remember_resident(self)
+
+    def _selection_identifiers(self):
+        """Stable identifiers for the whole selection, for state restoration.
+
+        Every selected object is recorded in ``selected_objects``:
+        editor acts on ``selected_objects`` (component picking, the clip tool,
+        the Surface Inspector's "whole brush" scope, group transforms, delete),
+        so a restore that put back only the primary would leave the rest of the
+        selection pointing at objects that are no longer in the scene.
+
+        An object is identified by its position in its list *and* by its stable
+        id, and :meth:`_restore_selection` prefers the id — indices shift when a
+        state with a different object count is restored, ids do not.
+        """
+        selection = self._selection_list()
+        if not selection:
+            return []
+        # One pass to build the position lookups rather than a list.index() per
+        # selected object: save_state runs on every operation, and a big
+        # selection on a big map would otherwise make it quadratic. Keyed by
+        # identity, because two brushes can compare equal without being the
+        # same brush.
+        brush_at = {id(b): i for i, b in enumerate(self.brushes)}
+        thing_at = {id(t): i for i, t in enumerate(self.things)}
+
+        out = []
+        for obj in selection:
+            if isinstance(obj, dict):
+                index = brush_at.get(id(obj))
+                if index is not None:
+                    out.append(['brush', index, obj.get('id', '')])
+            else:
+                index = thing_at.get(id(obj))
+                if index is not None:
+                    out.append(['thing', index, obj.properties.get('id', '')])
+        return out
+
+    def _selection_list(self):
+        """Return the authoritative current selection without duplicates."""
+        selection = []
+        seen = set()
+        for obj in self.selected_objects:
+            identity = id(obj)
+            if identity not in seen:
+                seen.add(identity)
+                selection.append(obj)
+        return selection
+
+    def _restore_selection(self, identifiers):
+        """Re-point the selection at the objects the restore just rebuilt.
+
+        Undo and redo replace every brush dict and Thing rather than editing
+        them, so a selection held across one is a set of references to objects
+        that are no longer in the scene.  Anything that goes on using them edits
+        detached copies: the change appears to do nothing, and the detached
+        objects stay alive in whatever widget or cache is holding them.
+        """
+        if not identifiers:
+            self.selected_objects = []
+            return
+        # Same reasoning as _selection_identifiers: one pass to build the id
+        # lookups instead of scanning the scene once per selected object.
+        by_id = {'brush': {}, 'thing': {}}
+        for brush in self.brushes:
+            brush_id = brush.get('id')
+            if brush_id:
+                by_id['brush'].setdefault(brush_id, brush)
+        for thing in self.things:
+            thing_id = thing.properties.get('id')
+            if thing_id:
+                by_id['thing'].setdefault(thing_id, thing)
+
+        restored = []
+        seen = set()
+        for entry in identifiers:
+            kind, index, obj_id = (list(entry) + ['', -1, ''])[:3]
+            pool = self.brushes if kind == 'brush' else self.things
+            match = by_id.get(kind, {}).get(obj_id) if obj_id else None
+            if match is None and isinstance(index, int) and 0 <= index < len(pool):
+                match = pool[index]
+            if match is not None and id(match) not in seen:
+                seen.add(id(match))
+                restored.append(match)
+        self.selected_objects = restored
+
+    def snapshot(self):
+        """The scene as it stands right now, as a JSON checkpoint string.
+
+        Self-contained: :meth:`restore_state` needs nothing else to put it
+        back. The undo history stores :meth:`_history_entry` instead.
+        """
+        return json.dumps(self._checkpoint_data(), separators=(',', ':'),
+                          check_circular=False)
+
+    def _history_entry(self):
+        """The scene as an undo/redo entry: :meth:`snapshot`'s JSON, with
+        each terrain paint chunk's data held by reference (:class:`_Checkpoint`).
+
+        Equal blobs are one string, shared by every entry that holds them:
+        an unchanged chunk keeps its string from one checkpoint to the next,
+        and one re-encoded since (a restore rebuilds the terrain's paint) is
+        matched by content against the blobs the history already has.
+        """
+        checkpoint = self._checkpoint_data()
+        pool = self._history_blobs
+        blobs, slots = [], {}
+        for key in _PAINT_HISTORY_KEYS:
+            entries = checkpoint.get(key)
+            if not entries:
+                continue
+            for entry in entries:
+                data = entry.get('data')
+                if not isinstance(data, str) or len(data) < _BLOB_MIN_CHARS:
+                    continue
+                data = pool.setdefault(data, data)
+                slot = slots.get(id(data))
+                if slot is None:
+                    slot = slots[id(data)] = len(blobs)
+                    blobs.append(data)
+                del entry['data']
+                entry[_BLOB_REF] = [slot, hash(data)]
+        text = json.dumps(checkpoint, separators=(',', ':'), check_circular=False)
+        return _Checkpoint(text, blobs)
+
+    def _enforce_history_budget(self):
+        """Drop the oldest undo steps while the history holds more than
+        :attr:`UNDO_BYTE_BUDGET`, keeping at least :attr:`UNDO_MIN_STEPS`.
+
+        A shared paint blob is counted once, and only goes when the last
+        entry holding it does. Also rebuilds the blob pool from what is left,
+        so a blob no entry holds any more is not kept alive by it.
+        """
+        held = {}                   # id(blob) -> [blob, entries holding it]
+        total = 0
+        for entry in list(self.undo_stack) + list(self.redo_stack):
+            total += len(entry)
+            for blob in getattr(entry, 'blobs', ()):
+                ref = held.get(id(blob))
+                if ref is None:
+                    held[id(blob)] = [blob, 1]
+                    total += len(blob)
+                else:
+                    ref[1] += 1
+        # Undo needs one entry under the step it restores.
+        keep = max(1, int(self.UNDO_MIN_STEPS)) + 1
+        while total > self.UNDO_BYTE_BUDGET and len(self.undo_stack) > keep:
+            oldest = self.undo_stack.popleft()
+            total -= len(oldest)
+            for blob in getattr(oldest, 'blobs', ()):
+                ref = held[id(blob)]
+                ref[1] -= 1
+                if not ref[1]:
+                    total -= len(blob)
+                    del held[id(blob)]
+        self._history_blobs = {ref[0]: ref[0] for ref in held.values()}
+        self.history_bytes = total
+
+    def _checkpoint_data(self):
+        """The scene as a JSON-ready checkpoint dict (see :meth:`snapshot`)."""
+        self.sync_terrain()
+        terrain_csg = []
+        if isinstance(self.terrain_data, dict):
+            terrain_csg = [
+                list(cut) for cut in self.terrain_data.get('csg_subtractions', [])
+                if isinstance(cut, (list, tuple)) and len(cut) == 6
+            ]
+        terrain_texture_paint = []
+        if isinstance(self.terrain_data, dict):
+            entries = self.terrain_data.get('texture_paint', [])
+            if isinstance(entries, list):
+                terrain_texture_paint = [
+                    dict(entry) for entry in entries
+                    if isinstance(entry, dict)
+                    and len(entry.get('coord', [])) == 2
+                    and entry.get('data')
+                ]
+
+        terrain_paint_stamps = []
+        terrain_paint_base = []
+        if isinstance(self.terrain_data, dict):
+            terrain_paint_stamps = [
+                dict(stamp) for stamp in self.terrain_data.get('paint_stamps', [])
+                if isinstance(stamp, dict)
+            ]
+            terrain_paint_base = [
+                dict(entry) for entry in self.terrain_data.get('texture_paint_base', [])
+                if isinstance(entry, dict)
+            ]
+
+        checkpoint = {
+            'brushes': self._serialize_brushes_for_undo(),
+            'things': [t.to_dict() for t in self.things],
+            'selection': self._selection_identifiers(),
+            'terrain_csg_subtractions': terrain_csg,
+            'terrain_texture_paint': terrain_texture_paint,
+            'terrain_paint_stamps': terrain_paint_stamps,
+            'terrain_texture_paint_base': terrain_paint_base,
+            'items': self.item_definitions.to_level_data(),
+        }
+        stream = self.editor_stream
+        if stream is not None and not stream.suspended:
+            # Distant cells are part of the authored world, and of its history.
+            stream.merge(self._serialize_brushes(), checkpoint['things'])
+            checkpoint.update(stream.all_data())
+            checkpoint['editor_camera'] = stream.position
+            checkpoint['editor_whole_world'] = stream.whole_world
+        return checkpoint
+
+    def save_state(self):
+        """Checkpoint the scene *before* an operation changes it.
+
+        Every tool in Fio calls this at the start of a gesture, not the end, so
+        an entry on the undo stack is the state to go back *to* rather than a
+        record of what the scene now looks like.  :meth:`undo` therefore has to
+        capture the live scene itself — see the note there.
+        """
+        selected = tuple(self.selected_objects)
+        self.mark_world_changed(selected)
+        # A checkpoint is taken *before* the operation changes anything, so a
+        # render frame prepared in between consumes the journal entry while the
+        # objects still hold their old state. Journal them again once the UI
+        # event that is making the change has finished.
+        post_event = self.post_event
+        if post_event is not None and selected:
+            post_event(lambda: self.mark_world_changed(selected))
+        # The operation may add or delete a connection's source or target.
+        # The I/O reverse index keys on object counts and list identity, which
+        # a delete followed by a placement restores exactly, so it must be told.
+        self._bump_io_revision()
+        # Keep the redo branch we are about to drop, so an operation that turns
+        # out to change nothing can put it back (see discard_last_checkpoint).
+        self._discarded_redo = list(self.redo_stack)
+        self.undo_stack.append(self._history_entry())
+        self.redo_stack.clear()
+        self._enforce_history_budget()
+
+    def discard_last_checkpoint(self):
+        """Undo a :meth:`save_state` that turned out to guard no change.
+
+        Several tools push a checkpoint optimistically at the start of a gesture
+        — a component drag at mouse-down, the clip tool before it knows whether
+        the plane cut anything — and drop it again when nothing moved, so the
+        user's history has no empty step in it.  Popping the undo entry is only
+        half of that: ``save_state`` also cleared the redo branch, and a
+        cancelled drag that silently threw away everything the user could have
+        redone is its own surprise.  Both are restored here.
+        """
+        if not self.undo_stack:
+            return False
+        self.undo_stack.pop()
+        redo = getattr(self, '_discarded_redo', None)
+        if redo is not None:
+            self.redo_stack = redo
+            self._discarded_redo = None
+        return True
+
+    def _serialize_brushes_for_undo(self):
+        """The brushes as JSON-ready dicts for an undo checkpoint.
+
+        Shallow: the checkpoint is encoded to a JSON string straight away, and
+        encoding already makes an independent copy, so a deep copy first only
+        doubled the work -- about 0.4 s a checkpoint on a 24k-brush map.
+        Renderer-internal cache keys are left out (GLM matrices, cached convex
+        geometry: neither serialisable nor meaningful outside the renderer),
+        and I/O connections are written as dicts.
+        """
+        result = []
+        for brush in self.brushes:
+            # Give every brush a stable id before it is checkpointed. Undo
+            # rebuilds brush dicts from JSON, so the id is what lets the
+            # selection (and anything else holding a reference) be re-pointed at
+            # the brush that replaced it; a brush drawn in a view and not saved
+            # since would otherwise have nothing to be recognised by.
+            if 'id' not in brush:
+                brush['id'] = str(uuid.uuid4())
+            entry = {k: v for k, v in brush.items()
+                     if k not in _RENDERER_PRIVATE_KEYS}
+            connections = entry.get('_io_connections')
+            if connections:
+                entry['_io_connections'] = [
+                    conn.to_dict() if hasattr(conn, 'to_dict') else conn
+                    for conn in connections
+                    if hasattr(conn, 'to_dict') or isinstance(conn, dict)]
+            result.append(entry)
+        return result
+
+    def restore_state(self, state_json):
+        """Restores the scene from a JSON state string.
+
+        The replacement world is built aside and published by assignment, and
+        only then is the world invalidated. The logic thread projects
+        ``brushes``/``things`` every frame: invalidating first -- and filling
+        ``self.brushes`` in place -- let it rebuild the dense tables from the
+        outgoing world (or a half-restored one) under the new epoch, then
+        rebuild both buffers again once the restore landed. On a 40k-brush
+        map that was several seconds of logic-thread stall per undo or Stop.
+        """
+        state = json.loads(state_json)
+        blobs = getattr(state_json, 'blobs', None)
+        if blobs:
+            # A history entry: its paint chunks name their data in blobs.
+            for key in _PAINT_HISTORY_KEYS:
+                for entry in state.get(key) or ():
+                    ref = entry.pop(_BLOB_REF, None) if isinstance(entry, dict) else None
+                    if ref is not None:
+                        entry['data'] = blobs[ref[0]]
+        stream = None
+        if 'editor_camera' in state:
+            from plugins.bigworld.editor_streaming import EditorCellStream
+            stream = EditorCellStream.for_level(state, state['editor_camera'])
+            if stream is not None:
+                pinned = [entry[2] for entry in state.get('selection', [])
+                          if isinstance(entry, (list, tuple)) and len(entry) > 2]
+                local = stream.local_data(pinned=pinned)
+                if state.get('editor_whole_world'):
+                    stream.whole_world = True
+                    local = stream.all_data()
+                state = dict(state, **local)
+
+        # Restore brushes with I/O connections
+        raw_brushes = state.get('brushes', [])
+        if stream is not None:
+            # Full saved records, not the compact undo form.
+            raw_brushes = self._deserialize_brushes(raw_brushes)
+        new_brushes = []
+        for brush_data in raw_brushes:
+            brush = brush_data.copy()
+
+            # Convert I/O connection dicts back to objects
+            if IO_AVAILABLE and '_io_connections' in brush:
+                io_data = brush['_io_connections']
+                if io_data and isinstance(io_data[0], dict):
+                    brush['_io_connections'] = [
+                        OutputConnection.from_dict(d) for d in io_data
+                    ]
+
+            new_brushes.append(brush)
+
+        # Restore things
+        things_data = state.get('things', [])
+        new_things = []
+        for t_data in things_data:
+            thing = Thing.from_dict(t_data)
+            if thing is not None:
+                new_things.append(thing)
+        self.brushes = new_brushes
+        self.things = new_things
+        self.editor_stream = stream
+        self._invalidate_entity_caches()
+        if stream is not None:
+            stream.remember_resident(self)
+
+        self._restore_selection(state['selection'])
+        if 'items' in state:
+            self.item_definitions.load(state['items'])
+
+        # Terrain CSG and baked texture paint are the terrain fields included
+        # in lightweight editor history. Heightmaps remain outside checkpoints
+        # because their full blobs are much larger.
+        if 'terrain_csg_subtractions' in state and isinstance(self.terrain_data, dict):
+            cuts = state.get('terrain_csg_subtractions') or []
+            if cuts:
+                self.terrain_data['csg_subtractions'] = [list(cut) for cut in cuts]
+            else:
+                self.terrain_data.pop('csg_subtractions', None)
+
+        if 'terrain_texture_paint' in state and isinstance(self.terrain_data, dict):
+            paint = state.get('terrain_texture_paint') or []
+            if paint:
+                self.terrain_data['texture_paint'] = [dict(entry) for entry in paint]
+            else:
+                self.terrain_data.pop('texture_paint', None)
+
+        # Placed stamps and the paint under them travel with the paint.
+        for key, field in (('terrain_paint_stamps', 'paint_stamps'),
+                           ('terrain_texture_paint_base', 'texture_paint_base')):
+            if key in state and isinstance(self.terrain_data, dict):
+                values = state.get(key) or []
+                if values:
+                    self.terrain_data[field] = [dict(v) for v in values]
+                else:
+                    self.terrain_data.pop(field, None)
+
+    def undo(self):
+        """Step back one operation, making the current scene redoable.
+
+        Two things about this are easy to get wrong, and both have been.
+
+        What goes on the **redo** stack is a snapshot of the scene *as it is
+        now*, not the checkpoint being popped.  The two are not the same thing:
+        tools checkpoint at the *start* of a gesture (mouse-down), so the top of
+        the undo stack is the state before the operation, and the operation's
+        actual result only ever exists in the live scene.  Pushing the popped
+        entry instead meant redo re-applied the state the undo had just
+        restored — i.e. redo did nothing at all.
+
+        What gets **restored** is the entry just popped, not the one under it.
+        The popped entry *is* the state before the operation being undone;
+        restoring its predecessor instead stepped back two gestures at a time,
+        so a mapper who made three edits and pressed undo once lost two of them.
+        """
+        if len(self.undo_stack) <= 1 or isinstance(self.undo_stack[-1], _HistoryBase):
+            return False
+        self.redo_stack.append(self._history_entry())
+        self.restore_state(self.undo_stack.pop())
+        return True
+
+    def redo(self):
+        """Re-apply the operation the last :meth:`undo` stepped back over."""
+        if not self.redo_stack:
+            return False
+        state_json = self.redo_stack.pop()
+        # Symmetrically: what makes the redo undoable again is the scene as it
+        # is before the redo lands, which is exactly what undo restored.
+        self.undo_stack.append(self._history_entry())
+        self.restore_state(state_json)
+        return True
+
+    # =========================================================================
+    # I/O HELPER METHODS
+    # =========================================================================
+
+    def find_entity_by_name(self, name: str):
+        """Find an entity (brush or thing) by name."""
+        if not name:
+            return None
+
+        for brush in self.brushes:
+            if brush.get('name') == name:
+                return brush
+
+        for thing in self.things:
+            if thing.properties.get('name') == name:
+                return thing
+
+        return self._load_editor_record(name=name)
+
+    def find_entity_by_id(self, entity_id: str):
+        """Find an entity (brush or thing) by stable UUID."""
+        if not entity_id:
+            return None
+
+        for brush in self.brushes:
+            if brush.get('id') == entity_id:
+                return brush
+
+        for thing in self.things:
+            if thing.properties.get('id') == entity_id:
+                return thing
+
+        return self._load_editor_record(identity=entity_id)
+
+    def _load_editor_record(self, identity=None, name=None):
+        """Resolve an explicitly requested distant object without loading its region."""
+        stream = self.editor_stream
+        if stream is None or stream.suspended:
+            return None
+        for kind, records in stream.records.items():
+            if identity is not None:
+                record = records.get(identity)
+            else:
+                record = next((r for r in records.values() if (
+                    r.get('name') if kind == 'brushes' else
+                    r.get('properties', {}).get('name')) == name), None)
+            if record is None:
+                continue
+            record_identity = record.get('id') if kind == 'brushes' else record['properties']['id']
+            if record_identity in stream.resident[kind]:
+                # A resident record absent from the live lists was deleted
+                # (or renamed); lookup must not resurrect its previous copy.
+                continue
+            if kind == 'brushes':
+                obj = self._deserialize_brushes([record])[0]
+                self.brushes = self.brushes + [obj]
+                identity = obj['id']
+            else:
+                obj = Thing.from_dict(record)
+                if obj is None:
+                    return None
+                self.things = self.things + [obj]
+                identity = obj.properties['id']
+            stream.resident[kind].add(identity)
+            self._invalidate_entity_caches()
+            return obj
+        return None
+
+    def ensure_entity_ids(self):
+        """Stamp the stable UUID onto any brush or Thing that has not got one.
+
+        Fio assigns ids lazily, at the three points that serialise the scene
+        (save, load, undo checkpoint), because those are where an id earns its
+        keep: it is what lets a dict rebuilt from JSON be recognised as the
+        object it replaced.  A brush a tool has only just appended has
+        therefore not been stamped yet -- ``save_state`` snapshots the scene
+        *before* the operation that creates it.
+
+        Anything that keys a derived structure on the id needs one to exist by
+        the time it looks, so it calls this rather than stamping ids itself:
+        the write stays here, in the module that owns the world, and the
+        derived structure stays read-only with respect to it.
+
+        Uses the same ``setdefault`` semantics as the serialisers, so whoever
+        gets there first wins and an object that already has an id is
+        untouched.  Returns how many ids were assigned.
+        """
+        assigned = 0
+        for brush in self.brushes:
+            if 'id' not in brush:
+                brush['id'] = str(uuid.uuid4())
+                assigned += 1
+        for thing in self.things:
+            props = getattr(thing, 'properties', None)
+            if isinstance(props, dict) and 'id' not in props:
+                props['id'] = str(uuid.uuid4())
+                assigned += 1
+        return assigned
+
+    def get_entity_id(self, entity):
+        """Return the stable ID of an entity (brush dict or Thing)."""
+        if isinstance(entity, dict):
+            return entity.get('id', '')
+        if hasattr(entity, 'properties'):
+            return entity.properties.get('id', '')
+        return ''
+
+    def get_all_entity_names(self):
+        """Get a list of all entity names in the scene."""
+        stream = self.editor_stream
+        if stream is not None and not stream.suspended:
+            stream.merge(self._serialize_brushes(), [t.to_dict() for t in self.things])
+            return [name for kind, records in stream.records.items()
+                    for record in records.values()
+                    if (name := (record.get('name') if kind == 'brushes' else
+                                 record.get('properties', {}).get('name')))]
+        names = []
+
+        for brush in self.brushes:
+            name = brush.get('name', '')
+            if name:
+                names.append(name)
+
+        for thing in self.things:
+            name = thing.properties.get('name', '')
+            if name:
+                names.append(name)
+
+        return names
+
+    def find_entities_targeting(self, target_name: str, target_id: str = ""):
+        """Find all entities that have I/O connections to the target.
+
+        Matches identity-addressed connections (by stable UUID) as well as
+        name-addressed ones, so the result stays correct across renames.
+        """
+        sources = []
+
+        if not IO_AVAILABLE:
+            return sources
+
+        def _matches(conn):
+            if target_id and getattr(conn, 'target_id', '') == target_id:
+                return True
+            return bool(target_name) and conn.target_name == target_name
+
+        for brush in self.brushes:
+            for conn in get_connections(brush):
+                if _matches(conn):
+                    sources.append({
+                        'entity': brush,
+                        'connection': conn,
+                        'type': 'brush'
+                    })
+
+        for thing in self.things:
+            for conn in get_connections(thing):
+                if _matches(conn):
+                    sources.append({
+                        'entity': thing,
+                        'connection': conn,
+                        'type': 'thing'
+                    })
+
+        return sources

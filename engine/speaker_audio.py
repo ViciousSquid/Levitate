@@ -1,0 +1,111 @@
+"""Where a Speaker's sound may come from: ``assets/sounds`` or ``assets/music``.
+
+A Speaker's ``sound_file`` names a file inside one of those two folders,
+stored project-relative (``assets/music/theme.ogg``). A bare file name, as
+older maps hold, means ``assets/sounds``. Anything else -- another folder, an
+absolute path, a path climbing out with ``..``, a file that is not audio -- is
+refused, so a map cannot make a speaker play an arbitrary file.
+"""
+
+import os
+
+#: The folders under ``assets/`` a Speaker plays from, as the Asset Browser's
+#: Audio tab shows them.
+SPEAKER_AUDIO_FOLDERS = ("sounds", "music")
+AUDIO_EXTENSIONS = (".wav", ".ogg", ".mp3")
+
+
+def speaker_sound_path(value):
+    """``assets/<sounds|music>/...`` for *value*, or None when not allowed.
+
+    Accepts ``assets/music/x.ogg``, ``music/x.ogg`` and a bare ``x.wav``
+    (meaning ``assets/sounds/x.wav``), with forward or back slashes.
+    """
+    raw = str(value or "").strip().replace("\\", "/")
+    if not raw or raw.startswith("/") or (len(raw) > 1 and raw[1] == ":"):
+        return None
+    parts = [p for p in raw.split("/") if p not in ("", ".")]
+    if not parts or ".." in parts:
+        return None
+    if len(parts) == 1:
+        parts = ["assets", "sounds"] + parts
+    elif parts[0] in SPEAKER_AUDIO_FOLDERS:
+        parts = ["assets"] + parts
+    if len(parts) < 3 or parts[0] != "assets" or parts[1] not in SPEAKER_AUDIO_FOLDERS:
+        return None
+    if not parts[-1].lower().endswith(AUDIO_EXTENSIONS):
+        return None
+    return "/".join(parts)
+
+
+def is_music(value) -> bool:
+    """True for a file in ``assets/music``: it plays at the music volume.
+
+    Everything else a game plays -- sounds, weapons, footsteps -- is sound.
+    """
+    rel = speaker_sound_path(value)
+    return rel is not None and rel.startswith("assets/music/")
+
+
+def resolve_speaker_sound(value, root):
+    """The file *value* names under *root*, or None when not allowed.
+
+    The file need not exist; a symlink leading out of its folder is refused.
+    """
+    rel = speaker_sound_path(value)
+    if rel is None:
+        return None
+    parts = rel.split("/")
+    folder = os.path.realpath(os.path.join(root, parts[0], parts[1]))
+    path = os.path.realpath(os.path.join(root, *parts))
+    try:
+        if os.path.commonpath([folder, path]) != folder:
+            return None
+    except ValueError:
+        return None
+    return path
+
+
+def list_speaker_audio(root, folder):
+    """Audio paths under assets/<folder>, using its archive when present.
+
+    A .fiopak is authoritative when present, matching runtime loading: loose
+    files are the fallback only when the archive does not exist.
+    """
+    if folder not in SPEAKER_AUDIO_FOLDERS:
+        return []
+    archive_path = os.path.join(root, "assets", f"{folder}.fiopak")
+    if os.path.isfile(archive_path):
+        from engine.audio_archives import list_archive_audio
+        import zipfile
+        try:
+            return list_archive_audio(
+                archive_path, f"assets/{folder}", AUDIO_EXTENSIONS
+            )
+        except (OSError, zipfile.BadZipFile) as exc:
+            print(f"[Audio] Cannot list {folder}.fiopak: {exc}")
+            return []
+
+    base = os.path.join(root, "assets", folder)
+    found = set()
+    for dirpath, _dirnames, filenames in os.walk(base):
+        for name in filenames:
+            if name.lower().endswith(AUDIO_EXTENSIONS):
+                rel = os.path.relpath(os.path.join(dirpath, name), root).replace("\\", "/")
+                if speaker_sound_path(rel) == rel:
+                    found.add(rel)
+    # And the audio in end users' own .fiopak packs (engine.asset_archives).
+    from engine.asset_archives import user_pack_entries, user_pack_paths
+    import zipfile
+    prefix = f"assets/{folder}/"
+    for pack in user_pack_paths(os.path.join(root, "assets")):
+        try:
+            with zipfile.ZipFile(pack) as archive:
+                entries, _skipped = user_pack_entries(archive)
+        except (OSError, ValueError, zipfile.BadZipFile) as exc:
+            print(f"[Audio] Cannot list {pack.name}: {exc}")
+            continue
+        found.update(name for name, _info in entries
+                     if name.startswith(prefix) and name.lower().endswith(AUDIO_EXTENSIONS)
+                     and speaker_sound_path(name) == name)
+    return sorted(found, key=str.casefold)

@@ -1,0 +1,328 @@
+# Fio — Liminal World Editor & Procedural Engine
+#    https://github.com/ViciousSquid/Fio
+
+import sys
+import os
+
+from python_runtime import require_supported_python
+
+
+os.environ["QT_PLUGIN_PATH"] = ""
+os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = ""
+
+# PyOpenGL calls glGetError after every GL call unless told not to, which on a
+# frame of a few hundred calls is a measurable share of the paint. It must be
+# decided before anything imports OpenGL.GL. FIO_GL_DEBUG=1 keeps the checks
+# (the test suite never comes through here, so it always runs with them).
+if os.environ.get("FIO_GL_DEBUG") != "1":
+    os.environ.setdefault("PYOPENGL_ERROR_CHECKING", "0")
+
+# Fio runs the UI/renderer, the logic thread and the monster AI as Python
+# threads. Whenever one releases the GIL (every GL call, every large NumPy
+# operation) and another takes it, the first waits up to the switch interval to
+# get it back -- 5 ms by default, a third of a frame. Measured on a 24k-brush
+# map, 1 ms cuts the logic thread's p95 frame preparation from ~59 to ~25 ms.
+sys.setswitchinterval(0.001)
+
+
+# Dark theme
+dark_stylesheet = """
+    QMainWindow {
+        background-color: #2b2b2b;
+    }
+    QWidget {
+        background-color: #2b2b2b;
+        color: #e0e0e0;
+    }
+    QPushButton {
+        background-color: #3c3f41;
+        border: 1px solid #555;
+        padding: 5px;
+        min-width: 60px;
+    }
+    QPushButton:hover {
+        background-color: #4b4d4d;
+    }
+    QPushButton:pressed {
+        background-color: #2b2b2b;
+    }
+    QLineEdit, QTextEdit, QSpinBox, QComboBox {
+        background-color: #3c3f41;
+        border: 1px solid #555;
+        color: #e0e0e0;
+        padding: 2px;
+    }
+    QMenuBar {
+        background-color: #3c3f41;
+        color: #e0e0e0;
+    }
+    QMenuBar::item:selected {
+        background-color: #4b4d4d;
+    }
+    QMenu {
+        background-color: #2b2b2b;
+        color: #e0e0e0;
+        border: 1px solid #555;
+    }
+    /* Qt 5 on macOS can leave the bottom pixel of an old hover highlight
+       behind if the unselected action is drawn transparently. Every normal
+       item must repaint its entire rectangle with an opaque background. */
+    QMenu::item {
+        background-color: #2b2b2b;
+    }
+    QMenu::item:selected {
+        background-color: #F08000;
+    }
+    QMenu::separator {
+        height: 1px;
+        background-color: #555;
+        margin: 6px 8px;
+    }
+    QDockWidget {
+        titlebar-close-icon: url(assets/close.png);
+        titlebar-normal-icon: url(assets/undock.png);
+    }
+    QDockWidget::title {
+        background-color: #3c3f41;
+        padding-left: 10px;
+        padding-top: 4px;
+    }
+    QScrollBar:vertical {
+        border: none;
+        background: #2b2b2b;
+        width: 12px;
+        margin: 0px;
+    }
+    QScrollBar::handle:vertical {
+        background: #4b4d4d;
+        min-height: 20px;
+        border-radius: 6px;
+    }
+    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+        height: 0px;
+    }
+    QTabWidget::pane {
+        border: 1px solid #555;
+    }
+    QTabBar::tab {
+        background-color: #3c3f41;
+        padding: 8px 12px;
+        border-right: 1px solid #555;
+    }
+    QTabWidget::tab-bar {
+        alignment: left;
+    }
+    QTabBar::tab:selected {
+        background-color: #2b2b2b;
+        border-bottom: 2px solid #007acc;
+    }
+    QStatusBar {
+        background-color: #3c3f41;
+        color: #e0e0e0;
+    }
+    QProgressBar {
+        border: 1px solid #555;
+        border-radius: 3px;
+        text-align: center;
+    }
+    QProgressBar::chunk {
+        background-color: #2b6132;
+    }
+    QFrame {
+        border: 1px solid #555;
+    }
+"""
+
+from editor_styles import CONTROL_STYLESHEET
+dark_stylesheet += CONTROL_STYLESHEET
+
+if __name__ == "__main__":
+    require_supported_python()
+
+    # ---------------------------------------------------------
+    # Android / standalone player entry point.
+    # Under python-for-android (ANDROID_ARGUMENT is set), or when FIO_PLAYER=1
+    # on the desktop, launch the touch-first .fiopak player instead of the
+    # PyQt5 editor. This branch runs before any PyQt import so the editor's
+    # desktop-only dependencies are never touched on mobile.
+    # ---------------------------------------------------------
+    if os.environ.get("ANDROID_ARGUMENT") or os.environ.get("FIO_PLAYER"):
+        # Desktop builds leave the player out (Nuitka: --nofollow-import-to=
+        # player); it is run from the staged Android runtime, not from here.
+        try:
+            from player.main import main as _player_main
+        except ImportError as error:
+            raise SystemExit(f"The Fio Player is not part of this build: {error}")
+        raise SystemExit(_player_main([]))
+
+    from PyQt5.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout, QProgressBar
+    from PyQt5.QtGui import QPixmap, QSurfaceFormat, QIcon
+    from PyQt5.QtCore import Qt
+    from editor.main_window import MainWindow
+    # Terrain height grids are built on a background thread, not in the
+    # frame (engine/terrain.py: Terrain.advance).
+    from engine.terrain import Terrain
+    Terrain.BACKGROUND_BUILDS = True
+
+    # ---------------------------------------------------------
+    # PATH RESOLUTION
+    # ---------------------------------------------------------
+    if getattr(sys, 'frozen', False) or "__compiled__" in globals():
+        root_directory = os.path.dirname(sys.executable)
+    else:
+        root_directory = os.path.dirname(os.path.abspath(__file__))
+
+    os.chdir(root_directory)
+    # Before anything that can fail: a windowed build has no console, so an
+    # exception during startup otherwise leaves no trace at all.
+    from editor import crash_log
+    from editor.user_paths import settings_path, writable_dir
+    crash_log.install(os.path.dirname(settings_path(root_directory))
+                      or writable_dir(root_directory))
+    # Index the asset archives before Qt asks for the splash or icons.
+    from engine.asset_archives import asset_exists, prepare_asset_archives
+    from engine.asset_qt import load_icon, load_pixmap, portable_stylesheet
+    prepare_asset_archives(root_directory)
+    
+    # Set the application ID for Windows taskbar (required for Windows 7+)
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            myappid = 'fio.editor.v1'  # arbitrary string
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+        except Exception:
+            pass
+    # The macOS menu bar names the app after the running bundle: Python's,
+    # for a source run. A built Fio.app is named by its own Info.plist.
+    if sys.platform == 'darwin' and not (
+            getattr(sys, 'frozen', False) or "__compiled__" in globals()):
+        from macos_app import set_process_app_name
+        set_process_app_name("Fio")
+    # ---------------------------------------------------------
+
+    # Version print
+    try:
+        with open(os.path.join(root_directory, 'editor/version.txt'), 'r') as f:
+            print(f"")
+            print(f"       +++ Fio {f.read().strip()}")
+    except FileNotFoundError:
+        print("Version file not found")
+
+    # ---------------------------------------------------------
+    # Configure OpenGL BEFORE QApplication is created
+    # ---------------------------------------------------------
+    # A damaged settings.ini falls back to the defaults (and is set aside);
+    # it must never be the reason Fio does not start.
+    from editor.settings_file import SettingsParser, read_settings
+    config = SettingsParser()
+    read_settings(config, settings_path(root_directory))
+    vsync = config.getboolean('Display', 'vsync', fallback=True)
+    # The editor's top-level windows take this format too: the 3D view's
+    # context can share with theirs only if they agree (engine/gl_format.py).
+    from engine.gl_format import set_default_surface_format
+    set_default_surface_format(1 if vsync else 0)
+
+    # Qt reads the UI scale only when the QApplication is created.
+    from editor.ui_scale import apply_ui_scale
+    apply_ui_scale(config)
+    # ---------------------------------------------------------
+
+    # Splash class defined AFTER Qt import
+    class ProgressSplashScreen(QWidget):
+        def __init__(self, pixmap_path):
+            super().__init__()
+            self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+
+            pixmap = load_pixmap(pixmap_path)
+
+            layout = QVBoxLayout()
+            layout.setContentsMargins(0, 0, 0, 0)
+            self.setLayout(layout)
+
+            self.image_label = QLabel()
+            self.image_label.setPixmap(pixmap)
+            layout.addWidget(self.image_label)
+
+            self.progress_bar = QProgressBar()
+            # The same thin bar as the editor's loading overlay, with the
+            # stage written beneath it.
+            from editor.loading_overlay import BAR_HEIGHT
+            self.progress_bar.setFixedHeight(BAR_HEIGHT)
+            self.progress_bar.setTextVisible(False)
+            self.progress_bar.setAlignment(Qt.AlignCenter)
+            self.progress_message = QLabel()
+            self.progress_message.setAlignment(Qt.AlignCenter)
+            layout.addWidget(self.progress_bar)
+            layout.addWidget(self.progress_message)
+
+            self.center_on_screen()
+
+        def center_on_screen(self):
+            screen = QApplication.primaryScreen()
+            geo = screen.geometry()
+            self.move(
+                (geo.width() - self.width()) // 2,
+                (geo.height() - self.height()) // 2
+            )
+
+        def set_progress(self, value, message):
+            self.progress_bar.setValue(value)
+            self.progress_bar.setFormat(f"{message} ({value}%)")
+            self.progress_message.setText(f"{message} ({value}%)")
+            QApplication.processEvents()
+
+        def finish(self, main_window):
+            self.close()
+
+    from editor.desktop_style import prepare_qt, install_editor_style, set_editor_font_size
+    prepare_qt(config.getboolean('Display', 'high_dpi_scaling', fallback=True))
+    # Create app
+    app = QApplication(sys.argv)
+    # One Windows-based style, bundled fonts and icons on every platform, so
+    # the editor looks the same on Windows and macOS (editor/desktop_style.py).
+    install_editor_style(app)
+    # The user's font size, applied up front so the splash matches the editor.
+    set_editor_font_size(app, config.getint('Display', 'font_size', fallback=11))
+    # Without this PyQt5 aborts the process on any exception escaping a Qt
+    # callback, losing the open map.
+    from editor.debug_console import install_excepthook
+    install_excepthook()
+    crash_log.wrap_current()
+    # Qt builds without QtSvg (Windows on ARM) draw the sheet's check marks
+    # and arrows from their pre-rendered PNGs instead.
+    app.setStyleSheet(portable_stylesheet(dark_stylesheet))
+
+    # Set application icon
+    icon_path = os.path.join(root_directory, 'assets', 'icon.ico')
+    if asset_exists(icon_path):
+        app_icon = load_icon(icon_path)
+        app.setWindowIcon(app_icon)
+    else:
+        mac_icon_path = os.path.join(root_directory, 'assets', 'icon.icns')
+        if asset_exists(mac_icon_path):
+            app_icon = load_icon(mac_icon_path)
+            app.setWindowIcon(app_icon)
+        else:
+            png_icon_path = os.path.join(root_directory, 'assets', 'icon.png')
+            if asset_exists(png_icon_path):
+                app_icon = load_icon(png_icon_path)
+                app.setWindowIcon(app_icon)
+
+    splash = ProgressSplashScreen('assets/splash.png')
+    splash.show()
+    splash.set_progress(5, "Configuring OpenGL...")
+
+    splash.set_progress(25, "Building editor UI...")
+
+    window = MainWindow(root_directory)
+    
+    # Set icon on main window
+    if 'app_icon' in locals():
+        window.setWindowIcon(app_icon)
+    
+    splash.set_progress(100, "Ready.")
+
+    window.showMaximized()
+    splash.finish(window)
+
+    sys.exit(app.exec_())

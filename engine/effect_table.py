@@ -1,0 +1,335 @@
+"""Dense structure-of-arrays execution state for Effect primitives.
+
+Effect objects remain the authoring representation.  This store owns the
+simulation/runtime state so the logic and render projections never need to
+read or mutate per-Effect runtime attributes on the hot path.
+"""
+
+from __future__ import annotations
+
+import random
+import weakref
+
+import numpy as np
+
+from .effect_entity import (
+    EFFECT_CUSTOM,
+    EFFECT_EXPLOSION,
+    EFFECT_FIRE,
+    EFFECT_ORB,
+    EFFECT_PARTICLES,
+)
+from .soa import grow_soa_arrays
+
+
+FAMILY_FIRE = 0
+FAMILY_EXPLOSION = 1
+FAMILY_ORB = 2
+FAMILY_CUSTOM = 3
+#: The emitter alone. Active from the start and looping, like FIRE; every
+#: family other than EXPLOSION is.
+FAMILY_PARTICLES = 4
+
+_FAMILY_IDS = {
+    EFFECT_FIRE: FAMILY_FIRE,
+    EFFECT_EXPLOSION: FAMILY_EXPLOSION,
+    EFFECT_ORB: FAMILY_ORB,
+    EFFECT_CUSTOM: FAMILY_CUSTOM,
+    EFFECT_PARTICLES: FAMILY_PARTICLES,
+}
+
+
+def effect_family(value) -> int:
+    """Resolve an authored Effect type to its dense execution family id."""
+    return _FAMILY_IDS.get(
+        str(value or EFFECT_FIRE).strip().upper(),
+        FAMILY_FIRE,
+    )
+
+
+class EffectStore:
+    """Dense SoA runtime state for authored Effect entities.
+
+    The store deliberately keeps no references to the authoring objects.
+    The id(object) -> row mapping is only a transient lookup key; the arrays
+    are the authoritative execution state.
+
+    **Row order.** :meth:`rebuild` (every entity-table reconcile, and Play
+    start) writes the rows in world order: the order of the Effects in the
+    entity list it is given.  An Effect the store has not seen yet that is
+    synced between rebuilds (:meth:`sync_authored`, and through it
+    :meth:`set_type` / :meth:`trigger_explosion`) is appended after them, in
+    the order such Effects are first synced, until the next rebuild puts it in
+    its world position.  Nothing pairs rows by position: readers ask
+    :meth:`index_of`.
+
+    **Generation.** ``generation`` moves on every change to ``family_id``,
+    ``lifetime``, ``spawn_time``, ``phase``, ``active`` or the row set -- the
+    columns an entity table publishes only when they change, rather than
+    copying them every tick.  ``pos`` is not among them (it is read where it
+    is used), so :meth:`set_position` leaves the generation alone.
+    """
+
+    __slots__ = (
+        "pos",
+        "lifetime",
+        "phase",
+        "family_id",
+        "spawn_time",
+        "active",
+        "ids",
+        "generation",
+        "_index_by_object",
+        "_capacity",
+        "_count",
+        "_returns",
+    )
+
+    def __init__(self, capacity=16):
+        self._capacity = max(1, int(capacity))
+        self._count = 0
+        self.pos = np.empty((self._capacity, 3), dtype=np.float32)
+        self.lifetime = np.empty(self._capacity, dtype=np.float32)
+        self.phase = np.empty(self._capacity, dtype=np.float32)
+        self.family_id = np.empty(self._capacity, dtype=np.uint8)
+        self.spawn_time = np.empty(self._capacity, dtype=np.float64)
+        self.active = np.empty(self._capacity, dtype=bool)
+        self.ids = []
+        self.generation = 0
+        self._index_by_object = {}
+        #: id(thing) -> (weakref to it, type to return to, when): explosions
+        #: that hand back to another type when they end
+        #: (:meth:`trigger_explosion`, :meth:`finish_explosions`). Weak, so
+        #: the store still keeps no authoring object alive.
+        self._returns = {}
+
+    def __len__(self):
+        return self._count
+
+    @property
+    def count(self):
+        return self._count
+
+    def _ensure_capacity(self, required):
+        if required <= self._capacity:
+            return
+        self._capacity, (
+            self.pos,
+            self.lifetime,
+            self.phase,
+            self.family_id,
+            self.spawn_time,
+            self.active,
+        ) = grow_soa_arrays(
+            required,
+            self._capacity,
+            self.pos,
+            self.lifetime,
+            self.phase,
+            self.family_id,
+            self.spawn_time,
+            self.active,
+        )
+
+    @staticmethod
+    def _lifetime(thing) -> float:
+        try:
+            return max(0.01, float(thing.properties.get("lifetime", 0.5)))
+        except (TypeError, ValueError):
+            return 0.5
+
+    @staticmethod
+    def _position(thing):
+        pos = thing.pos
+        return (float(pos[0]), float(pos[1]), float(pos[2]))
+
+    def _append(self, thing):
+        index = self._count
+        self._ensure_capacity(index + 1)
+        props = thing.properties
+        self._index_by_object[id(thing)] = index
+        self.ids.append(props.get("id"))
+        self.pos[index] = self._position(thing)
+        self.lifetime[index] = self._lifetime(thing)
+        self.family_id[index] = effect_family(
+            props.get("effect_type", EFFECT_FIRE)
+        )
+        self.phase[index] = random.random()
+        self.spawn_time[index] = 0.0
+        self.active[index] = self.family_id[index] != FAMILY_EXPLOSION
+        self._count = index + 1
+        self.generation += 1
+        return index
+
+    def clear(self):
+        """Drop all execution rows without retaining authoring objects."""
+        self._count = 0
+        self.ids.clear()
+        self._index_by_object.clear()
+        self._returns.clear()
+        self.generation += 1
+
+    def rebuild(self, things, *, reset_runtime=False):
+        """Reconcile execution rows to the current authoring Effect set.
+
+        Existing object identities retain runtime state unless reset_runtime is
+        requested. Added rows receive fresh runtime state; removed rows
+        disappear from the dense store.
+        """
+        old_count = self._count
+        old_index = self._index_by_object
+        # Rebuild rewrites rows from index zero upward.  A retained object can
+        # move to a later row after an insertion/reorder, so the old runtime
+        # columns must not alias the buffers being rewritten.
+        if reset_runtime:
+            old_phase = old_spawn = old_active = old_family = None
+        else:
+            old_phase = self.phase[:old_count].copy()
+            old_spawn = self.spawn_time[:old_count].copy()
+            old_active = self.active[:old_count].copy()
+            old_family = self.family_id[:old_count].copy()
+
+        self._count = 0
+        self.ids = []
+        self._index_by_object = {}
+
+        for thing in things:
+            props = getattr(thing, "properties", None)
+            if not isinstance(props, dict) or props.get("type") != "effect":
+                continue
+
+            old = old_index.get(id(thing))
+            i = self._count
+            self._ensure_capacity(i + 1)
+            self._index_by_object[id(thing)] = i
+            self.ids.append(props.get("id"))
+            self.pos[i] = self._position(thing)
+            self.lifetime[i] = self._lifetime(thing)
+            authored_family = effect_family(
+                props.get("effect_type", EFFECT_FIRE)
+            )
+            if not reset_runtime and old is not None and old < old_count:
+                self.family_id[i] = old_family[old]
+                self.phase[i] = old_phase[old]
+                self.spawn_time[i] = old_spawn[old]
+                self.active[i] = old_active[old]
+            else:
+                self.family_id[i] = authored_family
+                self.phase[i] = random.random()
+                self.spawn_time[i] = 0.0
+                self.active[i] = self.family_id[i] != FAMILY_EXPLOSION
+            self._count = i + 1
+        self.generation += 1
+
+    def begin_session(self, things):
+        """Reset every Effect runtime row at Play start."""
+        self._returns.clear()
+        self.rebuild(things, reset_runtime=True)
+
+    def index_of(self, thing):
+        """Return the dense execution row for an Effect, or -1."""
+        return int(self._index_by_object.get(id(thing), -1))
+
+    def sync_authored(self, thing):
+        """Refresh cold authoring-derived state for one Effect row."""
+        index = self.index_of(thing)
+        if index < 0:
+            return self._append(thing)
+
+        props = getattr(thing, "properties", {})
+        self.pos[index] = self._position(thing)
+        self.lifetime[index] = self._lifetime(thing)
+        self.family_id[index] = effect_family(
+            props.get("effect_type", EFFECT_FIRE)
+        )
+        self.generation += 1
+        return index
+
+    def refresh_authored(self, index, thing):
+        """Re-read one row's authored position and lifetime only.
+
+        Leaves the execution state (family, playback) alone, so an explosion
+        that is playing keeps playing.
+        """
+        self.pos[index] = self._position(thing)
+        self.lifetime[index] = self._lifetime(thing)
+        self.generation += 1
+
+    def set_type(self, thing, value):
+        """Apply a SetType runtime reset to one dense execution row."""
+        index = self.sync_authored(thing)
+        self.family_id[index] = effect_family(value)
+        self.phase[index] = random.random()
+        self.spawn_time[index] = 0.0
+        self.active[index] = self.family_id[index] != FAMILY_EXPLOSION
+        self.generation += 1
+        return index
+
+    def trigger_explosion(self, thing, now, return_to=None):
+        """Start or restart one-shot EXPLOSION playback.
+
+        With *return_to* (an Effect type name) the row goes back to that type
+        when the explosion has played: :meth:`finish_explosions` reports it
+        once its lifetime is over. A FIRE that explodes this way burns again
+        afterwards; an EXPLOSION previewed in the editor returns to its
+        dormant self."""
+        index = self.sync_authored(thing)
+        self.family_id[index] = FAMILY_EXPLOSION
+        self.phase[index] = 0.0
+        self.spawn_time[index] = float(now)
+        self.active[index] = True
+        self.generation += 1
+        if return_to:
+            self._returns[id(thing)] = (
+                weakref.ref(thing), str(return_to).strip().upper(),
+                float(now) + float(self.lifetime[index]))
+        else:
+            self._returns.pop(id(thing), None)
+        return index
+
+    def returning(self, thing):
+        """The type *thing*'s playing explosion returns to, or None."""
+        entry = self._returns.get(id(thing))
+        return entry[1] if entry is not None else None
+
+    def finish_explosions(self, now):
+        """Return every explosion that has played to the type it came from.
+
+        Called once a tick; does nothing (one dict check) when no explosion
+        is due to return. Each returning Effect's row is reset to its type
+        (:meth:`set_type`), and ``(thing, type)`` is listed for the caller.
+        """
+        if not self._returns:
+            return ()
+        due = [key for key, (_ref, _type, end) in self._returns.items()
+               if end <= now]
+        finished = []
+        for key in due:
+            ref, return_to, _end = self._returns.pop(key)
+            thing = ref()
+            if thing is None or self.index_of(thing) < 0:
+                continue                       # deleted while it played
+            self.set_type(thing, return_to)
+            finished.append((thing, return_to))
+        return finished
+
+    def cancel_returns(self):
+        """Return every explosion still playing to its type now (Play
+        stopping): ``(thing, type)`` for each."""
+        finished = []
+        for ref, return_to, _end in list(self._returns.values()):
+            thing = ref()
+            if thing is not None and self.index_of(thing) >= 0:
+                self.set_type(thing, return_to)
+                finished.append((thing, return_to))
+        self._returns.clear()
+        return finished
+
+    def set_position(self, thing, position):
+        """Update an Effect execution position without reading object state.
+
+        Position is not a published column, so the generation does not move.
+        """
+        index = self.index_of(thing)
+        if index >= 0:
+            self.pos[index] = position

@@ -1,0 +1,5229 @@
+from engine.asset_qt import load_pixmap
+import numpy as np
+import math
+import time
+import os
+from PyQt5.QtWidgets import QWidget, QMenu, QFileDialog, QApplication
+from PyQt5.QtGui import QPainter, QPen, QBrush, QColor, QFont, QPolygonF, QPixmap
+from PyQt5.QtCore import Qt, QRectF, QPointF, QPoint, QTimer
+from editor import model_wireframe
+from editor.things import (Thing, Light, PlayerStart, Speaker, ReflectionProbe, Prop, Monster,
+                          LogicGate, LogicRelay, LogicTimer, LogicCommand, LevelChanger, PathNode,
+                          LogicCamera, LogicSpawner, Portal, LogicState, Effect, Shake,
+                          LightVolume)
+from engine import brush_geometry as bg  # convex/angled-brush geometry
+from engine import brush_placement
+from engine.constants import brush_aabb_bounds, PLAYER_HULL_SIZE
+from engine.entity_models import (model_path as entity_model_path,
+                                  model_rotation, model_scale)
+from editor import component_edit as ce  # shared object/face/edge/vertex model
+from editor import brush_groups
+from editor.selection import SelectionLookup
+
+# How close (in screen pixels) the cursor has to be before a press grabs a
+# component handle or a brush side.  Converted to world units with the view's
+# zoom so the feel is the same at every zoom level.
+COMPONENT_GRAB_PIXELS = 9.0
+SIDE_GRAB_PIXELS = 7.0
+# Portal gizmos are deliberately easier to acquire than generic Thing icons.
+PORTAL_GIZMO_HANDLE_PIXELS = 12.0
+PORTAL_GIZMO_PICK_PIXELS = 10.0
+# I/O System imports for drawing connections
+try:
+    from editor.io_system import get_connections
+    IO_AVAILABLE = True
+except ImportError:
+    IO_AVAILABLE = False
+
+#: The 2D views' right-click menu: Fio's orange strip along the top of the
+#: menu, and green -- Fio's other colour -- along the top of every submenu
+#: opened from it (a submenu is a child widget of its menu, so ``QMenu QMenu``
+#: matches it and not the menu itself).
+CONTEXT_MENU_STYLE = """
+    QMenu {
+        background-color: #2c2c2c;
+        color: #ffffff;
+        border: 1px solid #3d3d3d;
+        border-top: 3px solid #FF8C00; /* orange strip */
+        padding-bottom: 2px;
+    }
+    QMenu QMenu {
+        border-top: 3px solid #4CAF50; /* submenus: green strip */
+    }
+    QMenu::item {
+        padding: 6px 28px 6px 12px;
+        background-color: transparent;
+    }
+    QMenu::item:selected {
+        background-color: #3e3e3e;
+    }
+    /* A large margin leaves a gap between groups. */
+    QMenu::separator {
+        height: 1px;
+        background: #555;
+        margin: 12px 0px;
+    }
+"""
+
+
+#: The rotate tool's angle step for each grid size: a finer grid, a finer
+#: step, and every step divides 360 (the default grid, 16, keeps 15 degrees).
+#: [ and ] change the grid -- and with it the step -- mid-rotate.
+ROTATE_STEP_FOR_GRID = {2: 1.0, 4: 5.0, 8: 10.0, 16: 15.0, 32: 30.0,
+                        64: 45.0, 128: 90.0}
+
+
+def rotate_step_for_grid(grid):
+    """The rotate step, in degrees, for a grid size (nearest listed size)."""
+    grid = int(grid or 16)
+    if grid in ROTATE_STEP_FOR_GRID:
+        return ROTATE_STEP_FOR_GRID[grid]
+    nearest = min(ROTATE_STEP_FOR_GRID, key=lambda size: abs(size - grid))
+    return ROTATE_STEP_FOR_GRID[nearest]
+
+
+class View2D(QWidget):
+    def __init__(self, editor, main_window, view_type):
+        # Only pass 'editor' (which acts as the parent widget) to super().__init__
+        super().__init__(editor)
+        self.editor = editor
+        self.main_window = main_window
+        self.view_type = view_type
+        
+        self.zoom_factor = 1.0
+        self.pan_offset = QPointF(0.0, 0.0)
+        
+        # State variables for mouse actions
+        self.is_panning = False
+        self.is_drawing_brush = False
+        self.is_dragging_object = False
+        self.is_resizing_brush = False
+        self.resize_handle_ix = -1
+        
+        # Coordinates for tracking mouse movement
+        self.last_pan_pos = QPoint()
+        self.pan_start_pos = QPoint()
+        
+        self.draw_start_pos = QPointF()
+        self.draw_current_pos = QPointF()
+        self.drag_start_pos = QPointF()
+        self.drag_offset = QPointF()
+        # Objects moved together during a group drag, plus the "grab" object
+        # whose point stays under the cursor.
+        self.drag_group = []
+        self.drag_primary = None
+        self._object_drag_undo_saved = False
+
+        # --- Select tool: rubber-band marquee state ---
+        # marquee_start/current are world-space (axis1, axis2) points; marquee
+        # _hits is the live set of objects the box currently encloses/touches so
+        # they can be highlighted before the selection is committed on release.
+        self.is_marquee_select = False
+        self.marquee_start = QPointF()
+        self.marquee_current = QPointF()
+        self.marquee_hits = []
+        self._maybe_toggle_manip = False
+
+        # --- Tier-2 group manipulation (multi-selection bounding box) ---
+        # manip_mode flips between 'resize' (scale handles) and 'rotate' (spin
+        # handles) each time the user clicks inside an existing selection.
+        self.manip_mode = 'resize'
+        self.is_group_resizing = False
+        self.group_resize_handle = -1
+        self._group_start = None      # snapshot of bounds + per-object state
+        self.is_group_rotating = False
+        self.group_rotate_pivot = None
+        self.group_rotate_start_ang = 0.0
+        self.group_rotate_applied = 0.0
+
+        self.initial_brush_rect = QRectF()
+        self.grid_size = 16
+        self.world_size = 1024
+        self.snap_to_grid_enabled = True
+        self.grid_visible = True  # Grid visibility (controlled by toggle button)
+
+        # Throttle tracker for 3D updates during drag
+        self.last_3d_update_time = 0.0
+
+        # Connection line animation state
+        self.connection_animations = {}
+        self.last_io_connections = set()
+        self.last_patrol_connections = set()
+        
+        # Animated arrow state - arrows traveling along connection lines
+        self.arrow_travel_progress = {}  # {conn_key: [arrow_positions]}
+        
+        self.animation_timer = QTimer(self)
+        self.animation_timer.setInterval(16)
+        self.animation_timer.timeout.connect(self._update_connection_animations)
+        # Runs only while animated links are drawn in this view, which must be
+        # on screen: started by draw_logic_connections, stopped by the tick
+        # that finds nothing left to animate, and by hideEvent.
+        # The scene below the camera cone, the tool overlays and the links,
+        # kept as one image between repaints (paintEvent).
+        self._base_layer = None
+        self._base_key = None
+        self._base_layer_valid = False
+        self._base_painter_state = None
+        self._overlay_frame = False
+        # The brushes' bounds in one array, for draw_brushes' cull
+        # (_brush_cull_index).
+        self._brush_cull = None
+
+        # ---- Arrow-key nudge undo coalescing ----
+        # A rapid burst of nudges (tapping or holding an arrow key) should be a
+        # single, cheap undo step rather than one full-scene save_state() per
+        # keypress.  We save state once when a burst starts, then let this idle
+        # timer end the burst after a short pause so the next nudge starts fresh.
+        self._nudge_in_progress = False
+        self._nudge_idle_timer = QTimer(self)
+        self._nudge_idle_timer.setSingleShot(True)
+        self._nudge_idle_timer.setInterval(500)  # ms of inactivity ends a burst
+        self._nudge_idle_timer.timeout.connect(self._end_nudge_burst)
+
+        # ---- Camera tracking for smooth viewcone updates ----
+        # No timer: each frame the 3D view takes its camera from (editor mode)
+        # it calls _check_camera_changed on the 2D views, which repaint only
+        # when the camera actually moved -- on the same frame, not on the next
+        # tick of a 60 Hz poll (MainWindow.notify_camera_moved).
+        # Cached camera state for change detection
+        self._last_camera_pos = None
+        self._last_camera_yaw = None
+        self._last_camera_pitch = None
+
+        # CTRL+drag connection state
+        self.is_connecting = False
+        self.connection_source = None  # The trigger brush being connected
+        self.connection_drag_pos = QPointF()  # Current mouse position during drag
+        self.connection_snap_target = None  # Target object we're snapping to
+        self.connection_snap_threshold = 30  # Pixels to snap within
+
+        # --- Clip / slice tool state (Radiant-style, toggled globally with X) ---
+        # clip_points holds up to two world-space (axis1, axis2) points defining
+        # the cut line in THIS view; the plane is that line extruded along the
+        # view's depth axis.  clip_hover tracks the cursor so the kept side can
+        # be previewed live and frozen on Enter.
+        self.clip_points = []          # list[QPointF] in this view's 2D world coords
+        self.clip_hover = None         # QPointF current cursor in 2D world coords
+        self._clip_hover_raw = None    # the cursor before snapping (re-snapped on [ ])
+        self.clip_keep_positive = False  # which half-space to keep
+
+        # --- Free-rotate tool state (toggled globally by the rotate button) ---
+        # A left-drag spins the selection about this view's depth axis.  We keep
+        # the on-screen pivot, the cursor angle where the drag began, and the
+        # net snapped angle already applied so each mouse move only rotates by
+        # the delta (rotations compose exactly about a fixed pivot/axis).
+        self.rotate_dragging = False
+        self.rotate_pivot = None       # QPointF pivot in this view's 2D world coords
+        self.rotate_pivot3 = None      # the same pivot in world space, held fixed
+        self.rotate_start_ang = 0.0    # cursor angle (radians) at drag start
+        self.rotate_applied = 0.0      # net snapped degrees applied so far
+        #: A rotate step set by hand (tests); None: the grid size's step
+        #: (ROTATE_STEP_FOR_GRID), so [ and ] change it mid-drag.
+        self._rotate_snap_override = None
+        self._rotate_last_world = None # the cursor in the last rotate update
+        #: A selected decal's edge being dragged (decal_handles): the decal,
+        #: which edge, and whether its undo step is saved yet.
+        self._decal_resize = None
+        #: A selected LightVolume's box handle or light source being dragged
+        #: (light_volume_handles): the volume, what is dragged, and whether
+        #: its undo step is saved yet.
+        self._light_volume_drag = None
+
+        # --- Component editing (face / edge / vertex / side stretch) ---
+        # The mode, hover and selection live on the main window's shared
+        # ComponentController; only the per-view drag anchors live here.
+        self.component_drag_start = None    # QPointF, view-plane press point
+        self.component_drag_anchor = None   # world position of the grabbed part
+        self.component_drag_kind = None     # 'vertex' / 'edge' / 'face' / 'side'
+
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.ClickFocus)
+        self.setContextMenuPolicy(Qt.NoContextMenu)
+
+        # Initialize color tag icons - load directly from assets (don't depend on scene_hierarchy)
+        self.color_pixmaps = {}
+        colour_icon_map = {
+            'red': "assets/circ_red.png",
+            'orange': "assets/circ_orange.png",
+            'yellow': "assets/circ_yellow.png",
+            'green': "assets/circ_green.png",
+            'blue': "assets/circ_blue.png",
+            'pink': "assets/circ_pink.png",
+            'white': "assets/circ_white.png",
+        }
+        for color_name, path in colour_icon_map.items():
+            pixmap = load_pixmap(path)
+            if not pixmap.isNull():
+                self.color_pixmaps[color_name] = pixmap.scaled(18, 18, Qt.KeepAspectRatio, Qt.SmoothTransformation) 
+
+    def showEvent(self, event):
+        """Only the 2D view on screen does any work: a hidden one is never
+        painted (Qt drops update() for it) and its animation timer sleeps.
+        The first paint after it is shown draws the scene as it is then."""
+        super().showEvent(event)
+        self._last_camera_pos = None        # re-read the camera at once
+        self._base_layer_valid = False
+
+    def hideEvent(self, event):
+        """Let this view sleep while another 2D view is shown."""
+        super().hideEvent(event)
+        self.animation_timer.stop()
+        self._base_layer = None             # not kept while out of sight
+        self._brush_cull = None
+
+    def reset_state(self):
+        # A drag in flight owns the views: update_views() reaches every 2D view
+        # (including this one) while the mouse is still down, and tearing the
+        # drag down here would strand the operation half-done — or, for a
+        # rotate, end it after a single step.
+        if self._drag_in_progress():
+            self.update()
+            return
+        self.component_drag_start = None
+        self.component_drag_anchor = None
+        self.component_drag_kind = None
+        self.is_dragging_object = False
+        self.is_resizing_brush = False
+        self.resize_handle_ix = -1
+        self.is_connecting = False
+        self.connection_source = None
+        self.connection_snap_target = None
+        self.clip_points = []
+        self.clip_hover = None
+        self.rotate_dragging = False
+        self.rotate_pivot = None
+        self.rotate_pivot3 = None
+        # Select-tool / group-manipulation transient state.
+        self.is_marquee_select = False
+        self.marquee_hits = []
+        self.is_group_resizing = False
+        self.group_resize_handle = -1
+        self._group_start = None
+        self.is_group_rotating = False
+        self.update()
+
+    def _drag_in_progress(self):
+        """True while any of this view's drag tools is mid-gesture."""
+        components = self.main_window.components
+        if components is not None and components.drag is not None:
+            return True
+        return bool(self.rotate_dragging or self.is_group_rotating or
+                    self.is_group_resizing or self.is_resizing_brush or
+                    self.is_dragging_object)
+
+    # ======================================================================
+    # Clip / slice tool
+    # ======================================================================
+
+    def _clip_active(self):
+        """True when the global clip mode is on (toggled by the X button)."""
+        return bool(self.main_window.clip_mode)
+
+    def _axis_indices(self):
+        """(axis1_idx, axis2_idx, depth_idx) for this ortho view."""
+        ax_map = {'x': 0, 'y': 1, 'z': 2}
+        ax1, ax2 = self.get_axes()
+        if not ax1 or not ax2:
+            return None
+        a1, a2 = ax_map[ax1], ax_map[ax2]
+        depth = ({0, 1, 2} - {a1, a2}).pop()
+        return a1, a2, depth
+
+    def clear_clip(self):
+        """Discard the in-progress cut (points/preview) but stay in clip mode."""
+        self.clip_points = []
+        self.clip_hover = None
+        self.update()
+
+    # ------------------------------------------------------------------
+    # Free-rotate tool
+    # ------------------------------------------------------------------
+    def _rotate_active(self):
+        """True when the global free-rotate mode is on (rotate toolbar button)."""
+        return bool(self.main_window.rotate_mode)
+
+    def _rotate_axis_vec(self):
+        """3D rotation axis for this view: e_axis1 x e_axis2, so a positive drag
+        angle (measured with atan2 in the view's 2D world frame) spins the
+        geometry the same way in that frame."""
+        idx = self._axis_indices()
+        if idx is None:
+            return None
+        a1, a2, _ = idx
+        e1 = [0.0, 0.0, 0.0]; e1[a1] = 1.0
+        e2 = [0.0, 0.0, 0.0]; e2[a2] = 1.0
+        return [e1[1]*e2[2] - e1[2]*e2[1],
+                e1[2]*e2[0] - e1[0]*e2[2],
+                e1[0]*e2[1] - e1[1]*e2[0]]
+
+    def _selected_brush(self):
+        obj = self.editor.primary_selection()
+        return obj if isinstance(obj, dict) else None
+
+    # ======================================================================
+    # Component editing (object / face / edge / vertex) — Radiant-style
+    # ======================================================================
+    #
+    # Everything below is driven by mouse events only.  A pick tests just the
+    # brushes in the current selection, and a drag works from a snapshot taken
+    # at mouse-down, so neither the paint path nor the scene at large is
+    # touched while the user is dragging.
+
+    def _components(self):
+        """The shared component controller living on the main window."""
+        return self.main_window.components
+
+    def _component_mode(self):
+        return self._components().mode
+
+    def _component_targets(self):
+        """Brushes a component pick is allowed to test (the selection)."""
+        return self.main_window.component_drag_targets()
+
+    def _world_per_pixel(self):
+        return 1.0 / max(self.zoom_factor, 1e-6)
+
+    def _view_ray(self, world_pos, depth_reference=None):
+        """A world-space ray through the cursor along this view's depth axis.
+
+        The 2D views are orthographic, so "what is under the cursor" is a line
+        through the view plane rather than a point — the same line the side and
+        face tests want.
+        """
+        idx = self._axis_indices()
+        if idx is None:
+            return None, None
+        a1, a2, depth = idx
+        origin = np.zeros(3)
+        origin[a1] = world_pos.x()
+        origin[a2] = world_pos.y()
+        origin[depth] = 0.0 if depth_reference is None else float(depth_reference)
+        direction = np.zeros(3)
+        direction[depth] = 1.0
+        return origin, direction
+
+    def _pick_component(self, world_pos):
+        """Component under the cursor, or ``None``.  Selection-scoped."""
+        idx = self._axis_indices()
+        mode = self._component_mode()
+        if idx is None or mode == ce.MODE_OBJECT:
+            return None
+        targets = self._component_targets()
+        if not targets:
+            return None
+        a1, a2, _ = idx
+        tol = COMPONENT_GRAB_PIXELS * self._world_per_pixel()
+        return ce.pick_component_2d(targets, mode,
+                                    (world_pos.x(), world_pos.y()),
+                                    a1, a2, tol)
+
+    def _drag_axes(self):
+        """The two world axes a drag in this view may move things along."""
+        idx = self._axis_indices()
+        return None if idx is None else (idx[0], idx[1])
+
+    def _view_plane_delta(self, world_pos):
+        """Raw (unsnapped) world delta from the drag start to ``world_pos``."""
+        idx = self._axis_indices()
+        if idx is None or self.component_drag_start is None:
+            return np.zeros(3)
+        a1, a2, _ = idx
+        delta = np.zeros(3)
+        delta[a1] = world_pos.x() - self.component_drag_start.x()
+        delta[a2] = world_pos.y() - self.component_drag_start.y()
+        return delta
+
+    def _snap_grid(self):
+        """Grid step for component drags, or 0 when snapping is switched off."""
+        return self.grid_size if self.snap_to_grid_enabled else 0
+
+    def begin_component_drag(self, ref, world_pos, shear=False, additive=False):
+        """Start dragging a picked component.  One undo checkpoint, at mouse-down.
+
+        What the press selects and which drag it builds is the controller's to
+        decide (:meth:`ComponentController.press`), shared with the 3D viewport.
+        What is left here is this view's alone: the world position the drag is
+        measured from, and the undo checkpoint.
+        """
+        controller = self._components()
+        drag = controller.press(ref, shear=shear, additive=additive)
+        if drag is None:
+            return False
+        # Matches every other drag tool in Fio (rotate, group resize): the
+        # checkpoint is pushed once here and the moves that follow add none.
+        self.main_window.save_state()
+        self.component_drag_start = QPointF(world_pos)
+        self.component_drag_anchor = np.array(ref.position, dtype=np.float64)
+        self.component_drag_kind = ref.kind
+        self.update()
+        return True
+
+    def begin_side_stretch(self, world_pos):
+        """Grab the brush side under the cursor, Radiant's direct side stretch.
+
+        Returns ``True`` when a side was grabbed.  Clicking near a corner grabs
+        both sides that meet there, so a corner drag resizes in two axes at
+        once without any handle.
+        """
+        targets = self._component_targets()
+        if not targets:
+            return False
+        origin, direction = self._view_ray(world_pos)
+        if origin is None:
+            return False
+        tol = SIDE_GRAB_PIXELS * self._world_per_pixel()
+        drag, picked = ce.begin_side_stretch(targets, origin, direction, tol,
+                                             min_t=-math.inf)
+        if drag is None or drag.is_empty():
+            return False
+        self.main_window.save_state()
+        self._components().begin_drag(drag)
+        self.component_drag_start = QPointF(world_pos)
+        self.component_drag_anchor = None
+        self.component_drag_kind = 'side'
+        self.setCursor(Qt.SizeAllCursor)
+        self.update()
+        return True
+
+    def update_component_drag(self, world_pos):
+        """Apply the drag for the cursor's current position."""
+        controller = self._components()
+        if controller.drag is None or self.component_drag_start is None:
+            return
+        axes = self._drag_axes()
+        delta = self._view_plane_delta(world_pos)
+        grid = self._snap_grid()
+        if self.component_drag_kind in (ce.MODE_VERTEX, ce.MODE_EDGE) and \
+                self.component_drag_anchor is not None:
+            # Grabbing a specific corner: snap where that corner lands, so it
+            # ends up on a grid intersection exactly like a dragged brush edge.
+            delta = ce.snap_component_delta(self.component_drag_anchor, delta,
+                                            grid, axes=axes)
+        else:
+            # Faces and sides move a plane, so snap the movement itself — the
+            # plane keeps whatever sub-grid offset the brush already had.
+            delta = ce.snap_delta(delta, grid, axes=axes)
+        controller.update_drag(delta)
+        current_time = time.time()
+        if current_time - self.last_3d_update_time > 0.016:
+            self.main_window.view_3d.update()
+            self.last_3d_update_time = current_time
+        self.update()
+
+    def end_component_drag(self):
+        """Commit the drag; drop the checkpoint if nothing actually moved."""
+        controller = self._components()
+        if controller.drag is None:
+            return False
+        label = controller.drag.label
+        rejected = controller.drag.rejected
+        changed = controller.commit_drag()
+        self.component_drag_start = None
+        self.component_drag_anchor = None
+        self.component_drag_kind = None
+        self.setCursor(Qt.ArrowCursor)
+        if changed:
+            self.main_window.unsaved_changes = True
+            self.main_window.state.mark_lighting_dirty()
+            if rejected:
+                self.main_window.show_toast(
+                    "%s — stopped at the last valid shape" % label.capitalize())
+        else:
+            # Nothing moved: undo the checkpoint we pushed at mouse-down so the
+            # user's undo history has no empty step in it (and gets the redo
+            # branch that checkpoint cleared back).
+            self.editor.state.discard_last_checkpoint()
+        self.main_window.property_editor.set_object(
+            self.editor.primary_selection())
+        self.main_window.refresh_views()
+        return changed
+
+    def cancel_component_drag(self):
+        """Abort the drag, restoring every affected brush."""
+        controller = self._components()
+        if controller.drag is None:
+            return False
+        controller.cancel_drag()
+        self.editor.state.discard_last_checkpoint()
+        self.component_drag_start = None
+        self.component_drag_anchor = None
+        self.component_drag_kind = None
+        self.setCursor(Qt.ArrowCursor)
+        self.main_window.refresh_views()
+        return True
+
+    def update_component_hover(self, world_pos):
+        """Refresh the highlighted component; repaint only when it changed."""
+        if self._component_mode() == ce.MODE_OBJECT:
+            return
+        if self._components().set_hover(self._pick_component(world_pos)):
+            # The handles are drawn over the scene (_paint_link_layers).
+            self._request_overlay_frame()
+
+    # ------------------------------------------------------------------
+    # Clone-and-place  (select -> Shift+Space -> move -> click)
+    # ------------------------------------------------------------------
+    def _track_clone_placement(self, world_pos):
+        """Keep the copies being placed under the cursor as it moves."""
+        placement = self.main_window.clone_placement
+        if not placement:
+            return
+        idx = self._axis_indices()
+        if idx is None:
+            return
+        a1, a2, _ = idx
+        snapped = self.snap_to_grid(world_pos)
+        anchor = placement.get('anchor')
+        if anchor is None:
+            # First move after the clone: latch on where the cursor is now, so
+            # the copies keep their initial grid offset instead of jumping.
+            placement['anchor'] = QPointF(snapped)
+            return
+        d1 = snapped.x() - anchor.x()
+        d2 = snapped.y() - anchor.y()
+        if d1 == 0 and d2 == 0:
+            return
+        delta = [0.0, 0.0, 0.0]
+        delta[a1] = d1
+        delta[a2] = d2
+        self.main_window.move_clone_placement(delta)
+        placement['anchor'] = QPointF(snapped)
+        current_time = time.time()
+        if current_time - self.last_3d_update_time > 0.016:
+            self.main_window.view_3d.update()
+            self.last_3d_update_time = current_time
+        self.update()
+
+    # ------------------------------------------------------------------
+    # Base tool (Select / Brush) + marquee helpers
+    # ------------------------------------------------------------------
+    def _select_tool_active(self):
+        """True when the Select (marquee) base tool is active and no special
+        drag tool (clip/rotate) is overriding it."""
+        if self._clip_active() or self._rotate_active():
+            return False
+        return self.main_window.tool_mode == 'select'
+
+    def _brush_tool_active(self):
+        """True when the Brush/Block (draw geometry) base tool is active."""
+        if self._clip_active() or self._rotate_active():
+            return False
+        return self.main_window.tool_mode == 'brush'
+
+    def reset_marquee(self):
+        """Cancel any in-progress rubber-band selection."""
+        self.is_marquee_select = False
+        self.marquee_hits = []
+        self.update()
+
+    def _selected_list(self):
+        """Current multi-selection as a plain list (never None)."""
+        objs = [o for o in self.editor.state.selected_objects if o is not None]
+        sel = self.editor.primary_selection()
+        if sel is not None and sel not in objs:
+            objs.append(sel)
+        return objs
+
+    def _obj_bounds_2d(self, obj, i1, i2):
+        """(min1, min2, max1, max2) footprint of a brush or point of a thing in
+        the current view plane."""
+        if isinstance(obj, dict):
+            b = brush_placement.world_bounds(obj)
+            return (b[i1], b[i2], b[i1 + 3], b[i2 + 3])
+        p = obj.pos
+        return (p[i1], p[i2], p[i1], p[i2])
+
+    def _objects_in_rect(self, world_rect, enclose=False):
+        """Objects whose footprint intersects (default) or is fully enclosed by
+        ``world_rect`` in the current view plane.  Skips hidden/locked-out ones."""
+        idx = self._axis_indices()
+        if idx is None:
+            return []
+        i1, i2, _ = idx
+        r = world_rect.normalized()
+        locked_out = self.main_window.config.getboolean(
+            'Display', 'locked_not_selectable_2d', fallback=False)
+        hits = []
+
+        for brush in self.editor.state.brushes:
+            if self._hidden(brush):
+                continue
+            if locked_out and brush.get('lock', False):
+                continue
+            b1, b2, B1, B2 = self._obj_bounds_2d(brush, i1, i2)
+            brect = QRectF(QPointF(b1, b2), QPointF(B1, B2)).normalized()
+            inside = (r.left() <= brect.left() and r.right() >= brect.right() and
+                      r.top() <= brect.top() and r.bottom() >= brect.bottom()) \
+                if enclose else r.intersects(brect)
+            if inside:
+                hits.append(brush)
+
+        for thing in self.editor.state.things:
+            if self._hidden(thing):
+                continue
+            if locked_out and thing.properties.get('lock', False):
+                continue
+            p = thing.pos
+            if r.contains(QPointF(p[i1], p[i2])):
+                hits.append(thing)
+        return hits
+
+    # ------------------------------------------------------------------
+    # Tier-2 group bounding box + scale / rotate manipulation
+    # ------------------------------------------------------------------
+    def _selection_bounds_2d(self):
+        """Combined world-space AABB (QRectF) of the whole selection in the view
+        plane, or None if nothing is selected."""
+        idx = self._axis_indices()
+        if idx is None:
+            return None
+        i1, i2, _ = idx
+        objs = self._selected_list()
+        if not objs:
+            return None
+        mn1 = mn2 = float('inf')
+        mx1 = mx2 = float('-inf')
+        for o in objs:
+            b1, b2, B1, B2 = self._obj_bounds_2d(o, i1, i2)
+            mn1, mn2 = min(mn1, b1), min(mn2, b2)
+            mx1, mx2 = max(mx1, B1), max(mx2, B2)
+        return QRectF(QPointF(mn1, mn2), QPointF(mx1, mx2)).normalized()
+
+    def _group_manip_active(self):
+        """The unified group box (scale/rotate handles) is shown when 2+ objects
+        are selected.  A lone brush keeps its own resize handles; a lone point
+        entity has nothing to scale."""
+        return len(self._selected_list()) >= 2
+
+    def _group_handle_at(self, screen_pos):
+        """Index (0-7) of the group bbox handle under the cursor, or -1."""
+        if not self._group_manip_active():
+            return -1
+        wb = self._selection_bounds_2d()
+        if wb is None:
+            return -1
+        p1 = self.world_to_screen(wb.topLeft())
+        p2 = self.world_to_screen(wb.bottomRight())
+        srect = QRectF(p1, p2).normalized()
+        for i, h in enumerate(self.get_resize_handles(srect)):
+            if (screen_pos - h).manhattanLength() < 10:
+                return i
+        return -1
+
+    def _begin_group_resize(self, handle_ix):
+        """Snapshot the selection so a handle drag can scale it about the
+        opposite edge/corner."""
+        idx = self._axis_indices()
+        wb = self._selection_bounds_2d()
+        if idx is None or wb is None:
+            return
+        i1, i2, _ = idx
+        self.main_window.save_state()
+        objs = self._selected_list()
+        snap = []
+        for o in objs:
+            if isinstance(o, dict):
+                snap.append((o, list(o['pos']), list(o['size'])))
+            else:
+                snap.append((o, list(o.pos), None))
+        self._group_start = {
+            'rect': QRectF(wb),
+            'objs': snap,
+            'i1': i1, 'i2': i2,
+        }
+        self.is_group_resizing = True
+        self.group_resize_handle = handle_ix
+
+    def _update_group_resize(self, world_pos):
+        """Scale every selected object about the anchor edge/corner so the group
+        bbox tracks the dragged handle (snapped to grid)."""
+        gs = self._group_start
+        if not gs:
+            return
+        i1, i2 = gs['i1'], gs['i2']
+        rect0 = gs['rect']
+        snapped = self.snap_to_grid(world_pos)
+        h = self.group_resize_handle
+
+        # Which edges this handle moves.  Handles: 0 TL,1 TR,2 BL,3 BR,
+        # 4 topMid,5 botMid,6 leftMid,7 rightMid.
+        moves_left = h in (0, 2, 6)
+        moves_right = h in (1, 3, 7)
+        moves_top = h in (0, 1, 4)
+        moves_bottom = h in (2, 3, 5)
+
+        left, right = rect0.left(), rect0.right()
+        top, bottom = rect0.top(), rect0.bottom()
+        if moves_left:
+            left = min(snapped.x(), right - self.grid_size)
+        if moves_right:
+            right = max(snapped.x(), left + self.grid_size)
+        if moves_top:
+            top = min(snapped.y(), bottom - self.grid_size)
+        if moves_bottom:
+            bottom = max(snapped.y(), top + self.grid_size)
+
+        ow, oh = rect0.width(), rect0.height()
+        nw, nh = (right - left), (bottom - top)
+        sx = nw / ow if ow > 1e-6 else 1.0
+        sy = nh / oh if oh > 1e-6 else 1.0
+        ox, oy = rect0.left(), rect0.top()   # map old->new: n = new_o + (p-old_o)*s
+
+        for entry in gs['objs']:
+            o, pos0, size0 = entry
+            if isinstance(o, dict):
+                c1 = pos0[i1]                 # brush centre on the two view axes
+                c2 = pos0[i2]
+                n1 = left + (c1 - ox) * sx
+                n2 = top + (c2 - oy) * sy
+                ns1 = max(self.grid_size, size0[i1] * sx)
+                ns2 = max(self.grid_size, size0[i2] * sy)
+                if bg.brush_has_geometry(o):
+                    lo = [pos0[k] - size0[k] / 2 for k in range(3)]
+                    hi = [pos0[k] + size0[k] / 2 for k in range(3)]
+                    lo[i1], hi[i1] = n1 - ns1 / 2, n1 + ns1 / 2
+                    lo[i2], hi[i2] = n2 - ns2 / 2, n2 + ns2 / 2
+                    bg.fit_brush_to_bounds(o, lo, hi)
+                else:
+                    o['pos'][i1] = n1
+                    o['pos'][i2] = n2
+                    o['size'][i1] = ns1
+                    o['size'][i2] = ns2
+            else:
+                # A point entity: scale its position about the anchor, keep size.
+                p1 = pos0[i1]
+                p2 = pos0[i2]
+                newp = list(o.pos)
+                newp[i1] = left + (p1 - ox) * sx
+                newp[i2] = top + (p2 - oy) * sy
+                o.pos = newp
+
+    def _end_group_resize(self):
+        self.is_group_resizing = False
+        self.group_resize_handle = -1
+        self._group_start = None
+
+    @property
+    def rotate_snap_deg(self):
+        """The rotate step: the grid size's (ROTATE_STEP_FOR_GRID)."""
+        if self._rotate_snap_override is not None:
+            return self._rotate_snap_override
+        return rotate_step_for_grid(self.grid_size)
+
+    @rotate_snap_deg.setter
+    def rotate_snap_deg(self, value):
+        self._rotate_snap_override = None if value is None else float(value)
+
+    def grid_size_changed(self):
+        """The grid size moved ([ or ]): the scissor's preview point and an
+        in-progress rotation snap to the new grid at once, without leaving
+        the tool or waiting for the mouse to move."""
+        if self._clip_active() and self._clip_hover_raw is not None:
+            self.clip_hover = self.snap_to_grid(self._clip_hover_raw)
+            self._update_clip_keep_side()
+        last = self._rotate_last_world
+        if last is not None:
+            if self.rotate_dragging:
+                self.update_rotate(last)
+            elif self.is_group_rotating:
+                self._update_group_rotate(last)
+        self.update()
+
+    def _begin_group_rotate(self, world_pos):
+        """Start a rotate-mode drag spinning the whole selection about the group
+        centre."""
+        wb = self._selection_bounds_2d()
+        if wb is None:
+            return False
+        self.group_rotate_pivot = wb.center()
+        self.group_rotate_start_ang = math.atan2(
+            world_pos.y() - self.group_rotate_pivot.y(),
+            world_pos.x() - self.group_rotate_pivot.x())
+        self.group_rotate_applied = 0.0
+        self.is_group_rotating = True
+        self.main_window.save_state()
+        return True
+
+    def _update_group_rotate(self, world_pos):
+        """Rotate the selection (brush geometry + every object's centre) about
+        the group pivot to follow the cursor."""
+        if not self.is_group_rotating or self.group_rotate_pivot is None:
+            return
+        self._rotate_last_world = QPointF(world_pos)
+        axis = self._rotate_axis_vec()
+        idx = self._axis_indices()
+        if axis is None or idx is None:
+            return
+        i1, i2, _ = idx
+        piv = self.group_rotate_pivot
+        ang = math.atan2(world_pos.y() - piv.y(), world_pos.x() - piv.x())
+        total = math.degrees(ang - self.group_rotate_start_ang)
+        if self.snap_to_grid_enabled and self.rotate_snap_deg > 0:
+            total = round(total / self.rotate_snap_deg) * self.rotate_snap_deg
+        delta = total - self.group_rotate_applied
+        if abs(delta) < 1e-6:
+            return
+        pivot3 = [0.0, 0.0, 0.0]
+        pivot3[i1] = piv.x()
+        pivot3[i2] = piv.y()
+        # Depth of the pivot is irrelevant for a rotation about the view axis.
+        rad = math.radians(delta)
+        cos_a, sin_a = math.cos(rad), math.sin(rad)
+        for o in self.editor.with_group_mates(self._selected_list()):
+            if isinstance(o, dict):
+                bg.rotate_brush(o, delta, axis, pivot=pivot3)
+            else:
+                p = list(o.pos)
+                dx, dy = p[i1] - piv.x(), p[i2] - piv.y()
+                p[i1] = piv.x() + dx * cos_a - dy * sin_a
+                p[i2] = piv.y() + dx * sin_a + dy * cos_a
+                o.pos = p
+        self.group_rotate_applied = total
+        # As above: a plain update_views() here would abort the drag.
+        self.main_window.refresh_views()
+
+    def _end_group_rotate(self):
+        applied = self.group_rotate_applied
+        self.is_group_rotating = False
+        if abs(applied) < 1e-6:
+            self.editor.state.discard_last_checkpoint()
+        else:
+            self.main_window.unsaved_changes = True
+            self.main_window.state.mark_lighting_dirty()
+            self.main_window.show_toast(f"Rotated group {applied:+.0f}°")
+
+    def begin_rotate(self, world_pos):
+        """Start a free-rotate drag around the centre of the whole selection.
+
+        Press and hold anywhere in the view and the selection follows the
+        cursor's angle about that centre — the Radiant gesture.  The pivot is
+        fixed for the duration of the drag so the geometry cannot wander as it
+        turns, and the whole spin is one undo step.
+        """
+        idx = self._axis_indices()
+        centre = self.main_window.selection_centre()
+        if idx is None or centre is None:
+            self.main_window.show_toast("Rotate: select something first",
+                                        is_error=True)
+            return False
+        a1, a2, _ = idx
+        self.rotate_pivot = QPointF(float(centre[a1]), float(centre[a2]))
+        self.rotate_pivot3 = list(centre)
+        self.rotate_start_ang = math.atan2(world_pos.y() - self.rotate_pivot.y(),
+                                           world_pos.x() - self.rotate_pivot.x())
+        self.rotate_applied = 0.0
+        self.rotate_dragging = True
+        self.main_window.save_state()  # single undo checkpoint for the whole drag
+        self.update()
+        return True
+
+    def update_rotate(self, world_pos):
+        """Apply the incremental rotation to reach the cursor's current angle."""
+        if not self.rotate_dragging or self.rotate_pivot is None:
+            return
+        self._rotate_last_world = QPointF(world_pos)
+        axis = self._rotate_axis_vec()
+        if axis is None:
+            return
+        ang = math.atan2(world_pos.y() - self.rotate_pivot.y(),
+                         world_pos.x() - self.rotate_pivot.x())
+        total_deg = math.degrees(ang - self.rotate_start_ang)
+        if self.snap_to_grid_enabled and self.rotate_snap_deg > 0:
+            total_deg = round(total_deg / self.rotate_snap_deg) * self.rotate_snap_deg
+        delta = total_deg - self.rotate_applied
+        if abs(delta) < 1e-6:
+            return
+        if self.main_window.apply_rotation_to_selection(
+                delta, axis, undoable=False, pivot=self.rotate_pivot3):
+            self.rotate_applied = total_deg
+            # Repaint without resetting view state: update_views() would call
+            # reset_state() on this very view and end the drag, forcing the
+            # user to release and press again for every single step.
+            self.main_window.refresh_views()
+            sel = self._selected_brush()
+            if sel is not None:
+                self.main_window.property_editor.set_object(sel)
+
+    def commit_rotate(self):
+        """Finish the drag, keeping the applied rotation (undo already staged)."""
+        if not self.rotate_dragging:
+            return
+        applied = self.rotate_applied
+        self.rotate_dragging = False
+        if abs(applied) < 1e-6:
+            # Nothing actually rotated — drop the checkpoint we pushed.
+            self.editor.state.discard_last_checkpoint()
+        else:
+            self.main_window.unsaved_changes = True
+            self.main_window.state.mark_lighting_dirty()
+            self.main_window.show_toast(f"Rotated {applied:.0f}°")
+        self.update()
+
+    def cancel_rotate(self):
+        """Abort an in-progress drag, restoring the pre-drag orientation."""
+        if not self.rotate_dragging:
+            self.rotate_pivot = None
+            return
+        axis = self._rotate_axis_vec()
+        if axis is not None and abs(self.rotate_applied) > 1e-6:
+            # Unwind about the same pivot the drag used, or the selection would
+            # come back rotated correctly but sitting somewhere else.
+            self.main_window.apply_rotation_to_selection(
+                -self.rotate_applied, axis, undoable=False,
+                pivot=self.rotate_pivot3)
+        self.editor.state.discard_last_checkpoint()
+        self.rotate_dragging = False
+        self.rotate_pivot = None
+        self.rotate_pivot3 = None
+        self.rotate_applied = 0.0
+        self.editor.update_views()
+
+    def _clip_plane(self):
+        """Build the 3D cut plane from the two placed points.
+
+        Returns ``(normal_list, offset, keep_positive)`` where a point ``p`` is
+        kept when ``dot(normal, p) <= offset`` (unless keep_positive), matching
+        ``brush_geometry``'s convention.  Returns ``None`` until two points exist.
+        """
+        if len(self.clip_points) < 2:
+            return None
+        idx = self._axis_indices()
+        if idx is None:
+            return None
+        a1, a2, depth = idx
+        A, B = self.clip_points[0], self.clip_points[1]
+        dx, dy = B.x() - A.x(), B.y() - A.y()
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+            return None
+        # Normal perpendicular to the cut line, lying in the view plane.
+        nx, ny = dy, -dx
+        length = math.hypot(nx, ny)
+        nx, ny = nx / length, ny / length
+        normal = [0.0, 0.0, 0.0]
+        normal[a1] = nx
+        normal[a2] = ny
+        # Offset for the (already unit) normal: dot(n, point_on_plane).
+        offset = nx * A.x() + ny * A.y()
+        # Keep the side the cursor is on.
+        keep_positive = self.clip_keep_positive
+        return normal, offset, keep_positive
+
+    def _update_clip_keep_side(self):
+        """Set keep_positive from which side of the cut line the cursor is on."""
+        if len(self.clip_points) < 2 or self.clip_hover is None:
+            return
+        A, B = self.clip_points[0], self.clip_points[1]
+        dx, dy = B.x() - A.x(), B.y() - A.y()
+        nx, ny = dy, -dx
+        side = nx * (self.clip_hover.x() - A.x()) + ny * (self.clip_hover.y() - A.y())
+        # Cursor on the +n side -> keep the +n (positive) half.
+        self.clip_keep_positive = side > 0
+
+    def _split_held(self):
+        """True while Shift is down — the modifier that keeps both halves."""
+        return bool(QApplication.keyboardModifiers() & Qt.ShiftModifier)
+
+    def apply_clip(self, split=False):
+        """Cut the selection with the placed plane.
+
+        Keeps only the previewed side by default; with ``split`` the far side
+        survives as a separate brush, so one gesture cuts a brush in two rather
+        than slicing a piece off it.
+        """
+        plane = self._clip_plane()
+        if plane is None:
+            self.main_window.show_toast("Clip: place two points first", is_error=True)
+            return
+        normal, offset, keep_positive = plane
+        n = self.main_window.apply_clip_to_selection(normal, offset, keep_positive,
+                                                     split=split)
+        if n:
+            self.main_window.show_toast(
+                f"Split {n} brush(es) — both halves kept" if split
+                else f"Clipped {n} brush(es)")
+        else:
+            self.main_window.show_toast("Clip: select a brush to slice", is_error=True)
+        self.clear_clip()
+
+    def draw_clip_overlay(self, painter):
+        """Draw the clip-tool banner, cut line, points and kept-side arrow."""
+        painter.save()
+
+        # Banner / hint in the top-left corner.
+        painter.setPen(QColor(255, 200, 0))
+        font = painter.font()
+        font.setPointSize(10)
+        font.setBold(True)
+        painter.setFont(font)
+        splitting = self._split_held()
+        if len(self.clip_points) == 0:
+            hint = "CLIP MODE — click two points to set the cut  (X to exit)"
+        elif len(self.clip_points) == 1:
+            hint = "CLIP MODE — click the second point"
+        elif splitting:
+            hint = "SPLIT — Enter cuts the brush in two, keeping BOTH halves"
+            painter.setPen(QColor(80, 200, 255))
+        else:
+            hint = ("CLIP MODE — move to pick the side to KEEP, Enter to cut, "
+                    "Shift+Enter to split  (Esc cancels)")
+        painter.drawText(10, 20, hint)
+
+        cut_pen = QPen(QColor(255, 210, 0), 1, Qt.DashLine)
+        pt_pen = QPen(QColor(255, 255, 255), 2)
+
+        # First point placed: rubber-band to the cursor.
+        if len(self.clip_points) == 1:
+            p0 = self.world_to_screen(self.clip_points[0])
+            painter.setPen(cut_pen)
+            if self.clip_hover is not None:
+                painter.drawLine(p0, self.world_to_screen(self.clip_hover))
+            painter.setPen(pt_pen)
+            painter.drawEllipse(p0, 4, 4)
+
+        # Both points placed: full cut line + kept-side arrow.
+        elif len(self.clip_points) >= 2:
+            A, B = self.clip_points[0], self.clip_points[1]
+            pA, pB = self.world_to_screen(A), self.world_to_screen(B)
+            # Extend the line across the whole widget.
+            dx, dy = pB.x() - pA.x(), pB.y() - pA.y()
+            length = math.hypot(dx, dy) or 1.0
+            ux, uy = dx / length, dy / length
+            far = float(self.width() + self.height())
+            painter.setPen(cut_pen)
+            painter.drawLine(QPointF(pA.x() - ux * far, pA.y() - uy * far),
+                             QPointF(pB.x() + ux * far, pB.y() + uy * far))
+            painter.setPen(pt_pen)
+            painter.drawEllipse(pA, 4, 4)
+            painter.drawEllipse(pB, 4, 4)
+
+            # Kept-side arrow: offset the midpoint in world space toward the kept
+            # half, then map to screen so the view's axis flips are handled.
+            mid = QPointF((A.x() + B.x()) * 0.5, (A.y() + B.y()) * 0.5)
+            # Perpendicular in world coords (kept-side nudge direction):
+            wdx, wdy = B.x() - A.x(), B.y() - A.y()
+            wnx, wny = wdy, -wdx
+            wlen = math.hypot(wnx, wny) or 1.0
+            wnx, wny = wnx / wlen, wny / wlen
+            s_mid = self.world_to_screen(mid)
+            reach = 32.0 / self.zoom_factor
+
+            def _marker(sign, colour, label):
+                world = QPointF(mid.x() + wnx * sign * reach,
+                                mid.y() + wny * sign * reach)
+                screen = self.world_to_screen(world)
+                painter.setPen(QPen(colour, 2))
+                painter.drawLine(s_mid, screen)
+                painter.drawEllipse(screen, 5, 5)
+                painter.setPen(colour)
+                painter.drawText(screen + QPointF(8, 4), label)
+
+            keep = QColor(60, 220, 90)
+            if splitting:
+                # Both halves survive, so neither side is the "discarded" one.
+                both = QColor(80, 200, 255)
+                _marker(1.0, both, "keep")
+                _marker(-1.0, both, "keep")
+            else:
+                _marker(1.0 if self.clip_keep_positive else -1.0, keep, "keep")
+
+        painter.restore()
+
+    def draw_rotate_overlay(self, painter):
+        """Draw the rotate-tool banner, pivot marker and live angle readout."""
+        painter.save()
+        painter.setPen(QColor(255, 200, 0))
+        font = painter.font()
+        font.setPointSize(10)
+        font.setBold(True)
+        painter.setFont(font)
+        mode = (f"{self.rotate_snap_deg:g}° steps, grid {self.grid_size} - [ ] to change"
+                if self.snap_to_grid_enabled else "free")
+        painter.drawText(10, 20, f"ROTATE MODE ({mode}) — drag to spin the "
+                                 f"selection  (Esc to exit)")
+
+        if self.rotate_pivot is not None:
+            c = self.world_to_screen(self.rotate_pivot)
+            painter.setPen(QPen(QColor(255, 210, 0), 1, Qt.DashLine))
+            painter.drawEllipse(c, 26, 26)
+            painter.setPen(QPen(QColor(255, 255, 255), 1))
+            painter.drawLine(QPointF(c.x() - 6, c.y()), QPointF(c.x() + 6, c.y()))
+            painter.drawLine(QPointF(c.x(), c.y() - 6), QPointF(c.x(), c.y() + 6))
+            if self.rotate_dragging:
+                painter.setPen(QColor(60, 220, 90))
+                painter.drawText(c + QPointF(30, 4), f"{self.rotate_applied:+.0f}°")
+        painter.restore()
+
+    def _store_previous_tab_index(self):
+        """Store the current tab index before switching to Properties."""
+        if self.main_window.properties_tab_widget:
+            self.main_window._previous_tab_index = self.main_window.properties_tab_widget.currentIndex()
+
+    def _focus_properties_tab(self):
+        """Focus the Properties tab in the properties dock."""
+        if self.main_window.properties_tab_widget:
+            self._store_previous_tab_index()
+            self.main_window.properties_tab_widget.setCurrentIndex(0)
+
+    def keyPressEvent(self, event):
+        # --- Escape backs out of the innermost thing in progress ---
+        if event.key() == Qt.Key_Escape:
+            if self._components().drag is not None:
+                self.cancel_component_drag()
+                return
+            if self.main_window.clone_placement_active():
+                self.main_window.cancel_clone_placement()
+                self.update()
+                return
+
+        # --- Free-rotate tool keys (only while rotate mode is active) ---
+        if self._rotate_active():
+            if event.key() == Qt.Key_Escape:
+                if self.rotate_dragging:
+                    self.cancel_rotate()            # abort the current spin
+                else:
+                    self.main_window.set_rotate_mode(False)  # exit rotate mode
+                return
+
+        # --- Clip / slice tool keys (only while clip mode is active) ---
+        if self._clip_active():
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                # Shift keeps the far side too, Radiant's Split.
+                self.apply_clip(split=bool(event.modifiers() & Qt.ShiftModifier))
+                return
+            if event.key() == Qt.Key_Shift:
+                self.update()       # redraw the overlay in split colours
+            if event.key() == Qt.Key_Escape:
+                if self.clip_points:
+                    self.clear_clip()               # cancel the pending cut
+                else:
+                    self.main_window.set_clip_mode(False)  # exit clip mode
+                return
+
+        # F1 Synchronization ---
+        if event.key() == Qt.Key_F1:
+            # Keep the View-menu action and the 2D/3D shortcut in sync.
+            current_state = self.editor.show_logic_links
+            self.main_window.set_connection_links_enabled(not current_state)
+            return
+
+        # --- Arrow Key Nudging ---
+        # Only process arrow keys if we have a selected object and we're not in play mode
+        selected = self.editor.primary_selection()
+        if selected and not self.editor.view_3d.play_mode:
+            arrow_key = None
+            if event.key() == Qt.Key_Up:
+                arrow_key = 'up'
+            elif event.key() == Qt.Key_Down:
+                arrow_key = 'down'
+            elif event.key() == Qt.Key_Left:
+                arrow_key = 'left'
+            elif event.key() == Qt.Key_Right:
+                arrow_key = 'right'
+
+            if arrow_key:
+                # Determine move distance
+                # If grid is visible, use grid size; otherwise use a default of 16
+                if self.grid_visible:
+                    base_distance = self.grid_size
+                else:
+                    base_distance = 16
+
+                # Shift = 5x distance for bigger jumps
+                if event.modifiers() & Qt.ShiftModifier:
+                    distance = base_distance * 5
+                else:
+                    distance = base_distance
+
+                # Get the axes for this view
+                ax1, ax2 = self.get_axes()
+                if ax1 and ax2:
+                    ax_map = {'x': 0, 'y': 1, 'z': 2}
+                    a1_idx = ax_map[ax1]
+                    a2_idx = ax_map[ax2]
+
+                    # Determine direction multipliers based on view type
+                    # Top view: x right, z down (screen Y increases downward)
+                    # Front view: x right, y up (screen Y increases downward, so y decreases upward)
+                    # Side view: z right, y up
+                    if self.view_type == 'top':
+                        dx_map = {'left': -1, 'right': 1, 'up': 0, 'down': 0}
+                        dz_map = {'left': 0, 'right': 0, 'up': -1, 'down': 1}
+                        dy_map = {'left': 0, 'right': 0, 'up': 0, 'down': 0}
+                    elif self.view_type == 'front':
+                        dx_map = {'left': -1, 'right': 1, 'up': 0, 'down': 0}
+                        dy_map = {'left': 0, 'right': 0, 'up': 1, 'down': -1}
+                        dz_map = {'left': 0, 'right': 0, 'up': 0, 'down': 0}
+                    elif self.view_type == 'side':
+                        dz_map = {'left': -1, 'right': 1, 'up': 0, 'down': 0}
+                        dy_map = {'left': 0, 'right': 0, 'up': 1, 'down': -1}
+                        dx_map = {'left': 0, 'right': 0, 'up': 0, 'down': 0}
+                    else:
+                        dx_map = dy_map = dz_map = {'left': 0, 'right': 0, 'up': 0, 'down': 0}
+
+                    # Calculate delta for each axis
+                    delta_x = dx_map[arrow_key] * distance
+                    delta_y = dy_map[arrow_key] * distance
+                    delta_z = dz_map[arrow_key] * distance
+
+                    # Begin (or continue) a nudge burst.  save_state() is a
+                    # full-scene serialization, so we call it only once per
+                    # burst; the idle timer below closes the burst after a pause.
+                    self._begin_nudge_burst()
+
+                    # One delta for the whole selection, snapped from the
+                    # object that was clicked.  Snapping each object's own
+                    # destination instead would drag them onto a common grid
+                    # line and destroy the layout the user arranged; this is
+                    # the same rule a mouse drag follows.
+                    group = [o for o in self._selected_list()
+                             if not (o.get('lock', False) if isinstance(o, dict)
+                                     else o.properties.get('lock', False))]
+                    if not group:
+                        return
+                    group = self.editor.movable_with_mates(group)
+                    primary = selected if selected in group else group[0]
+                    p_ref = primary['pos'] if isinstance(primary, dict) else primary.pos
+
+                    raw = (delta_x, delta_y, delta_z)
+                    d1, d2 = raw[a1_idx], raw[a2_idx]
+                    if self.grid_visible:
+                        grid = self.grid_size
+                        d1 = round((p_ref[a1_idx] + d1) / grid) * grid - p_ref[a1_idx]
+                        d2 = round((p_ref[a2_idx] + d2) / grid) * grid - p_ref[a2_idx]
+
+                    for obj in group:
+                        self._translate_object_2d(obj, d1, d2, a1_idx, a2_idx)
+
+                    # Update views
+                    self.update()
+                    self.main_window.view_3d.update()
+
+                    # NOTE: We intentionally do NOT rebuild the property editor
+                    # here.  set_object() tears down and recreates the entire
+                    # property panel (scroll area, tabs, dozens of widgets), which
+                    # made repeated nudges very slow.  The panel does not display
+                    # the object's live position, so there is nothing to refresh;
+                    # the 2D/3D repaints above already reflect the new position.
+                    return
+
+        super().keyPressEvent(event)
+
+    def _begin_nudge_burst(self):
+        """Start a nudge burst if one isn't already running, and keep it alive.
+
+        The first nudge of a burst records a single undo snapshot; subsequent
+        nudges within the idle window reuse it instead of serializing the whole
+        scene again.  Each nudge (re)starts the idle timer so a held key or a
+        rapid tap sequence stays in one burst.
+        """
+        if not self._nudge_in_progress:
+            self.main_window.save_state()
+            self._nudge_in_progress = True
+        # Restart the inactivity countdown; the burst ends only after a pause.
+        self._nudge_idle_timer.start()
+
+    def _end_nudge_burst(self):
+        """Close the current nudge burst so the next nudge starts a new undo step."""
+        self._nudge_in_progress = False
+
+    def keyReleaseEvent(self, event):
+        if event.key() == Qt.Key_Shift and self._clip_active():
+            self.update()           # back to single-side colours
+        # A key release alone must not end the nudge burst: Qt auto-repeat fires
+        # a release between every repeated press, and tapping an arrow key
+        # releases between taps.  Ending the burst here would force a fresh
+        # full-scene save_state() on the very next nudge, which is exactly the
+        # slowdown we are avoiding.  The idle timer ends the burst after a pause.
+        super().keyReleaseEvent(event)
+
+    def get_visible_world_bounds(self):
+        """Returns a QRectF of the visible world area in this 2D view."""
+        width = self.width()
+        height = self.height()
+        
+        # Handle invalid size
+        if width <= 0 or height <= 0 or self.zoom_factor <= 0:
+            return QRectF(0, 0, 0, 0)
+        
+        # Calculate half dimensions in world space
+        half_width_world = width / (2.0 * self.zoom_factor)
+        half_height_world = height / (2.0 * self.zoom_factor)
+        
+        # Create bounds rect centered on pan_offset
+        bounds = QRectF(
+            self.pan_offset.x() - half_width_world,
+            self.pan_offset.y() - half_height_world,
+            half_width_world * 2,
+            half_height_world * 2
+        )
+        
+        return bounds
+
+    def _filtered(self, obj):
+        """Whether the editor's view filters (the Filter menu) hide *obj*."""
+        return self.editor.state.view_filters.hides(obj)
+
+    def _hidden(self, obj):
+        """Hidden by the map, or filtered out of the editor's views. A decal
+        is shown like any entity, marked with the DECAL button's icon
+        (:meth:`editor.things.Decal.get_icon_pixmap`)."""
+        props = obj if isinstance(obj, dict) else obj.properties
+        return bool(props.get('hidden', False)) or self._filtered(obj)
+
+    def is_brush_visible(self, brush, visible_bounds, axis1_idx, axis2_idx):
+        """Check if a brush's projected bounding box intersects the visible area."""
+        if self._hidden(brush):
+            return False
+        
+        # Derived bounds (brush_placement) in the view's two axes.
+        size = brush.get('size', [0, 0, 0])
+
+        # Skip degenerate brushes
+        if size[axis1_idx] <= 0 or size[axis2_idx] <= 0:
+            return False
+
+        b = brush_placement.world_bounds(brush)
+        min_x, max_x = b[axis1_idx], b[axis1_idx + 3]
+        min_y, max_y = b[axis2_idx], b[axis2_idx + 3]
+        # QRectF.intersects, without building a QRectF per brush per paint
+        # (this runs for every brush in the map on each repaint): an empty
+        # box intersects nothing, and touching edges do not intersect.
+        if max_x <= min_x or max_y <= min_y:
+            return False
+        return (min_x < visible_bounds.right() and visible_bounds.left() < max_x
+                and min_y < visible_bounds.bottom() and visible_bounds.top() < max_y)
+
+    def is_thing_visible(self, thing, visible_bounds, axis1_idx, axis2_idx):
+        """Whether any of what a thing draws can be in the visible area.
+
+        Its origin, padded by the most it draws away from it: 32 pixels for
+        a sprite, its radius (world units) for a Light or Speaker, and the
+        reach of its model for a model -- whose origin is the point it
+        stands on. The pad used to be 32 *pixels* for everything (a radius
+        was divided by the zoom too), so zoomed in on the top of a model,
+        or on a radius circle, the origin left the view and the whole thing
+        vanished: the closer the zoom, the sooner.
+        """
+        pos = thing.pos
+        x = pos[axis1_idx]
+        y = pos[axis2_idx]
+
+        margin = 32.0 / self.zoom_factor if self.zoom_factor > 0 else 32.0
+        # The radius a Light, Speaker etc. draws, in world units.
+        if hasattr(thing, 'get_radius'):
+            try:
+                margin = max(margin, float(thing.get_radius() or 0.0))
+            except (TypeError, ValueError):
+                pass
+        if isinstance(thing, PlayerStart):
+            margin = max(margin, 64.0)  # full 100-unit sign, including its base
+        margin = max(margin, self._model_reach(thing))
+
+        point_rect = QRectF(x - margin, y - margin, margin * 2, margin * 2)
+        return visible_bounds.intersects(point_rect)
+
+    #: Models whose reach is remembered (each ``positions`` array is its
+    #: loaded model's, shared by every instance).
+    MODEL_REACH_CACHE = 256
+
+    def _model_reach(self, thing):
+        """How far (world units) a thing's drawn model reaches from its
+        origin in any direction; 0 when it draws no model wireframe."""
+        render_mode = str(thing.properties.get('render_mode', 'model')).lower()
+        if not entity_model_path(thing) or not (render_mode == 'model'
+                                                or isinstance(thing, PlayerStart)):
+            return 0.0
+        found = self._model_edges_for(thing)
+        placed = self._model_placement(thing) if found is not None else None
+        if placed is None:
+            return 0.0
+        positions = found[1]
+        cache = self.__dict__.setdefault('_model_reach_cache', {})
+        entry = cache.get(id(positions))
+        if entry is None or entry[0] is not positions:
+            pts = np.asarray(positions, dtype=float).reshape(-1, 3)
+            reach = float(np.sqrt((pts * pts).sum(axis=1).max())) if len(pts) else 0.0
+            if len(cache) >= self.MODEL_REACH_CACHE:
+                cache.clear()
+            entry = cache[id(positions)] = (positions, reach)
+        scale = placed[0]
+        try:
+            factor = max(abs(float(v)) for v in scale)
+        except TypeError:
+            factor = abs(float(scale))
+        return entry[1] * factor
+
+    def get_axes(self):
+        if self.view_type == 'top': return 'x', 'z'
+        elif self.view_type == 'side': return 'z', 'y'
+        elif self.view_type == 'front': return 'x', 'y'
+        return None, None
+        
+    def world_to_screen(self, p):
+        center_x, center_y = self.width() / 2, self.height() / 2
+        screen_x = center_x + (p.x() - self.pan_offset.x()) * self.zoom_factor
+        
+        if self.view_type in ['front', 'side']:
+            screen_y = center_y - (p.y() - self.pan_offset.y()) * self.zoom_factor
+        else:
+            screen_y = center_y + (p.y() - self.pan_offset.y()) * self.zoom_factor
+            
+        return QPointF(screen_x, screen_y)
+
+    def screen_to_world(self, p):
+        center_x, center_y = self.width() / 2, self.height() / 2
+        world_x = (p.x() - center_x) / self.zoom_factor + self.pan_offset.x()
+        
+        if self.view_type in ['front', 'side']:
+            world_y = (center_y - p.y()) / self.zoom_factor + self.pan_offset.y()
+        else:
+            world_y = (p.y() - center_y) / self.zoom_factor + self.pan_offset.y()
+            
+        return QPointF(world_x, world_y)
+
+    def snap_to_grid(self, pos):
+        if not self.snap_to_grid_enabled:
+            return pos
+        grid = self.grid_size
+        return QPointF(round(pos.x() / grid) * grid, round(pos.y() / grid) * grid)
+
+    # -- the layers ----------------------------------------------------------
+    #
+    # A repaint of a 2D view draws every brush, model and sprite in sight
+    # (40-110 ms on a 20 000-brush map), and most repaints asked for it to
+    # move something small: the 3D camera's cone, in all three 2D views on
+    # every frame the 3D camera moved; the arrows travelling along animated
+    # I/O links, 60 times a second; the clip line or the component
+    # highlight following the cursor. So the scene -- grid, terrain,
+    # brushes, entities and decal handles -- is kept as one image, and a
+    # frame that only moves what is drawn over it (_request_overlay_frame)
+    # draws that image and the layers above it: the camera cone and the
+    # clip and rotate overlays (_paint_overlays), then the links and
+    # everything over them (_paint_link_layers). Any other repaint -- every
+    # update() from the editor, an edit, a selection change, a pan, a zoom,
+    # a resize -- paints the scene afresh, as before.
+
+    def update(self, *args):
+        """Repaint, with the scene painted afresh."""
+        self._base_layer_valid = False
+        self._overlay_frame = False
+        super().update(*args)
+
+    def _request_overlay_frame(self):
+        """Repaint only what is drawn over the scene (the camera cone, the
+        tool overlays, the links and above): the image of the scene is
+        reused if nothing else has asked for a repaint."""
+        self._overlay_frame = True
+        QWidget.update(self)
+
+    def _request_arrow_frame(self):
+        """Repaint only to move the link arrows."""
+        self._request_overlay_frame()
+
+    def _base_layer_key(self):
+        """What the cached scene depends on beyond the editor's update()
+        calls (a safety net for any change made without one). Not the 3D
+        camera: its cone is drawn over the scene."""
+        state = self.editor.state
+        config = self.main_window.config
+        return (self.width(), self.height(), self.devicePixelRatioF(),
+                self.zoom_factor, self.pan_offset.x(), self.pan_offset.y(),
+                getattr(state, 'world_epoch', None),
+                getattr(state.brushes, 'row_version', None),
+                getattr(state.things, 'row_version', None),
+                tuple(id(o) for o in state.selected_objects),
+                getattr(state.view_filters, 'version', None),
+                self.grid_size, self.grid_visible,
+                bool(self.editor.view_3d.play_mode),
+                tuple(config.get('GridColours', name, fallback=None)
+                      for name in ('background', 'minor', 'major')))
+
+    def _animating_links(self):
+        return bool(self.editor.show_logic_links and self.main_window.config.getboolean(
+            'Display', 'animate_connections', fallback=False))
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        overlay_frame, self._overlay_frame = self._overlay_frame, False
+        key = self._base_layer_key()
+        if not (overlay_frame and self._base_layer_valid and self._base_layer is not None
+                and self._base_key == key):
+            self._paint_scene_layer(key)
+        painter.drawPixmap(0, 0, self._base_layer)
+        visible_bounds = self.get_visible_world_bounds()
+        if visible_bounds.width() <= 0 or visible_bounds.height() <= 0:
+            return          # the view shows nothing: only the background
+        # Go on with the pen, brush and font the scene's painter was left
+        # with, as when one painter drew the lot: the layers above draw
+        # exactly what they drew then.
+        pen, brush, font = self._base_painter_state
+        painter.setPen(pen)
+        painter.setBrush(brush)
+        painter.setFont(font)
+        self._paint_overlays(painter)
+        self._paint_link_layers(painter, visible_bounds)
+
+    def _paint_scene_layer(self, key):
+        """Paint the scene into a new image of the view, kept for the frames
+        that only move what is drawn over it."""
+        ratio = self.devicePixelRatioF()
+        layer = QPixmap(max(1, int(round(self.width() * ratio))),
+                        max(1, int(round(self.height() * ratio))))
+        layer.setDevicePixelRatio(ratio)
+        painter = QPainter(layer)
+        # What a painter begun on the widget starts with (QPainter::initFrom),
+        # not a pixmap's defaults: the widget's font, its foreground pen and
+        # its background.
+        palette = self.palette()
+        painter.setPen(QPen(palette.brush(self.foregroundRole()), 1))
+        painter.setBackground(palette.brush(self.backgroundRole()))
+        painter.setFont(self.font())
+        self._paint_base_layer(painter)
+        state = (QPen(painter.pen()), QBrush(painter.brush()), QFont(painter.font()))
+        painter.end()
+        self._base_layer, self._base_key = layer, key
+        self._base_painter_state = state
+        self._base_layer_valid = True
+
+    def _paint_base_layer(self, painter):
+        """The scene: everything below the camera cone, the tool overlays and
+        the I/O links. Returns the visible world bounds, or None when the
+        view shows nothing (only the background)."""
+        # Use the custom grid background colour (or fallback to dark grey)
+        bg_hex = self.main_window.config.get('GridColours', 'background', fallback='#2b2b2b')
+        painter.fillRect(self.rect(), QColor(bg_hex))
+        
+        visible_bounds = self.get_visible_world_bounds()
+        if visible_bounds.width() <= 0 or visible_bounds.height() <= 0:
+            return None
+        
+        self.draw_grid(painter)
+        self.draw_terrain(painter, visible_bounds)
+        self.draw_brushes(painter, visible_bounds)
+        self.draw_things(painter, visible_bounds)
+        self.draw_light_volumes(painter)
+        self.draw_decal_handles(painter)
+        return visible_bounds
+
+    def _paint_overlays(self, painter):
+        """Over the scene, below the I/O links: the 3D camera's cone and the
+        clip and rotate tools' overlays -- what moves with the 3D camera or
+        the cursor, drawn on every frame instead of kept in the scene."""
+        self.draw_camera(painter)
+        if self._clip_active():
+            self.draw_clip_overlay(painter)
+        if self._rotate_active():
+            self.draw_rotate_overlay(painter)
+
+    def _paint_link_layers(self, painter, visible_bounds):
+        """The I/O links and everything drawn over them."""
+        # --- REVISED: Logic/Trigger Connections ---
+        # Only draw if the global toggle is ON (F1)
+        show_f1_key = self.editor.show_logic_links
+        
+        if show_f1_key:
+            self.draw_logic_connections(painter, visible_bounds)
+            self.draw_patrol_paths(painter, visible_bounds)
+
+            # Teleporter connections (Action=teleport with target_node) ---
+            ax1, ax2 = self.get_axes()
+            if not ax1 or not ax2:
+                return
+            ax_map = {'x': 0, 'y': 1, 'z': 2}
+            a1 = ax_map[ax1]
+            a2 = ax_map[ax2]
+
+            # Build node lookup once
+            node_lookup = {}
+            for t in self.editor.state.things:
+                if isinstance(t, PathNode):
+                    n = t.properties.get('name', '') or ''
+                    if n:
+                        node_lookup[n] = t
+
+            teleporter_color = QColor(200, 100, 255, 200)  # Purple-ish
+            teleporter_pen = QPen(teleporter_color, 2, Qt.DashLine)
+
+            for brush in self.editor.state.brushes:
+                if not brush.get('is_trigger', False):
+                    continue
+                if brush.get('trigger_action') != 'teleport':
+                    continue
+                target_name = brush.get('target_node', '')
+                if not target_name:
+                    continue
+                target_node = node_lookup.get(target_name)
+                if target_node is None:
+                    continue
+
+                src_w = QPointF(brush['pos'][a1], brush['pos'][a2])
+                dst_w = QPointF(target_node.pos[a1], target_node.pos[a2])
+
+                # Culling
+                margin = 100.0
+                sr = QRectF(src_w.x() - margin, src_w.y() - margin, margin * 2, margin * 2)
+                dr = QRectF(dst_w.x() - margin, dst_w.y() - margin, margin * 2, margin * 2)
+                if not (visible_bounds.intersects(sr) or visible_bounds.intersects(dr)):
+                    continue
+
+                p1 = self.world_to_screen(src_w)
+                p2 = self.world_to_screen(dst_w)
+
+                painter.setPen(teleporter_pen)
+                painter.setBrush(Qt.NoBrush)
+                painter.drawLine(p1, p2)
+
+                # Draw an arrowhead at the destination
+                self._draw_connection_arrow(painter, p1, p2, teleporter_color)
+
+                # Optional: small "teleport" label at midpoint
+                mid = QPointF((p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2)
+                painter.save()
+                painter.setPen(QPen(teleporter_color.lighter(150)))
+                font = QFont()
+                font.setPointSize(7)
+                painter.setFont(font)
+                painter.drawText(mid + QPointF(4, -4), "teleport")
+                painter.restore()
+
+        if self.is_drawing_brush:
+            pen = QPen(QColor(255, 255, 0), 1, Qt.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            start_screen = self.world_to_screen(self.draw_start_pos)
+            current_screen = self.world_to_screen(self.draw_current_pos)
+            painter.drawRect(QRectF(start_screen, current_screen).normalized())
+
+        self.draw_cordon(painter)
+
+        if self.is_marquee_select:
+            self.draw_marquee(painter)
+
+        # Component handles for the selected brushes (vertex/edge/face modes).
+        if self._component_mode() != ce.MODE_OBJECT:
+            self.draw_component_overlay(painter)
+
+        # Unified group bounding box + scale/rotate handles for a multi-selection.
+        if self._group_manip_active():
+            self.draw_group_bbox(painter)
+
+        if self.is_connecting and self.connection_source:
+            self.draw_connection_drag(painter)
+
+    def draw_cordon(self, painter):
+        """The cordon box, while it is on (Visgroups & Cordon window)."""
+        cordon = self.editor.state.view_filters.cordon
+        if not cordon.enabled:
+            return
+        ax1, ax2 = self.get_axes()
+        index = {'x': 0, 'y': 1, 'z': 2}
+        i1, i2 = index[ax1], index[ax2]
+        a = self.world_to_screen(QPointF(cordon.lo[i1], cordon.lo[i2]))
+        b = self.world_to_screen(QPointF(cordon.hi[i1], cordon.hi[i2]))
+        painter.save()
+        painter.setPen(QPen(QColor(240, 128, 0), 2, Qt.DashLine))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(QRectF(a, b).normalized())
+        painter.setPen(QColor(240, 128, 0))
+        painter.drawText(QRectF(a, b).normalized().topLeft() + QPointF(4, 14), "Cordon")
+        painter.restore()
+
+    @staticmethod
+    def _segment_intersects_rect(p1, p2, rect):
+        """Return True when a 2D line segment touches ``rect``.
+
+        Endpoint-only culling drops long I/O links when both entities are
+        outside the current view even though the link itself crosses the view.
+        Liang-Barsky keeps the test constant-time and avoids constructing Qt
+        paths for every connection.
+        """
+        rect = rect.normalized()
+        x1, y1 = float(p1.x()), float(p1.y())
+        x2, y2 = float(p2.x()), float(p2.y())
+        dx = x2 - x1
+        dy = y2 - y1
+
+        if dx == 0.0 and dy == 0.0:
+            return rect.contains(QPointF(x1, y1))
+
+        t0, t1 = 0.0, 1.0
+        for p, q in (
+            (-dx, x1 - rect.left()),
+            (dx, rect.right() - x1),
+            (-dy, y1 - rect.top()),
+            (dy, rect.bottom() - y1),
+        ):
+            if p == 0.0:
+                if q < 0.0:
+                    return False
+                continue
+            t = q / p
+            if p < 0.0:
+                if t > t1:
+                    return False
+                t0 = max(t0, t)
+            else:
+                if t < t0:
+                    return False
+                t1 = min(t1, t)
+
+        return t0 <= t1
+
+    def draw_logic_connections(self, painter, visible_bounds):
+        """
+        Draws I/O connections between entities.
+        Respects 'Animate Connections' setting.
+        """
+        ax1, ax2 = self.get_axes()
+        if not ax1 or not ax2: return
+            
+        ax_map = {'x': 0, 'y': 1, 'z': 2}
+        axis1_idx = ax_map[ax1]
+        axis2_idx = ax_map[ax2]
+        
+        # The objects with outputs first: a look at each object's connection
+        # list is cheap, where the view filters' test is not, and the target
+        # lookup below -- which filters every object in the map -- is built
+        # only when there is a link to draw. This runs on every frame drawn
+        # over the kept scene (the camera moving, the arrows travelling).
+        brush_sources = []
+        thing_sources = []
+        if IO_AVAILABLE:
+            for brush in self.editor.state.brushes:
+                io_conns = get_connections(brush)
+                if io_conns and not self._filtered(brush):
+                    brush_sources.append((brush, io_conns))
+            for thing in self.editor.state.things:
+                io_conns = get_connections(thing)
+                if io_conns and not self._filtered(thing):
+                    thing_sources.append((thing, io_conns))
+
+        # Resolve targets by stable id first. Names remain the fallback for
+        # older maps that predate target_id.
+        pos_by_id = {}
+        pos_by_name = {}
+        if brush_sources or thing_sources:
+            for b in self.editor.state.brushes:
+                if self._filtered(b):
+                    continue
+                b_id = b.get('id')
+                b_name = b.get('name')
+                if b_id:
+                    pos_by_id[b_id] = b['pos']
+                if b_name and b_name not in pos_by_name:
+                    pos_by_name[b_name] = b['pos']
+            for t in self.editor.state.things:
+                if self._filtered(t):
+                    continue
+                props = getattr(t, 'properties', {})
+                t_id = props.get('id')
+                t_name = props.get('name', '')
+                if t_id:
+                    pos_by_id[t_id] = t.pos
+                if t_name and t_name not in pos_by_name:
+                    pos_by_name[t_name] = t.pos
+
+        def get_target_pos(conn):
+            target_id = getattr(conn, 'target_id', '') or ''
+            if target_id:
+                target = pos_by_id.get(target_id)
+                if target is not None:
+                    return target
+            return pos_by_name.get(getattr(conn, 'target_name', ''))
+
+        def entity_id(entity):
+            if isinstance(entity, dict):
+                return entity.get('id') or ('obj:%x' % id(entity))
+            props = getattr(entity, 'properties', {})
+            return props.get('id') or ('obj:%x' % id(entity))
+
+        # Check Animation Setting
+        should_animate = self.main_window.config.getboolean('Display', 'animate_connections', fallback=False)
+
+        current_connections = set()
+        connections_to_draw = []
+        
+        # Collect I/O System Connections
+        if IO_AVAILABLE:
+            # From brushes
+            for brush, io_conns in brush_sources:
+                for conn in io_conns:
+                    target_pos = get_target_pos(conn)
+                    if target_pos:
+                        # Determine if this is a logic entity
+                        is_logic = brush.get('is_trigger', False) or brush.get('is_mover', False) or brush.get('is_door', False)
+                        connections_to_draw.append({
+                            'id': f"io_{entity_id(brush)}_{conn.output_name}_{getattr(conn, 'target_id', '') or conn.target_name}_{conn.input_name}",
+                            'target': conn.target_name,
+                            'src': brush['pos'],
+                            'dst': target_pos,
+                            'is_logic': is_logic
+                        })
+            
+            # From things
+            for thing, io_conns in thing_sources:
+                for conn in io_conns:
+                    target_pos = get_target_pos(conn)
+                    if target_pos:
+                        is_logic = thing.properties.get('type') == 'logic_gate'
+                        connections_to_draw.append({
+                            'id': f"io_{entity_id(thing)}_{conn.output_name}_{getattr(conn, 'target_id', '') or conn.target_name}_{conn.input_name}",
+                            'target': conn.target_name,
+                            'src': thing.pos,
+                            'dst': target_pos,
+                            'is_logic': is_logic
+                        })
+
+        # Draw all collected connections
+        for conn in connections_to_draw:
+            source_2d = QPointF(conn['src'][axis1_idx], conn['src'][axis2_idx])
+            target_2d = QPointF(conn['dst'][axis1_idx], conn['dst'][axis2_idx])
+            
+            # Cull against the whole line segment, not just its endpoints.
+            # This keeps long-distance links visible when both entities are
+            # outside the current view but the connection crosses the view.
+            margin = 100.0
+            link_bounds = visible_bounds.adjusted(-margin, -margin, margin, margin)
+            if not self._segment_intersects_rect(source_2d, target_2d, link_bounds):
+                continue
+
+            conn_key = (conn['id'], conn['target'])
+            current_connections.add(conn_key)
+            
+            p1 = self.world_to_screen(source_2d)
+            p2 = self.world_to_screen(target_2d)
+            
+            # Select Color
+            if conn['is_logic']:
+                color = QColor(255, 255, 0, 200) # Yellow for Logic
+            else:
+                color = QColor(0, 255, 255, 180) # Cyan for Standard Triggers
+                
+            pen = QPen(color, 2, Qt.DotLine)
+            painter.setPen(pen)
+            painter.drawLine(p1, p2)
+            
+            # Draw Arrows based on setting
+            if should_animate:
+                if not self.animation_timer.isActive() and not self._paced_by_play():
+                    self.animation_timer.start()
+                # Initialize animation state if needed
+                if conn_key not in self.connection_animations:
+                    self.connection_animations[conn_key] = {'progress': 1.0, 'growing': True}
+                    self.arrow_travel_progress[conn_key] = [0.0]
+                
+                self._draw_traveling_arrows(painter, p1, p2, color, conn_key)
+            else:
+                # Draw a single static arrow head at the target end
+                self._draw_connection_arrow(painter, p1, p2, color)
+
+        # Links no longer drawn (deleted, filtered, scrolled away) stop
+        # animating, so the timer sleeps once nothing on screen moves.
+        if self.connection_animations:
+            for stale in [k for k in self.connection_animations if k not in current_connections]:
+                del self.connection_animations[stale]
+                self.arrow_travel_progress.pop(stale, None)
+        self.last_io_connections = current_connections
+
+    def draw_patrol_paths(self, painter, visible_bounds):
+        """
+        Draw dashed olive lines between connected PathNodes (next_node chains)
+        and thin dotted teal lines from patrolling Monsters to their patrol_target.
+        """
+        ax1, ax2 = self.get_axes()
+        if not ax1 or not ax2:
+            return
+        ax_map = {'x': 0, 'y': 1, 'z': 2}
+        a1 = ax_map[ax1]
+        a2 = ax_map[ax2]
+
+        # Build a lookup: node-name → thing, for fast resolution
+        node_lookup = {}
+        for t in self.editor.state.things:
+            if (isinstance(t, PathNode) or t.properties.get('type') == 'deathmatchnode') and not self._filtered(t):
+                n = t.properties.get('name', '') or ''
+                if n:
+                    node_lookup[n] = t
+
+        # --- 1. PathNode → next_node chain lines (olive, dashed) ---------
+        # Navigation edges are deliberately distinct from entity I/O links.
+        olive = QColor(128, 128, 0, 200)
+        olive_dim = QColor(128, 128, 0, 80)
+        chain_pen = QPen(olive, 2, Qt.DashLine)
+
+        links = []
+        for name, node in node_lookup.items():
+            targets = ([node.get_next_node_name()] if isinstance(node, PathNode)
+                       else str(node.properties.get('links', '')).replace(',', ' ').split())
+            links.extend((node, target) for target in targets if target)
+        for node, next_name in links:
+            next_node = node_lookup.get(next_name)
+            if next_node is None:
+                continue
+
+            src_w = QPointF(node.pos[a1], node.pos[a2])
+            dst_w = QPointF(next_node.pos[a1], next_node.pos[a2])
+
+            # Cull if both endpoints are off-screen
+            margin = 100.0
+            sr = QRectF(src_w.x() - margin, src_w.y() - margin, margin * 2, margin * 2)
+            dr = QRectF(dst_w.x() - margin, dst_w.y() - margin, margin * 2, margin * 2)
+            if not (visible_bounds.intersects(sr) or visible_bounds.intersects(dr)):
+                continue
+
+            p1 = self.world_to_screen(src_w)
+            p2 = self.world_to_screen(dst_w)
+
+            navigation = node.properties.get('type') == 'deathmatchnode'
+            link_color = QColor(38, 166, 154, 230) if navigation else olive
+            painter.setPen(QPen(link_color, 2, Qt.SolidLine) if navigation else chain_pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawLine(p1, p2)
+
+            # Small arrowhead at destination
+            self._draw_connection_arrow(painter, p1, p2, link_color)
+            if navigation:
+                self._draw_connection_arrow(painter, p2, p1, link_color)
+
+            # Tiny "next" label at midpoint
+            mid = QPointF((p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2)
+            painter.save()
+            painter.setPen(QPen(link_color if navigation else olive_dim))
+            font = QFont()
+            font.setPointSize(7)
+            painter.setFont(font)
+            painter.drawText(mid + QPointF(4, -4), "nav" if navigation else "next")
+            painter.restore()
+
+        # --- 2. Monster → patrol_target lines (teal, dotted, thinner) ----
+        patrol_pen = QPen(QColor(38, 166, 154, 120), 1, Qt.DotLine)
+        for t in self.editor.state.things:
+            if not isinstance(t, Monster) or self._filtered(t):
+                continue
+            if not t.properties.get('patrol', False):
+                continue
+            target_name = t.properties.get('patrol_target', '') or ''
+            if not target_name:
+                continue
+            target_node = node_lookup.get(target_name)
+            if target_node is None:
+                continue
+
+            src_w = QPointF(t.pos[a1], t.pos[a2])
+            dst_w = QPointF(target_node.pos[a1], target_node.pos[a2])
+
+            margin = 100.0
+            sr = QRectF(src_w.x() - margin, src_w.y() - margin, margin * 2, margin * 2)
+            dr = QRectF(dst_w.x() - margin, dst_w.y() - margin, margin * 2, margin * 2)
+            if not (visible_bounds.intersects(sr) or visible_bounds.intersects(dr)):
+                continue
+
+            p1 = self.world_to_screen(src_w)
+            p2 = self.world_to_screen(dst_w)
+
+            painter.setPen(patrol_pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawLine(p1, p2)
+            self._draw_connection_arrow(painter, p1, p2, QColor(38, 166, 154, 120))
+
+    def draw_grid(self, painter):
+        # Don't draw grid if hidden or in play mode
+        if not self.grid_visible:
+            return
+        if self.editor.view_3d.play_mode:
+            return
+            
+        config = self.main_window.config
+        minor_hex = config.get("GridColours", "minor", fallback="#404040")
+        major_hex = config.get("GridColours", "major", fallback="#5a5a5a")
+        bg_hex = config.get("GridColours", "background", fallback="#2b2b2b")
+
+        grid_color = QColor(minor_hex)          # thin lines
+        thick_grid_color = QColor(major_hex)    # every 8th line
+        world_origin_color = QColor(0, 255, 0)  # keep origin green
+        painter.setPen(QPen(grid_color, 1))
+
+        screen_rect = self.rect()
+        top_left_world = self.screen_to_world(screen_rect.topLeft())
+        bottom_right_world = self.screen_to_world(screen_rect.bottomRight())
+        
+        grid = self.grid_size
+        if grid * self.zoom_factor < 4: return 
+
+        start_x = int(top_left_world.x() / grid) * grid
+        end_x = int(bottom_right_world.x() / grid) * grid
+        start_y = int(top_left_world.y() / grid) * grid
+        end_y = int(bottom_right_world.y() / grid) * grid
+
+        for x in range(start_x, end_x + 1, grid):
+            is_thick = (x % (grid * 8)) == 0
+            is_origin = x == 0
+            pen = QPen(thick_grid_color if is_thick else grid_color, 1)
+            if is_origin: pen.setColor(world_origin_color)
+            painter.setPen(pen)
+            p1 = self.world_to_screen(QPointF(x, top_left_world.y()))
+            p2 = self.world_to_screen(QPointF(x, bottom_right_world.y()))
+            painter.drawLine(p1, p2)
+        
+        for y in range(start_y, end_y + 1, grid):
+            is_thick = (y % (grid * 8)) == 0
+            is_origin = y == 0
+            pen = QPen(thick_grid_color if is_thick else grid_color, 1)
+            if is_origin: pen.setColor(world_origin_color)
+            painter.setPen(pen)
+            p1 = self.world_to_screen(QPointF(top_left_world.x(), y))
+            p2 = self.world_to_screen(QPointF(bottom_right_world.x(), y))
+            painter.drawLine(p1, p2)
+
+    # -- the brush cull --------------------------------------------------------
+    #
+    # draw_brushes tested every brush in the map against the view on every
+    # repaint: 20 000 brushes, one by one in Python, to draw the dozen a
+    # zoomed-in view shows. The brushes' derived bounds are kept in one array
+    # instead, worked out again when the world changes (its epoch, or its row
+    # set), and one vectorised test picks the brushes that may be in view;
+    # only those go on to is_brush_visible, the exact test, in map order.
+    #
+    # A tool writes the brushes it edits in place for many frames after one
+    # undo checkpoint (EditorState.edited_objects): the selection, the group
+    # mates a move carries with it (MainWindow.movable_with_mates), and what
+    # a drag in any 2D view moves (View2D.drag_group). Those, and the movers
+    # and doors (their runtime transform moves them with no edit at all), are
+    # tested on every repaint from where they are now, as before.
+
+    #: A row no view intersects (a brush the array does not place).
+    _NO_BOUNDS = (math.inf, math.inf, math.inf, -math.inf, -math.inf, -math.inf)
+
+    def _brush_cull_index(self, brushes):
+        """``(key, bounds, always, groups, rows)`` for *brushes*: their
+        derived world bounds as an (n, 6) array; the rows tested every repaint
+        whatever the array says; each group's rows; each brush's row by id."""
+        state = self.editor.state
+        key = (getattr(state, 'world_epoch', None), id(brushes),
+               getattr(brushes, 'row_version', None), len(brushes))
+        cull = self._brush_cull
+        if cull is not None and cull[0] == key:
+            return cull
+        bounds = np.empty((len(brushes), 6), dtype=np.float64)
+        always, groups, rows = [], {}, {}
+        world_bounds = brush_placement.world_bounds
+        for i, brush in enumerate(brushes):
+            rows[id(brush)] = i
+            name = brush_groups.group_of(brush)
+            if name:
+                groups.setdefault(name, []).append(i)
+            if brush_placement.is_dynamic(brush):
+                always.append(i)
+                bounds[i] = self._NO_BOUNDS
+                continue
+            try:
+                bounds[i] = world_bounds(brush)
+            except Exception:
+                # Left to is_brush_visible, as every brush was.
+                always.append(i)
+                bounds[i] = self._NO_BOUNDS
+        cull = (key, bounds, always, groups, rows)
+        self._brush_cull = cull
+        return cull
+
+    def _edited_rows(self, brushes, groups, rows):
+        """The rows of the brushes a tool may be writing in place now."""
+        edited = list(self.editor.state.selected_objects)
+        # A drag in any of the 2D views: this one draws what it moves too.
+        for name in ('view_top', 'view_front', 'view_side'):
+            view = getattr(self.main_window, name, None)
+            if isinstance(view, View2D):
+                edited.extend(view.drag_group)
+                if view.drag_primary is not None:
+                    edited.append(view.drag_primary)
+        found, names = [], set()
+        for obj in edited:
+            i = rows.get(id(obj))
+            if i is not None and brushes[i] is obj:
+                found.append(i)
+            name = brush_groups.group_of(obj)
+            if name:
+                names.add(name)
+        for name in names:
+            found.extend(groups.get(name, ()))
+        return found
+
+    def _brushes_in_view(self, visible_bounds, axis1_idx, axis2_idx):
+        """The brushes that may be in view, in map (drawing) order: every
+        brush is_brush_visible passes, and a few more."""
+        brushes = self.editor.state.brushes
+        _key, bounds, always, groups, rows = self._brush_cull_index(brushes)
+        # Touching counts here: is_brush_visible draws the exact line.
+        hit = ((bounds[:, axis1_idx] <= visible_bounds.right())
+               & (bounds[:, axis1_idx + 3] >= visible_bounds.left())
+               & (bounds[:, axis2_idx] <= visible_bounds.bottom())
+               & (bounds[:, axis2_idx + 3] >= visible_bounds.top()))
+        picked = np.flatnonzero(hit)
+        extra = always + self._edited_rows(brushes, groups, rows)
+        if extra:
+            picked = np.union1d(picked, np.asarray(extra, dtype=np.intp))
+        return [brushes[i] for i in picked.tolist()]
+
+    def draw_brushes(self, painter, visible_bounds):
+        ax1, ax2 = self.get_axes()
+        if not ax1 or not ax2:
+            return
+            
+        ax_map = {'x': 0, 'y': 1, 'z': 2}
+        axis1_idx = ax_map[ax1]
+        axis2_idx = ax_map[ax2]
+
+        # Computed once: when several objects are selected the unified group box
+        # owns the handles, so individual brushes must not draw their own.
+        group_active = self._group_manip_active()
+        selected = SelectionLookup(self.editor.state.selected_objects)
+        primary = self.editor.primary_selection()
+        transform = (self.width() / 2, self.height() / 2,
+                     self.pan_offset.x(), self.pan_offset.y(), self.zoom_factor,
+                     self.view_type in ('front', 'side'))
+
+        for brush in self._brushes_in_view(visible_bounds, axis1_idx, axis2_idx):
+            # CULL brush if not visible
+            if not self.is_brush_visible(brush, visible_bounds, axis1_idx, axis2_idx):
+                continue
+                
+            # Check if brush is in selected_objects list (for multi-select support)
+            is_selected = brush in selected or brush is primary
+            is_trigger = brush.get('is_trigger', False)
+            is_subtractive = brush.get('operation') == 'subtract'
+            is_locked = brush.get('lock', False)
+            is_fog = brush.get('is_fog', False)
+            is_mover = brush.get('is_mover', False)
+            is_door = brush.get('is_door', False)
+            
+            # Check for flash effect (takes precedence over other colors)
+            is_flashing = False
+            flash_until = brush.get('_flash_until', 0)
+            if flash_until > time.time():
+                is_flashing = True
+            
+            # Apply colors based on state (flash overrides everything)
+            if is_flashing:
+                pen_color = QColor(255, 105, 180)  # Hot pink
+                fill_color = QColor(255, 105, 180, 60)
+            elif is_locked:
+                pen_color = QColor(255, 105, 97) 
+                fill_color = QColor(74,4,4, 20)
+            elif is_trigger:
+                pen_color = QColor(0, 255, 255, 150)
+                fill_color = QColor(0, 255, 255, 30)
+            elif is_subtractive:
+                pen_color = QColor(255, 0, 0)
+                fill_color = QColor(255, 0, 0, 30)
+            elif is_fog:
+                fog_color_rgb = brush.get('fog_color', [0.5, 0.6, 0.7])
+                pen_color = QColor.fromRgbF(fog_color_rgb[0], fog_color_rgb[1], fog_color_rgb[2])
+                fill_color = QColor.fromRgbF(fog_color_rgb[0], fog_color_rgb[1], fog_color_rgb[2], 0.3)
+            elif is_mover:
+                pen_color = QColor(0, 120, 255)
+                fill_color = QColor(0, 120, 255, 50)
+            else:
+                pen_color = QColor(211, 211, 211)
+                fill_color = QColor(200, 200, 200, 30)
+
+            if is_selected and not is_flashing:  # Don't override flash with selection
+                pen_color = QColor(255, 255, 0)
+            
+            pen = QPen(pen_color, 2 if is_selected else 1)
+            if (is_trigger or is_fog) and not is_selected and not is_flashing: 
+                pen.setStyle(Qt.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(QBrush(fill_color))
+
+            pos = brush['pos']
+            size = brush['size']
+            # A previewed mover is drawn where the preview carries it: its
+            # runtime displacement (brush_placement), not a write to pos.
+            shift = None
+            if is_mover or brush.get('is_door'):
+                runtime = brush_placement.runtime_of(brush)
+                if runtime is not None:
+                    home = brush_placement.authored_box(brush)
+                    shift = (runtime[0] - home[0], runtime[1] - home[1],
+                             runtime[2] - home[2])
+                    pos = [pos[0] + shift[0], pos[1] + shift[1], pos[2] + shift[2]]
+
+            screen_rect = self._brush_screen_rect(
+                pos, size, axis1_idx, axis2_idx, transform)
+
+            # Angled (clipped) brushes draw their true convex outline; plain box
+            # brushes draw the fast bounding rectangle.  screen_rect is still
+            # computed above for labels/handles/colour tags.
+            hull = None
+            if bg.brush_has_geometry(brush):
+                convex = bg.get_convex(brush)
+                if convex is not None and convex.is_valid:
+                    hull = convex.silhouette(axis1_idx, axis2_idx)
+            if hull:
+                if shift is not None:
+                    hull = [(a + shift[axis1_idx], b + shift[axis2_idx]) for a, b in hull]
+                poly = QPolygonF([self.world_to_screen(QPointF(a, b)) for a, b in hull])
+                painter.drawPolygon(poly)
+            else:
+                painter.drawRect(screen_rect)
+
+                        # Build combined type label for trigger/mover/door
+            type_labels = []
+            if is_trigger:
+                type_labels.append("TRIGGER")
+            if is_mover:
+                type_labels.append("MOVER")
+            if is_door:
+                type_labels.append("DOOR")
+            
+            if type_labels:
+                painter.setPen(QColor(255, 255, 255, 180))
+                font = painter.font()
+                font.setPointSize(10)
+                painter.setFont(font)
+                label_text = " / ".join(type_labels)
+                painter.drawText(screen_rect, Qt.AlignCenter, label_text)
+
+            # Show the exact runtime trigger AABB when requested.
+            if is_selected and is_trigger and brush.get('show_aabb_bounds', False):
+                lo_x, lo_y, lo_z, hi_x, hi_y, hi_z = brush_aabb_bounds(brush)
+                mins = (lo_x, lo_y, lo_z)
+                maxs = (hi_x, hi_y, hi_z)
+                a1_min = mins[axis1_idx]
+                a1_max = maxs[axis1_idx]
+                a2_min = mins[axis2_idx]
+                a2_max = maxs[axis2_idx]
+                aabb_p1 = self.world_to_screen(QPointF(a1_min, a2_min))
+                aabb_p2 = self.world_to_screen(QPointF(a1_max, a2_max))
+                aabb_rect = QRectF(aabb_p1, aabb_p2).normalized()
+                painter.save()
+                painter.setPen(QPen(QColor(255, 140, 0), 1, Qt.DashLine))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRect(aabb_rect)
+                painter.restore()
+
+            # Add mover label
+            if is_mover:
+                painter.setPen(QColor(255, 255, 255, 180))
+                font = painter.font()
+                font.setPointSize(10)
+                painter.setFont(font)
+                painter.drawText(screen_rect.adjusted(0, 0, -5, -5), Qt.AlignRight | Qt.AlignBottom, "MOVER")
+            
+            # Add door label
+            if is_door:
+                painter.setPen(QColor(255, 255, 255, 180))
+                font = painter.font()
+                font.setPointSize(10)
+                painter.setFont(font)
+                painter.drawText(screen_rect.adjusted(0, 0, -5, -5), Qt.AlignRight | Qt.AlignBottom, "DOOR")
+            
+            
+            # A lone selected brush keeps its own resize handles; when several
+            # objects are selected the unified group box owns the handles instead.
+            if is_selected and not is_locked and not group_active:
+                self.draw_resize_handles(painter, screen_rect)
+
+            self.draw_brush_color_tag(painter, brush, screen_rect)
+
+    @staticmethod
+    def _brush_screen_rect(pos, size, axis1, axis2, transform):
+        """Project a box with this draw's fixed viewport/pan/zoom values.
+
+        Preserve the old QPointF rounding: convert the minimum corner and
+        size separately, then add them, rather than computing pos + size/2.
+        """
+        cx, cy, pan_x, pan_y, zoom, invert_y = transform
+        x = float(pos[axis1] - size[axis1] / 2)
+        y = float(pos[axis2] - size[axis2] / 2)
+        x2, y2 = x + float(size[axis1]), y + float(size[axis2])
+        sx1, sx2 = cx + (x - pan_x) * zoom, cx + (x2 - pan_x) * zoom
+        dy1, dy2 = (y - pan_y) * zoom, (y2 - pan_y) * zoom
+        if invert_y:
+            return QRectF(QPointF(sx1, cy - dy1), QPointF(sx2, cy - dy2)).normalized()
+        return QRectF(QPointF(sx1, cy + dy1), QPointF(sx2, cy + dy2)).normalized()
+
+    def draw_brush_color_tag(self, painter, brush, screen_rect):
+        color = brush.get('color')
+        if isinstance(color, str) and color in self.color_pixmaps:
+            pixmap = self.color_pixmaps[color]
+            tag_size = 16 
+            tag_x = int(screen_rect.bottomRight().x() - tag_size - 2) 
+            tag_y = int(screen_rect.bottomRight().y() - tag_size - 2) 
+            painter.drawPixmap(tag_x, tag_y, pixmap)
+    
+    def draw_thing_color_tag(self, painter, thing, screen_rect):
+        """Draw color tag for things (same as brushes)"""
+        color = thing.properties.get('color')
+        if isinstance(color, str) and color in self.color_pixmaps:
+            pixmap = self.color_pixmaps[color]
+            tag_size = 16 
+            tag_x = int(screen_rect.bottomRight().x() - tag_size - 2) 
+            tag_y = int(screen_rect.bottomRight().y() - tag_size - 2) 
+            painter.drawPixmap(tag_x, tag_y, pixmap)
+
+    #: Models' wireframes: translucent cyan.
+    MODEL_WIREFRAME_COLOUR = (0, 255, 255, 100)
+
+    def _model_edges_for(self, model_thing):
+        """``(model, positions, edges)`` for a Thing's loaded model, or None.
+
+        2D is a QPainter view, not the renderer's OpenGL context. Never load
+        a model here: OBJ/GLB loading creates VAOs/VBOs and must happen in the
+        3D view's current GL context. The 3D renderer loads it on its next
+        frame.
+        """
+        model_path = entity_model_path(model_thing)
+        if not model_path:
+            return None
+        renderer = self.main_window.view_3d.renderer
+        if not renderer:
+            return None
+        obj = renderer.get_loaded_model(model_path)
+        if not obj or not obj.is_loaded:
+            return None
+        edges = model_wireframe.model_edges(obj)
+        if edges is None:
+            return None
+        positions, segments = edges
+        if len(segments) > model_wireframe.MAX_WIREFRAME_EDGES:
+            return None                         # drawn as a box
+        return obj, positions, segments
+
+    @staticmethod
+    def _model_placement(model_thing):
+        """``(scale, rotation)`` of a model, as finite floats, or None when
+        its map data or a typed value cannot be drawn (then: a box)."""
+        try:
+            if not all(math.isfinite(float(v)) for v in model_thing.pos[:3]):
+                return None
+        except (TypeError, ValueError):
+            return None
+        return model_wireframe.placement(model_scale(model_thing),
+                                         model_rotation(model_thing))
+
+    def _project_model(self, model_thing, positions, ax_map, ax1, ax2):
+        """Screen ``(xs, ys)`` of a model's welded corners in this view, or
+        None when its placement cannot be drawn."""
+        placed = self._model_placement(model_thing)
+        if placed is None:
+            return None
+        scale, rotation = placed
+        return model_wireframe.project(
+            positions, model_thing.pos, scale, rotation, (ax_map[ax1], ax_map[ax2]),
+            (self.width() / 2, self.height() / 2),
+            (self.pan_offset.x(), self.pan_offset.y()), self.zoom_factor,
+            flip_y=self.view_type in ('front', 'side'))
+
+    def _compute_model_screen_coords(self, model_thing, ax_map, ax1, ax2):
+        """Screen coordinates of a model's corners (for its bounds and hit
+        test). Returns (pts_x, pts_y) numpy arrays, or None if failed."""
+        found = self._model_edges_for(model_thing)
+        if found is None:
+            return None
+        return self._project_model(model_thing, found[1], ax_map, ax1, ax2)
+
+    #: An explosion's blast radius: dark orange.
+    BLAST_RADIUS_COLOUR = (204, 85, 0)
+
+    def _draw_blast_radius(self, painter, thing, s_pos):
+        """The circle a blast reaches (an Effect's, or an Explosive Prop's),
+        with its size."""
+        from engine.explosions import EXPLOSIVE_DEFAULTS
+        try:
+            radius = float(thing.properties.get(
+                'explosion_radius', EXPLOSIVE_DEFAULTS['explosion_radius']))
+        except (TypeError, ValueError):
+            radius = float(EXPLOSIVE_DEFAULTS['explosion_radius'])
+        r, g, b = self.BLAST_RADIUS_COLOUR
+        px = radius * self.zoom_factor
+        painter.save()
+        painter.setBrush(QBrush(QColor(r, g, b, 40)))
+        painter.setPen(QPen(QColor(r, g, b, 220), 1, Qt.DashLine))
+        painter.drawEllipse(s_pos, px, px)
+        painter.setPen(QPen(QColor(r, g, b)))
+        font = QFont()
+        font.setPointSize(8)
+        painter.setFont(font)
+        painter.drawText(QPointF(s_pos.x() + px + 4, s_pos.y() + 4), f"{int(radius)} u")
+        painter.restore()
+
+    def _draw_model_wireframe(self, painter, model_thing, ax_map, ax1, ax2):
+        """Draws the projected wireframe of a 3D model in the 2D view.
+
+        In bulk (editor/model_wireframe.py): the model's distinct edges are
+        projected, culled and snapped to pixels in NumPy and drawn with one
+        drawLines call. Drawing them a triangle at a time from Python cost
+        ~25 ms a 6,000-triangle model per view, on every repaint of a drag.
+        """
+        found = self._model_edges_for(model_thing)
+        placed = self._model_placement(model_thing) if found is not None else None
+        if found is None or placed is None:
+            painter.setPen(QPen(QColor(200, 200, 200), 1))
+            s_pos = self.world_to_screen(QPointF(model_thing.pos[ax_map[ax1]], model_thing.pos[ax_map[ax2]]))
+            rect = QRectF(s_pos.x()-10, s_pos.y()-10, 20, 20)
+            painter.drawRect(rect)
+            return rect
+
+        obj, positions, edges = found
+        scale, rotation = placed
+        i1, i2 = ax_map[ax1], ax_map[ax2]
+        flip_y = self.view_type in ('front', 'side')
+        zoom = self.zoom_factor
+        cached = model_wireframe.wireframe_image(
+            obj, positions, edges, scale, rotation, (i1, i2), zoom, flip_y,
+            self.MODEL_WIREFRAME_COLOUR)
+        if cached is not None:
+            # The same picture for every instance at this zoom: placed at the
+            # model's origin (snapped to a pixel), never re-rasterised while
+            # it is dragged.
+            image, left, top = cached
+            origin = self.world_to_screen(QPointF(model_thing.pos[i1], model_thing.pos[i2]))
+            x = int(round(origin.x())) + left
+            y = int(round(origin.y())) + top
+            rect = QRectF(x, y, image.width(), image.height())
+            if rect.intersects(QRectF(0, 0, self.width(), self.height())):
+                painter.drawImage(x, y, image)
+            return rect
+
+        # Larger on screen than a cached image may be: drawn directly, only
+        # the edges inside the view.
+        pts_x, pts_y = self._project_model(model_thing, positions, ax_map, ax1, ax2)
+        segments = model_wireframe.visible_segments(
+            pts_x, pts_y, edges, self.width(), self.height())
+        if len(segments):
+            painter.setPen(QPen(QColor(*self.MODEL_WIREFRAME_COLOUR), 1))
+            painter.drawLines(model_wireframe.segments_polygon(segments))
+
+        return QRectF(float(np.min(pts_x)), float(np.min(pts_y)),
+                      max(2.0, float(np.ptp(pts_x))), max(2.0, float(np.ptp(pts_y))))
+
+    @staticmethod
+    def _point_segment_distance_sq(point, a, b):
+        """Squared 2D distance from a point to a line segment."""
+        abx = b.x() - a.x()
+        aby = b.y() - a.y()
+        denom = abx * abx + aby * aby
+        if denom <= 1e-9:
+            dx = point.x() - a.x()
+            dy = point.y() - a.y()
+            return dx * dx + dy * dy
+        t = ((point.x() - a.x()) * abx + (point.y() - a.y()) * aby) / denom
+        t = max(0.0, min(1.0, t))
+        px = a.x() + abx * t
+        py = a.y() + aby * t
+        dx = point.x() - px
+        dy = point.y() - py
+        return dx * dx + dy * dy
+
+    def _portal_gizmo_hit_test(self, thing, screen_pos, ax1, ax2):
+        """Hit the visible portal gizmo in screen space, independent of zoom."""
+        ax_map = {'x': 0, 'y': 1, 'z': 2}
+        center = self.world_to_screen(QPointF(
+            float(thing.pos[ax_map[ax1]]), float(thing.pos[ax_map[ax2]])))
+        dx = screen_pos.x() - center.x()
+        dy = screen_pos.y() - center.y()
+        if dx * dx + dy * dy <= PORTAL_GIZMO_HANDLE_PIXELS ** 2:
+            return True
+
+        yaw = thing.get_yaw_radians()
+        w2 = thing.get_width() * 0.5
+        if ax1 == 'x' and ax2 == 'z':
+            rx = math.cos(yaw)
+            rz = -math.sin(yaw)
+            left = self.world_to_screen(QPointF(
+                float(thing.pos[0]) - rx * w2,
+                float(thing.pos[2]) - rz * w2))
+            right = self.world_to_screen(QPointF(
+                float(thing.pos[0]) + rx * w2,
+                float(thing.pos[2]) + rz * w2))
+            return self._point_segment_distance_sq(
+                screen_pos, left, right) <= PORTAL_GIZMO_PICK_PIXELS ** 2
+
+        i1, i2 = ax_map[ax1], ax_map[ax2]
+        h2 = thing.get_height() * 0.5
+        proj_half_w = (w2 * abs(math.cos(yaw)) if ax1 == 'x'
+                       else w2 * abs(math.sin(yaw)))
+        proj_half_w = max(4.0, proj_half_w)
+        rect = QRectF(
+            self.world_to_screen(QPointF(
+                float(thing.pos[i1]) - proj_half_w,
+                float(thing.pos[i2]) + h2)),
+            self.world_to_screen(QPointF(
+                float(thing.pos[i1]) + proj_half_w,
+                float(thing.pos[i2]) - h2)),
+        ).normalized()
+        pad = PORTAL_GIZMO_PICK_PIXELS
+        return rect.adjusted(-pad, -pad, pad, pad).contains(screen_pos)
+
+    @staticmethod
+    def _sprite_rect(pixmap, center):
+        """Bound editor markers to 32 logical pixels, preserving aspect ratio.
+
+        Drawing and picking share this rectangle, regardless of source image
+        dimensions, Retina backing resolution or view zoom.
+        """
+        width = pixmap.width() / pixmap.devicePixelRatioF()
+        height = pixmap.height() / pixmap.devicePixelRatioF()
+        scale = min(1.0, 32.0 / max(1.0, width, height))
+        width, height = width * scale, height * scale
+        return QRectF(center.x() - width / 2, center.y() - height / 2,
+                      width, height)
+
+    def draw_things(self, painter, visible_bounds):
+        ax1, ax2 = self.get_axes()
+        if not ax1 or not ax2:
+            return
+            
+        ax_map = {'x': 0, 'y': 1, 'z': 2}
+        axis1_idx = ax_map[ax1]
+        axis2_idx = ax_map[ax2]
+        selected = SelectionLookup(self.editor.state.selected_objects)
+        primary = self.editor.primary_selection()
+        
+        for thing in self.editor.state.things:
+            # Skip hidden things
+            if self._hidden(thing):
+                continue
+            # A light volume has no icon: draw_light_volumes draws its box
+            # and its light source.
+            if isinstance(thing, LightVolume):
+                continue
+            
+            # CULL thing if not visible
+            if not self.is_thing_visible(thing, visible_bounds, axis1_idx, axis2_idx):
+                continue
+            
+            w_pos = QPointF(thing.pos[axis1_idx], thing.pos[axis2_idx])
+            s_pos = self.world_to_screen(w_pos)
+            
+            draw_rect = None
+
+            # A blast radius (dark orange) -- an Effect's, or that of the Effect
+            # an Explosive Prop spawns -- while its panel's eye is on, as a
+            # monster's sight is.
+            if (getattr(self.editor, '_explosion_preview_thing', None) is thing
+                    and (thing.properties.get('explosive', False)
+                         or thing.properties.get('type') == 'effect')):
+                self._draw_blast_radius(painter, thing, s_pos)
+
+            # --- MODEL RENDERING ---
+            # A Prop may retain its model_path while being represented as a
+            # billboard.  Representation, not asset history, decides what the
+            # 2D view draws.
+            render_mode = str(thing.properties.get('render_mode', 'model')).lower()
+            if entity_model_path(thing) and (render_mode == 'model' or isinstance(thing, PlayerStart)):
+                draw_rect = self._draw_model_wireframe(painter, thing, ax_map, ax1, ax2)
+
+            # --- PORTAL RENDERING ---
+            elif isinstance(thing, Portal):
+                draw_rect = self._draw_portal_gizmo(
+                    painter, thing, s_pos, axis1_idx, axis2_idx,
+                    ax_map, ax1, ax2, visible_bounds)
+
+            # --- SPRITE RENDERING ---
+            else:
+                # 1. Draw Radius
+                if isinstance(thing, (Light, Speaker, ReflectionProbe)) and thing.properties.get('show_radius', False):
+                    default_col = ([255, 255, 0] if isinstance(thing, Speaker) else
+                                   [120, 200, 255] if isinstance(thing, ReflectionProbe) else
+                                   [255, 255, 255])
+                    col = thing.properties.get('colour', default_col)
+
+                    # Normalise to 0-255 integers
+                    if isinstance(col, (list, tuple)) and len(col) >= 3:
+                        r, g, b = col[0], col[1], col[2]
+                        if max(r, g, b) > 1.0:
+                            # Already 0-255 range
+                            r, g, b = int(r), int(g), int(b)
+                        else:
+                            # Convert 0.0-1.0 to 0-255
+                            r, g, b = int(r * 255), int(g * 255), int(b * 255)
+                    else:
+                        r, g, b = 255, 255, 255
+
+                    viz_color = QColor(r, g, b, 60)
+                    painter.setBrush(QBrush(viz_color))
+                    painter.setPen(QPen(viz_color.darker(120), 1))
+                    radius = thing.get_radius() * self.zoom_factor
+                    painter.drawEllipse(s_pos, radius, radius)
+
+                # 1b. Draw Monster Sight Radius
+                if isinstance(thing, Monster) and getattr(self.editor, '_sight_preview_thing', None) is thing:
+                    sight = thing.properties.get('sight', 300)
+                    sight_px = sight * self.zoom_factor
+                    # Translucent fill
+                    painter.setBrush(QBrush(QColor(255, 80, 40, 25)))
+                    # Dashed orange-red border
+                    painter.setPen(QPen(QColor(255, 100, 40, 200), 1, Qt.DashLine))
+                    painter.drawEllipse(s_pos, sight_px, sight_px)
+                    # Distance label at right-hand edge of the circle
+                    painter.save()
+                    painter.setPen(QPen(QColor(255, 140, 80)))
+                    font = QFont()
+                    font.setPointSize(8)
+                    painter.setFont(font)
+                    painter.drawText(QPointF(s_pos.x() + sight_px + 4, s_pos.y() + 4), f"{sight} u")
+                    painter.restore()
+
+                # 1c. Draw PathNode Radius
+                if (isinstance(thing, PathNode) or thing.properties.get('type') == 'deathmatchnode') and thing.properties.get('show_radius', False):
+                    radius = thing.get_radius() * self.zoom_factor
+                    painter.setBrush(QBrush(QColor(38, 166, 154, 30)))
+                    painter.setPen(QPen(QColor(38, 166, 154, 220), 1, Qt.DashLine))
+                    painter.drawEllipse(s_pos, radius, radius)
+                    painter.save()
+                    painter.setPen(QPen(QColor(77, 208, 196)))
+                    font = QFont()
+                    font.setPointSize(8)
+                    painter.setFont(font)
+                    affects = thing.get_affects_type() if isinstance(thing, PathNode) else 'ground'
+                    label = f"{int(thing.get_radius())} u  [{affects}]"
+                    painter.drawText(QPointF(s_pos.x() + radius + 4, s_pos.y() + 4), label)
+                    painter.restore()
+
+                # 2. Draw Sprite (or orange cube marker for PathNode)
+                pixmap = None
+                if isinstance(thing, PathNode):
+                    # PathNode renders as a small solid orange square — no sprite
+                    half = 10
+                    painter.save()
+                    painter.setBrush(QBrush(QColor(255, 128, 0)))
+                    painter.setPen(QPen(QColor(200, 80, 0), 1))
+                    node_rect = QRectF(s_pos.x() - half, s_pos.y() - half, half * 2, half * 2)
+                    painter.drawRect(node_rect)
+                    # Label with node name
+                    painter.setPen(QPen(QColor(255, 180, 80)))
+                    font = QFont()
+                    font.setPointSize(8)
+                    font.setBold(True)
+                    painter.setFont(font)
+                    node_name = thing.properties.get('name', '')
+                    painter.drawText(QPointF(s_pos.x() + half + 4, s_pos.y() + 4), node_name)
+                    painter.restore()
+                    draw_rect = node_rect
+                elif hasattr(thing, 'get_icon_pixmap'):
+                    pixmap = thing.get_icon_pixmap()
+                else:
+                    pixmap = thing.get_instance_pixmap()
+
+                if pixmap:
+                    draw_rect = self._sprite_rect(pixmap, s_pos)
+                    painter.drawPixmap(draw_rect.toRect(), pixmap)
+
+            # 2b. The entity's label (a Monster's name; a PlayerStart's
+            # name and Primary) beneath its model or sprite.
+            label_lines = thing.editor_label_lines()
+            if label_lines:
+                self._draw_entity_label(painter, s_pos, label_lines,
+                                        self._ENTITY_LABEL_COLOURS.get(
+                                            type(thing).__name__, QColor(255, 100, 100)),
+                                        draw_rect)
+
+            # 3. Direction Arrow
+            angle_deg = None
+            if 'angle' in thing.properties:
+                angle_deg = float(thing.properties.get('angle', 0.0))
+
+            if angle_deg is not None:
+                painter.save()
+                arrow_color = QColor(0, 255, 255) if thing.__class__.__name__ == 'PlayerStart' else QColor(255, 128, 0)
+                angle_rad = math.radians(angle_deg)
+                arrow_len = 35 * self.zoom_factor
+                if arrow_len < 15: arrow_len = 15
+
+                dx = math.cos(angle_rad) * arrow_len
+                dy = math.sin(angle_rad) * arrow_len
+                if self.view_type == 'top': dy = -dy
+
+                s_end = s_pos + QPointF(dx, dy)
+                painter.setPen(QPen(arrow_color, 2))
+                painter.drawLine(s_pos, s_end)
+
+                head_angle = math.atan2(s_end.y() - s_pos.y(), s_end.x() - s_pos.x())
+                head_size = 8
+                p1 = s_end - QPointF(math.cos(head_angle - math.pi / 6) * head_size,
+                                     math.sin(head_angle - math.pi / 6) * head_size)
+                p2 = s_end - QPointF(math.cos(head_angle + math.pi / 6) * head_size,
+                                     math.sin(head_angle + math.pi / 6) * head_size)
+
+                painter.setBrush(QBrush(arrow_color))
+                painter.drawPolygon(QPolygonF([s_end, p1, p2]))
+                painter.restore()
+
+            # 4. Overlays (selection highlight + color tag)
+            if draw_rect:
+                self.draw_thing_color_tag(painter, thing, draw_rect)
+                is_selected = thing in selected or thing == primary
+                if is_selected:
+                    painter.setPen(QPen(QColor(255, 255, 0), 2, Qt.DotLine))
+                    painter.setBrush(Qt.NoBrush)
+                    painter.drawRect(draw_rect.adjusted(-2, -2, 2, 2))
+
+        # Draw portal pair link lines on top of all things (F1 toggle respects this too)
+        self._draw_portal_links(painter, axis1_idx, axis2_idx, visible_bounds)
+
+    def _draw_portal_center_handle(self, painter, center, color):
+        """Draw the center handle used to acquire a portal gizmo."""
+        size = 6.0
+        diamond = QPolygonF([
+            center + QPointF(0.0, -size),
+            center + QPointF(size, 0.0),
+            center + QPointF(0.0, size),
+            center + QPointF(-size, 0.0),
+        ])
+        painter.save()
+        painter.setPen(QPen(QColor(255, 255, 255, 230), 1.5))
+        painter.setBrush(QBrush(color))
+        painter.drawPolygon(diamond)
+        painter.setPen(QPen(QColor(255, 255, 255, 210), 1))
+        painter.drawLine(center + QPointF(-3, 0), center + QPointF(3, 0))
+        painter.drawLine(center + QPointF(0, -3), center + QPointF(0, 3))
+        painter.restore()
+
+    def _draw_portal_gizmo(self, painter, thing, s_pos, axis1_idx, axis2_idx, ax_map, ax1, ax2, visible_bounds):
+        """
+        Draw the Portal aperture as a thick line segment in the 2D view,
+        with a small normal arrow showing the facing direction and the portal name.
+        Returns the bounding QRectF used for selection/hit-testing.
+        """
+        # ---- Color handling (FIXED) ----
+        raw_col = thing.properties.get('color', [255, 255, 255])
+
+        # Handle string values that may come from property editor text fields
+        if isinstance(raw_col, str):
+            try:
+                import ast
+                raw_col = ast.literal_eval(raw_col)
+            except (ValueError, SyntaxError):
+                raw_col = [255, 255, 255]
+
+        # Ensure valid list/tuple with at least 3 numeric components
+        if not isinstance(raw_col, (list, tuple)) or len(raw_col) < 3:
+            raw_col = [255, 255, 255]
+
+        # Safely convert each component to 0-255 int
+        def _to_color_int(val, default=255):
+            try:
+                return max(0, min(255, int(float(val))))
+            except (TypeError, ValueError):
+                return default
+
+        r = _to_color_int(raw_col[0] if len(raw_col) > 0 else 255)
+        g = _to_color_int(raw_col[1] if len(raw_col) > 1 else 255)
+        b = _to_color_int(raw_col[2] if len(raw_col) > 2 else 255)
+
+        # Dim inactive portals
+        if not thing.is_active():
+            r, g, b = int(r * 0.4), int(g * 0.4), int(b * 0.4)
+
+        # Warn visually when portal_target is missing or points to a nonexistent portal
+        target_name = thing.properties.get('portal_target', '')
+        target_exists = target_name and any(
+            isinstance(t, Portal) and t.properties.get('name') == target_name
+            for t in self.editor.state.things
+            if t is not thing
+        )
+        is_broken = not target_exists
+        if is_broken:
+            r, g, b = 220, 60, 60   # red tint — unlinked or broken target
+
+        portal_color = QColor(r, g, b, 220)
+        dim_color    = QColor(r, g, b, 80)
+
+        is_active = thing.is_active()
+
+        # Top view: aperture is a horizontal line (X axis), normal points along Z.
+        # Front/side views: aperture is a vertical line (Y axis), normal shows as a dot.
+        # For the top view we can show a proper line + normal; for other views a square.
+        yaw = thing.get_yaw_radians()
+        w2  = thing.get_width() / 2.0
+
+        if ax1 == 'x' and ax2 == 'z':
+            # Top view — draw full aperture line and normal arrow
+            rx =  math.cos(yaw)   # right vector X
+            rz = -math.sin(yaw)   # right vector Z (Z is our screen-Y in top view)
+            nx =  math.sin(yaw)   # normal X
+            nz =  math.cos(yaw)   # normal Z
+
+            ox, oz = float(thing.pos[0]), float(thing.pos[2])
+
+            left_w  = QPointF(ox - rx * w2, oz - rz * w2)
+            right_w = QPointF(ox + rx * w2, oz + rz * w2)
+            left_s  = self.world_to_screen(left_w)
+            right_s = self.world_to_screen(right_w)
+
+            # Aperture line
+            pen_style = Qt.SolidLine if is_active else Qt.DashLine
+            painter.save()
+            painter.setPen(QPen(portal_color, 3, pen_style))
+            painter.drawLine(left_s, right_s)
+
+            # Normal arrow (shows facing direction)
+            normal_len = 24.0  # screen pixels
+            mid_s = QPointF((left_s.x() + right_s.x()) / 2,
+                            (left_s.y() + right_s.y()) / 2)
+            # In top view, Z maps to screen-Y (downward positive in Qt)
+            tip_s = QPointF(mid_s.x() + nx * normal_len,
+                            mid_s.y() + nz * normal_len)
+            painter.setPen(QPen(portal_color, 2))
+            painter.drawLine(mid_s, tip_s)
+            # Arrowhead
+            angle = math.atan2(tip_s.y() - mid_s.y(), tip_s.x() - mid_s.x())
+            hs = 8
+            ah1 = tip_s - QPointF(math.cos(angle - math.pi/6)*hs, math.sin(angle - math.pi/6)*hs)
+            ah2 = tip_s - QPointF(math.cos(angle + math.pi/6)*hs, math.sin(angle + math.pi/6)*hs)
+            painter.setBrush(QBrush(portal_color))
+            painter.drawPolygon(QPolygonF([tip_s, ah1, ah2]))
+            self._draw_portal_center_handle(painter, mid_s, portal_color)
+
+            # Name label
+            painter.setPen(QPen(portal_color.lighter(150)))
+            font = QFont()
+            font.setPointSize(8)
+            painter.setFont(font)
+            painter.drawText(right_s + QPointF(5, 4), thing.properties.get('name', ''))
+
+            painter.restore()
+
+            # Bounding rect for selection
+            xs = [left_s.x(), right_s.x(), tip_s.x()]
+            ys = [left_s.y(), right_s.y(), tip_s.y()]
+            margin = 6
+            draw_rect = QRectF(min(xs) - margin, min(ys) - margin,
+                            max(xs) - min(xs) + margin*2,
+                            max(ys) - min(ys) + margin*2)
+
+        else:
+            # Front / side view — draw as a tall rectangle indicating the aperture
+            h2 = thing.get_height() / 2.0
+            # In front view ax1=x, ax2=y;  in side view ax1=z, ax2=y
+            px = float(thing.pos[axis1_idx])
+            py = float(thing.pos[axis2_idx])
+
+            # Width in this projection depends on the view:
+            # front view: portal width is along X, so project w2 onto X
+            # side view:  portal width is along Z, project onto Z
+            if ax1 == 'x':
+                proj_half_w = w2 * abs(math.cos(yaw))
+            else:
+                proj_half_w = w2 * abs(math.sin(yaw))
+            proj_half_w = max(4.0, proj_half_w)
+
+            top_left_w  = QPointF(px - proj_half_w, py + h2)
+            bot_right_w = QPointF(px + proj_half_w, py - h2)
+            tl_s = self.world_to_screen(top_left_w)
+            br_s = self.world_to_screen(bot_right_w)
+            rect_s = QRectF(tl_s, br_s).normalized()
+
+            pen_style = Qt.SolidLine if is_active else Qt.DashLine
+            painter.save()
+            painter.setPen(QPen(portal_color, 2, pen_style))
+            painter.setBrush(QBrush(dim_color))
+            painter.drawRect(rect_s)
+            self._draw_portal_center_handle(
+                painter, self.world_to_screen(QPointF(px, py)), portal_color)
+
+            # Name label
+            painter.setPen(QPen(portal_color.lighter(150)))
+            font = QFont()
+            font.setPointSize(8)
+            painter.setFont(font)
+            painter.drawText(rect_s.topRight() + QPointF(4, 12), thing.properties.get('name', ''))
+
+            painter.restore()
+            draw_rect = rect_s
+
+        return draw_rect
+
+    #: Label colour by entity class; Monsters' red otherwise. A PlayerStart's
+    #: label matches its direction arrow.
+    _ENTITY_LABEL_COLOURS = {'PlayerStart': QColor(0, 255, 255)}
+
+    def _draw_entity_label(self, painter, s_pos, lines, colour, sprite_rect=None):
+        """Write *lines* under the sprite at screen point *s_pos*, top line first."""
+        painter.save()
+        painter.setPen(QPen(colour))
+        font = QFont()
+        font.setPointSize(8)
+        font.setBold(True)
+        painter.setFont(font)
+        line_height = painter.fontMetrics().height()
+        # From the left edge of the sprite, with a DPI-aware gap.
+        text_x = sprite_rect.left() if sprite_rect is not None else s_pos.x() - 16
+        sprite_bottom = sprite_rect.bottom() if sprite_rect is not None else s_pos.y() + 16
+        text_y = sprite_bottom + line_height + 2
+        for line in lines:
+            painter.drawText(QPointF(text_x, text_y), line)
+            text_y += line_height
+        painter.restore()
+
+    def _draw_portal_links(self, painter, axis1_idx, axis2_idx, visible_bounds):
+        """
+        Draw a dashed cyan line between each linked portal pair
+        """
+        portals_by_name = {}
+        for t in self.editor.state.things:
+            if isinstance(t, Portal) and not self._filtered(t):
+                name = t.properties.get('name', '')
+                if name:
+                    portals_by_name[name] = t
+
+        drawn_pairs = set()
+        link_pen = QPen(QColor(0, 200, 255, 140), 1, Qt.DashLine)
+
+        for name, pa in portals_by_name.items():
+            target = pa.properties.get('portal_target', '')
+            if not target or target not in portals_by_name:
+                continue
+            pair = frozenset({name, target})
+            if pair in drawn_pairs:
+                continue
+            drawn_pairs.add(pair)
+
+            pb = portals_by_name[target]
+
+            ax_w = QPointF(float(pa.pos[axis1_idx]), float(pa.pos[axis2_idx]))
+            bx_w = QPointF(float(pb.pos[axis1_idx]), float(pb.pos[axis2_idx]))
+
+            # Cull if both endpoints out of view
+            margin = 80.0
+            ar = QRectF(ax_w.x()-margin, ax_w.y()-margin, margin*2, margin*2)
+            br = QRectF(bx_w.x()-margin, bx_w.y()-margin, margin*2, margin*2)
+            if not (visible_bounds.intersects(ar) or visible_bounds.intersects(br)):
+                continue
+
+            p1 = self.world_to_screen(ax_w)
+            p2 = self.world_to_screen(bx_w)
+
+            painter.setPen(link_pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawLine(p1, p2)
+
+            # Small label at midpoint
+            mid = QPointF((p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2)
+            painter.save()
+            painter.setPen(QPen(QColor(0, 200, 255, 100)))
+            font = QFont()
+            font.setPointSize(8)
+            painter.setFont(font)
+            link_label = f"{name} ↔ {target}"
+            painter.drawText(mid + QPointF(4, -4), link_label)
+            painter.restore()
+
+    def draw_terrain(self, painter, visible_bounds):
+        """Draw terrain outline/profile in 2D view."""
+        # Check if terrain exists and is enabled
+        if not self.editor.terrain:
+            return
+        terrain = self.editor.terrain
+        # Keep the Big World "fill world with terrain" preview live as the view
+        # pans (the top view is the world map). Cheap + idempotent; expands the
+        # terrain to the world and streams it around the editor camera.
+        if self.view_type == 'top' and hasattr(self.editor, 'sync_bigworld_terrain'):
+            self.editor.sync_bigworld_terrain()
+        if not terrain.enabled:
+            return
+
+        ax1, ax2 = self.get_axes()
+        if not ax1 or not ax2:
+            return
+        
+        # Get view bounds
+        min1 = visible_bounds.left()
+        max1 = visible_bounds.right()
+        min2 = visible_bounds.top()
+        max2 = visible_bounds.bottom()
+        
+        # Set terrain drawing style
+        terrain_color = QColor(139, 90, 43, 180)  # Brown with transparency
+        terrain_fill = QColor(139, 90, 43, 40)
+        
+        if terrain.solid:
+            pen = QPen(terrain_color, 2)
+        else:
+            pen = QPen(terrain_color, 1, Qt.DashLine)
+        
+        painter.setPen(pen)
+        
+        # Get terrain bounds
+        t_bounds = terrain.get_terrain_bounds()
+        t_min_x, t_max_x = t_bounds[0]
+        t_min_z, t_max_z = t_bounds[1]
+        
+        if ax1 == 'x' and ax2 == 'z':
+            # TOP VIEW - Draw terrain boundary rectangle. Clamp to the visible
+            # viewport: an infinite/world-filled terrain has bounds millions of
+            # units across, and handing Qt an astronomically large rectangle is
+            # slow and precision-glitchy — the on-screen part is all that shows.
+            fill_min_x = max(t_min_x, min1); fill_max_x = min(t_max_x, max1)
+            fill_min_z = max(t_min_z, min2); fill_max_z = min(t_max_z, max2)
+            p1 = self.world_to_screen(QPointF(fill_min_x, fill_min_z))
+            p2 = self.world_to_screen(QPointF(fill_max_x, fill_max_z))
+            rect = QRectF(p1, p2).normalized()
+
+            painter.setBrush(QBrush(terrain_fill))
+            painter.drawRect(rect)
+            
+            # Draw a chunk grid to indicate terrain. Clip to the visible
+            # viewport (a world-filled terrain spans thousands of chunks — only
+            # the on-screen lines are worth drawing) and skip it entirely when
+            # chunks would be sub-pixel at the current zoom.
+            chunk_size = terrain.chunk_size
+            if chunk_size * self.zoom_factor >= 4:
+                painter.setPen(QPen(QColor(139, 90, 43, 60), 1))
+                cx_start = max(terrain.min_chunk_x,
+                               int(math.floor((min1 - terrain.offset_x) / chunk_size)))
+                cx_end = min(terrain.max_chunk_x + 1,
+                             int(math.ceil((max1 - terrain.offset_x) / chunk_size)))
+                z0 = max(t_min_z, min2); z1 = min(t_max_z, max2)
+                for cx in range(cx_start, cx_end + 1):
+                    x = cx * chunk_size + terrain.offset_x
+                    if x < t_min_x or x > t_max_x:
+                        continue
+                    p1 = self.world_to_screen(QPointF(x, z0))
+                    p2 = self.world_to_screen(QPointF(x, z1))
+                    painter.drawLine(p1, p2)
+                cz_start = max(terrain.min_chunk_z,
+                               int(math.floor((min2 - terrain.offset_z) / chunk_size)))
+                cz_end = min(terrain.max_chunk_z + 1,
+                             int(math.ceil((max2 - terrain.offset_z) / chunk_size)))
+                x0 = max(t_min_x, min1); x1 = min(t_max_x, max1)
+                for cz in range(cz_start, cz_end + 1):
+                    z = cz * chunk_size + terrain.offset_z
+                    if z < t_min_z or z > t_max_z:
+                        continue
+                    p1 = self.world_to_screen(QPointF(x0, z))
+                    p2 = self.world_to_screen(QPointF(x1, z))
+                    painter.drawLine(p1, p2)
+            
+            # Label — anchored to the visible top-left of the terrain so it
+            # stays on screen even when the terrain is effectively infinite.
+            painter.setPen(QPen(terrain_color, 1))
+            label_world = QPointF(max(t_min_x, min1) + 10, max(t_min_z, min2) + 10)
+            infinite = (terrain.max_chunk_x - terrain.min_chunk_x) > 100000
+            painter.drawText(self.world_to_screen(label_world),
+                             "TERRAIN (∞)" if infinite else "TERRAIN")
+            
+        elif ax1 == 'x' and ax2 == 'y':
+            # FRONT VIEW - Draw height profile
+            center_z = (t_min_z + t_max_z) / 2
+            
+            # Sample terrain heights
+            resolution = 64
+            points = []
+            sample_min_x = max(min1, t_min_x)
+            sample_max_x = min(max1, t_max_x)
+            
+            if sample_max_x > sample_min_x:
+                for x in np.linspace(sample_min_x, sample_max_x, resolution):
+                    h = terrain.get_height_at(x, center_z)
+                    screen_pt = self.world_to_screen(QPointF(x, h))
+                    points.append(screen_pt)
+                
+                if len(points) >= 2:
+                    # Draw filled area under terrain
+                    bottom_y = self.world_to_screen(QPointF(0, terrain.offset_y)).y()
+                    polygon = QPolygonF()
+                    polygon.append(QPointF(points[0].x(), bottom_y))
+                    for pt in points:
+                        polygon.append(pt)
+                    polygon.append(QPointF(points[-1].x(), bottom_y))
+                    
+                    painter.setBrush(QBrush(terrain_fill))
+                    painter.drawPolygon(polygon)
+                    
+                    # Draw terrain line
+                    painter.setPen(pen)
+                    painter.setBrush(Qt.NoBrush)
+                    for i in range(len(points) - 1):
+                        painter.drawLine(points[i], points[i + 1])
+                        
+        elif ax1 == 'z' and ax2 == 'y':
+            # SIDE VIEW - Draw height profile
+            center_x = (t_min_x + t_max_x) / 2
+            
+            resolution = 64
+            points = []
+            sample_min_z = max(min1, t_min_z)
+            sample_max_z = min(max1, t_max_z)
+            
+            if sample_max_z > sample_min_z:
+                for z in np.linspace(sample_min_z, sample_max_z, resolution):
+                    h = terrain.get_height_at(center_x, z)
+                    screen_pt = self.world_to_screen(QPointF(z, h))
+                    points.append(screen_pt)
+                
+                if len(points) >= 2:
+                    bottom_y = self.world_to_screen(QPointF(0, terrain.offset_y)).y()
+                    polygon = QPolygonF()
+                    polygon.append(QPointF(points[0].x(), bottom_y))
+                    for pt in points:
+                        polygon.append(pt)
+                    polygon.append(QPointF(points[-1].x(), bottom_y))
+                    
+                    painter.setBrush(QBrush(terrain_fill))
+                    painter.drawPolygon(polygon)
+                    
+                    painter.setPen(pen)
+                    painter.setBrush(Qt.NoBrush)
+                    for i in range(len(points) - 1):
+                        painter.drawLine(points[i], points[i + 1])
+    
+    def _check_camera_changed(self):
+        """
+        Check if the 3D camera has moved/rotated since last frame.
+        If so, schedule a repaint of this 2D view's overlays: the camera cone
+        is drawn over the kept image of the scene, which a camera move leaves
+        as it is (_request_overlay_frame).
+        Called by the 3D view on each frame it draws in editor mode
+        (MainWindow.notify_camera_moved), and repaints only when the camera
+        actually changed.
+        """
+        if not self.isVisible() or self._paced_by_play():
+            return
+
+        camera = self.editor.view_3d.camera
+
+        # Get current camera state
+        current_pos = (float(camera.pos.x), float(camera.pos.y), float(camera.pos.z))
+        current_yaw = float(camera.yaw)
+        current_pitch = float(camera.pitch)
+
+        # Check if anything changed (with small epsilon for float comparison)
+        EPSILON = 0.01
+        changed = False
+
+        if self._last_camera_pos is None:
+            changed = True
+        else:
+            if any(abs(current_pos[i] - self._last_camera_pos[i]) > EPSILON for i in range(3)):
+                changed = True
+            if abs(current_yaw - self._last_camera_yaw) > EPSILON:
+                changed = True
+            if abs(current_pitch - self._last_camera_pitch) > EPSILON:
+                changed = True
+
+        if changed:
+            # Update cache
+            self._last_camera_pos = current_pos
+            self._last_camera_yaw = current_yaw
+            self._last_camera_pitch = current_pitch
+            # Schedule repaint - Qt will coalesce multiple requests
+            self._request_overlay_frame()
+
+    def draw_camera(self, painter):
+        """Optimized camera drawing with early exit for off-screen cameras."""
+        camera = self.editor.view_3d.camera
+        ax1, ax2 = self.get_axes()
+        if not ax1 or not ax2:
+            return
+
+        ax_map = {'x': 0, 'y': 1, 'z': 2}
+        axis1_idx = ax_map[ax1]
+        axis2_idx = ax_map[ax2]
+
+        cam_pos_2d = QPointF(camera.pos[axis1_idx], camera.pos[axis2_idx])
+        screen_pos = self.world_to_screen(cam_pos_2d)
+
+        # Early exit if camera is far off-screen
+        margin = 100
+        if not self.rect().adjusted(-margin, -margin, margin, margin).contains(screen_pos.toPoint()):
+            return
+
+        # Determine view angle for this 2D projection
+        yaw = camera.yaw
+        pitch = camera.pitch
+        
+        if self.view_type == 'top':
+            angle_deg = yaw
+        elif self.view_type == 'front':
+            angle_deg = -yaw
+        elif self.view_type == 'side':
+            angle_deg = -pitch
+
+        fov = camera.fov
+        cone_length = 200
+        
+        # Calculate view cone corners
+        left_angle_rad = np.radians(angle_deg - fov / 2)
+        right_angle_rad = np.radians(angle_deg + fov / 2)
+
+        left_point = QPointF(cam_pos_2d.x() + cone_length * np.cos(left_angle_rad),
+                             cam_pos_2d.y() + cone_length * np.sin(left_angle_rad))
+        right_point = QPointF(cam_pos_2d.x() + cone_length * np.cos(right_angle_rad),
+                              cam_pos_2d.y() + cone_length * np.sin(right_angle_rad))
+
+        screen_left = self.world_to_screen(left_point)
+        screen_right = self.world_to_screen(right_point)
+
+        # Draw view cone (semi-transparent)
+        cone_poly = QPolygonF([screen_pos, screen_left, screen_right])
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 25))
+        painter.drawPolygon(cone_poly)
+        
+        # Draw camera body
+        painter.setPen(QPen(QColor(255, 255, 255), 2))
+        painter.setBrush(QColor(0, 0, 0, 150))
+        painter.drawEllipse(screen_pos, 8, 8)
+
+    # -- a selected decal's handles (editor.decal_handles) ---------------------
+
+    def _handle_decal(self):
+        """The decal whose edges have handles: the selected one (or the
+        Decal tool's one selected decal); not a locked one."""
+        from editor.things import Decal
+        decal = self.editor.primary_selection()
+        if not isinstance(decal, Decal):
+            decal = None
+            tool = getattr(getattr(self.main_window, 'view_3d', None), 'decal_tool', None)
+            if tool is not None and getattr(tool, 'active', False):
+                chosen = tool.selected()
+                if len(chosen) == 1:
+                    decal = chosen[0]
+        if decal is None or decal.properties.get('lock', False):
+            return None
+        return decal
+
+    def _decal_keep_aspect(self):
+        tool = getattr(getattr(self.main_window, 'view_3d', None), 'decal_tool', None)
+        return bool(getattr(tool, 'keep_aspect', True))
+
+    def draw_decal_handles(self, painter):
+        """The selected decal's face outlined, with a handle on each edge
+        this view can drag."""
+        from editor import decal_handles
+        decal = self._handle_decal()
+        idx = self._axis_indices()
+        if decal is None or idx is None:
+            return
+        i1, i2, _ = idx
+        corners = decal_handles.outline(decal, i1, i2)
+        if corners is None:
+            return
+        polygon = QPolygonF([self.world_to_screen(QPointF(u, v)) for u, v in corners])
+        painter.setPen(QPen(QColor(0xF0, 0x80, 0x00), 1.5))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawPolygon(polygon)
+        painter.setPen(QPen(QColor(255, 255, 255), 1))
+        painter.setBrush(QBrush(QColor(255, 255, 255)))
+        size = 8
+        for _key, _sign, (u, v) in decal_handles.handles(decal, i1, i2):
+            at = self.world_to_screen(QPointF(u, v))
+            painter.drawRect(QRectF(at.x() - size / 2, at.y() - size / 2, size, size))
+
+    def _begin_decal_resize(self, screen_pos):
+        """A press on a selected decal's handle starts dragging that edge."""
+        from editor import decal_handles
+        decal = self._handle_decal()
+        idx = self._axis_indices()
+        if decal is None or idx is None:
+            return False
+        i1, i2, _ = idx
+        world = self.screen_to_world(QPointF(screen_pos))
+        hit = decal_handles.handle_at(decal, i1, i2, (world.x(), world.y()),
+                                      10.0 / max(self.zoom_factor, 1e-9))
+        if hit is None:
+            return False
+        self._decal_resize = {'decal': decal, 'key': hit[0], 'sign': hit[1],
+                              'saved': False}
+        return True
+
+    def _update_decal_resize(self, world_pos):
+        """Move the dragged edge to the cursor: snapped to the grid while
+        grid snap is on, the other side following with Keep aspect ratio."""
+        from editor import decal_handles
+        from engine.change_journal import touch
+        drag = self._decal_resize
+        idx = self._axis_indices()
+        if drag is None or idx is None:
+            return
+        i1, i2, _ = idx
+        decal = drag['decal']
+        result = decal_handles.resize(
+            decal, drag['key'], drag['sign'], (world_pos.x(), world_pos.y()), i1, i2,
+            grid=self.grid_size if self.snap_to_grid_enabled else None,
+            keep_aspect=self._decal_keep_aspect())
+        if result is None:
+            return
+        pos, width, height = result
+        props = decal.properties
+        if (all(abs(a - b) < 1e-6 for a, b in zip(pos, decal.pos))
+                and abs(width - float(props.get('width', 0.0))) < 1e-6
+                and abs(height - float(props.get('height', 0.0))) < 1e-6):
+            return
+        if not drag['saved']:
+            self.main_window.save_state()            # the whole drag: one undo step
+            drag['saved'] = True
+        decal.pos = list(pos)
+        props['width'], props['height'] = width, height
+        touch(decal)
+        self.main_window.refresh_views()
+
+    def _end_decal_resize(self):
+        """The drag is over: the panels show the decal's new size."""
+        drag, self._decal_resize = self._decal_resize, None
+        if drag is None or not drag['saved']:
+            return
+        decal = drag['decal']
+        self.editor.state.mark_world_changed([decal])
+        self.main_window.mark_as_modified()
+        editor = getattr(self.main_window, 'property_editor', None)
+        if editor is not None and editor.current_object is decal:
+            editor.set_object(decal)
+        tool = getattr(getattr(self.main_window, 'view_3d', None), 'decal_tool', None)
+        panel = getattr(tool, '_panel', None)
+        if panel is not None and decal in tool.selected():
+            panel.show_values(decal.properties)
+
+    # ------------------------------------------------------------------
+    # Light volumes: the box, its handles and the light source
+    # ------------------------------------------------------------------
+    def _handle_light_volume(self):
+        """The light volume whose handles show: the selected one, unlocked."""
+        from editor.things import LightVolume
+        volume = self.editor.primary_selection()
+        if not isinstance(volume, LightVolume) or volume.properties.get('lock', False):
+            return None
+        return volume
+
+    def draw_light_volumes(self, painter):
+        """Every light volume's box, in its light's colour; the selected one
+        solid, with its handles and its light source (a line from the box's
+        centre shows where the source sits when it is outside the box)."""
+        from editor import light_volume_handles as lvh
+        from editor.things import LightVolume
+        idx = self._axis_indices()
+        if idx is None:
+            return
+        i1, i2, _ = idx
+        selected = self._handle_light_volume()
+        for thing in self.editor.state.things:
+            if not isinstance(thing, LightVolume) or self._hidden(thing):
+                continue
+            u0, v0, u1, v1 = lvh.outline(thing, i1, i2)
+            rect = QRectF(self.world_to_screen(QPointF(u0, v0)),
+                          self.world_to_screen(QPointF(u1, v1))).normalized()
+            r, g, b = (max(0, min(255, int(c * 255))) for c in thing.get_color()[:3])
+            colour = QColor(r, g, b)
+            pen = QPen(colour, 1.5 if thing is selected else 1.0,
+                       Qt.SolidLine if thing is selected else Qt.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(rect)
+            su, sv = lvh.source_point(thing, i1, i2)
+            source = self.world_to_screen(QPointF(su, sv))
+            radius = self.LIGHT_SOURCE_MARKER_PIXELS / 2.0
+            if thing is not selected:
+                # The light source is what there is to click on.
+                painter.setPen(QPen(colour, 1))
+                painter.setBrush(QBrush(QColor(r, g, b, 90)))
+                painter.drawEllipse(source, radius * 0.75, radius * 0.75)
+                continue
+            painter.setPen(QPen(QColor(255, 255, 255), 1))
+            painter.setBrush(QBrush(QColor(255, 255, 255)))
+            size = 8
+            for _key, (u, v) in lvh.handles(thing, i1, i2):
+                at = self.world_to_screen(QPointF(u, v))
+                painter.drawRect(QRectF(at.x() - size / 2, at.y() - size / 2, size, size))
+            centre = self.world_to_screen(QPointF((u0 + u1) / 2.0, (v0 + v1) / 2.0))
+            painter.setPen(QPen(QColor(255, 220, 0), 1, Qt.DotLine))
+            painter.drawLine(centre, source)
+            painter.setPen(QPen(QColor(0, 0, 0), 1))
+            painter.setBrush(QBrush(QColor(255, 220, 0)))
+            painter.drawEllipse(source, radius, radius)
+            painter.drawLine(QPointF(source.x() - radius, source.y()),
+                             QPointF(source.x() + radius, source.y()))
+            painter.drawLine(QPointF(source.x(), source.y() - radius),
+                             QPointF(source.x(), source.y() + radius))
+
+    #: The light-source marker's size on screen, pixels.
+    LIGHT_SOURCE_MARKER_PIXELS = 12
+    #: How near (pixels) a click must be to a light volume's outline.
+    LIGHT_VOLUME_PICK_PIXELS = 6
+
+    def _light_volume_hit_test(self, volume, screen_pos):
+        """Whether a click at *screen_pos* is on a light volume's outline
+        or its light-source marker in this view."""
+        from editor import light_volume_handles as lvh
+        idx = self._axis_indices()
+        if idx is None:
+            return False
+        i1, i2, _ = idx
+        su, sv = lvh.source_point(volume, i1, i2)
+        source = self.world_to_screen(QPointF(su, sv))
+        if (abs(source.x() - screen_pos.x()) <= self.LIGHT_SOURCE_MARKER_PIXELS * 0.75
+                and abs(source.y() - screen_pos.y()) <= self.LIGHT_SOURCE_MARKER_PIXELS * 0.75):
+            return True
+        u0, v0, u1, v1 = lvh.outline(volume, i1, i2)
+        rect = QRectF(self.world_to_screen(QPointF(u0, v0)),
+                      self.world_to_screen(QPointF(u1, v1))).normalized()
+        pad = self.LIGHT_VOLUME_PICK_PIXELS
+        outer = rect.adjusted(-pad, -pad, pad, pad)
+        inner = rect.adjusted(pad, pad, -pad, -pad)
+        return outer.contains(screen_pos) and not (
+            inner.isValid() and inner.contains(screen_pos))
+
+
+    def _begin_light_volume_drag(self, screen_pos, modifiers=Qt.NoModifier):
+        """A press on the selected light volume's source marker or a box
+        handle starts dragging it; the source wins where the two overlap.
+        (A light volume has no icon: what it shows is its box and source.)"""
+        from editor import light_volume_handles as lvh
+        volume = self._handle_light_volume()
+        idx = self._axis_indices()
+        if volume is None or idx is None:
+            return False
+        i1, i2, _ = idx
+        world = self.screen_to_world(QPointF(screen_pos))
+        point = (world.x(), world.y())
+        per_pixel = 1.0 / max(self.zoom_factor, 1e-9)
+        if lvh.source_at(volume, i1, i2, point,
+                         per_pixel * self.LIGHT_SOURCE_MARKER_PIXELS * 0.75):
+            self._light_volume_drag = {'volume': volume, 'mode': 'source',
+                                       'saved': False}
+            return True
+        key = lvh.handle_at(volume, i1, i2, point, per_pixel * 10.0)
+        if key is None:
+            return False
+        self._light_volume_drag = {
+            'volume': volume, 'mode': 'resize', 'key': key, 'saved': False,
+            # The source stays where it is in the world while the box moves
+            # around it (it is stored relative to the box's centre).
+            'source': volume.get_source_position(),
+        }
+        return True
+
+    def _update_light_volume_drag(self, world_pos):
+        """Move the dragged handle or the source to the cursor (snapped while
+        grid snap is on); the whole drag is one undo step."""
+        from editor import light_volume_handles as lvh
+        from engine.change_journal import touch
+        drag = self._light_volume_drag
+        idx = self._axis_indices()
+        if drag is None or idx is None:
+            return
+        i1, i2, _ = idx
+        volume = drag['volume']
+        grid = self.grid_size if self.snap_to_grid_enabled else None
+        point = (world_pos.x(), world_pos.y())
+        props = volume.properties
+        if drag['mode'] == 'source':
+            pos, size = list(volume.pos), volume.get_volume_size()
+            offset = lvh.move_source(volume, point, i1, i2, grid)
+        else:
+            pos, size = lvh.resize(volume, drag['key'], point, i1, i2, grid)
+            offset = [s - p for s, p in zip(drag['source'], pos)]
+        unchanged = (
+            all(abs(a - float(b)) < 1e-6 for a, b in zip(pos, volume.pos))
+            and all(abs(a - b) < 1e-6 for a, b in zip(size, volume.get_volume_size()))
+            and all(abs(a - b) < 1e-6 for a, b in zip(offset, volume.get_source_offset())))
+        if unchanged:
+            return
+        if not drag['saved']:
+            self.main_window.save_state()
+            drag['saved'] = True
+        volume.pos = list(pos)
+        props['volume_size'] = list(size)
+        props['source_offset'] = list(offset)
+        touch(volume)
+        self.main_window.refresh_views()
+
+    def _end_light_volume_drag(self):
+        """The drag is over: the property panel shows the new values."""
+        drag, self._light_volume_drag = self._light_volume_drag, None
+        if drag is None or not drag['saved']:
+            return
+        volume = drag['volume']
+        self.editor.state.mark_world_changed([volume])
+        self.main_window.mark_as_modified()
+        editor = getattr(self.main_window, 'property_editor', None)
+        if editor is not None and editor.current_object is volume:
+            editor.set_object(volume)
+
+    def draw_resize_handles(self, painter, rect):
+        painter.setPen(QPen(QColor(255, 255, 255), 1))
+        painter.setBrush(QBrush(QColor(255, 255, 255)))
+        handle_size = 8
+        handles = self.get_resize_handles(rect)
+        for handle in handles:
+            handle_rect = QRectF(handle.x() - handle_size/2, handle.y() - handle_size/2, handle_size, handle_size)
+            painter.drawRect(handle_rect)
+
+    def draw_component_overlay(self, painter):
+        """Draw the vertex/edge/face handles of the selected brushes.
+
+        Reads the controller's cached overlay arrays (rebuilt only when the
+        selection, hover or geometry actually changed) and projects them here —
+        no geometry is derived during the paint.
+        """
+        controller = self._components()
+        idx = self._axis_indices()
+        if idx is None:
+            return
+        a1, a2, _ = idx
+        targets = self._component_targets()
+        if not targets:
+            return
+        data = controller.overlay(targets)
+
+        def to_screen(p):
+            return self.world_to_screen(QPointF(float(p[a1]), float(p[a2])))
+
+        cold = QColor(120, 200, 255)
+        hot = QColor(255, 170, 40)
+
+        lines = data['lines']
+        if len(lines):
+            painter.setPen(QPen(cold, 1))
+            for seg in lines:
+                painter.drawLine(to_screen(seg[0]), to_screen(seg[1]))
+        hot_lines = data['hot_lines']
+        if len(hot_lines):
+            painter.setPen(QPen(hot, 2))
+            for seg in hot_lines:
+                painter.drawLine(to_screen(seg[0]), to_screen(seg[1]))
+
+        half = 3.0
+        painter.setPen(QPen(cold, 1))
+        painter.setBrush(QBrush(QColor(120, 200, 255, 110)))
+        for p in data['points']:
+            s = to_screen(p)
+            painter.drawRect(QRectF(s.x() - half, s.y() - half,
+                                    half * 2, half * 2))
+        painter.setPen(QPen(hot, 2))
+        painter.setBrush(QBrush(QColor(255, 170, 40, 190)))
+        for p in data['hot_points']:
+            s = to_screen(p)
+            painter.drawRect(QRectF(s.x() - half - 1, s.y() - half - 1,
+                                    half * 2 + 2, half * 2 + 2))
+        painter.setBrush(Qt.NoBrush)
+
+    def draw_marquee(self, painter):
+        """Draw the live rubber-band box and outline the objects it will catch."""
+        idx = self._axis_indices()
+        if idx is None:
+            return
+        i1, i2, _ = idx
+        painter.save()
+
+        # Highlight the caught objects so the selection is previewed live.
+        hi_pen = QPen(QColor(0, 220, 255), 2)
+        painter.setPen(hi_pen)
+        painter.setBrush(Qt.NoBrush)
+        for o in self.marquee_hits:
+            b1, b2, B1, B2 = self._obj_bounds_2d(o, i1, i2)
+            p1 = self.world_to_screen(QPointF(b1, b2))
+            p2 = self.world_to_screen(QPointF(B1, B2))
+            r = QRectF(p1, p2).normalized()
+            if r.width() < 6 and r.height() < 6:      # a point entity
+                r = r.adjusted(-7, -7, 7, 7)
+            painter.drawRect(r)
+
+        # The marquee rectangle itself.
+        start = self.world_to_screen(self.marquee_start)
+        cur = self.world_to_screen(self.marquee_current)
+        rect = QRectF(start, cur).normalized()
+        painter.setPen(QPen(QColor(0, 200, 255), 1, Qt.DashLine))
+        painter.setBrush(QBrush(QColor(0, 180, 255, 30)))
+        painter.drawRect(rect)
+        painter.restore()
+
+    def draw_group_bbox(self, painter):
+        """Draw one bounding box with 8 handles around the whole selection.
+
+        Yellow square handles in scale mode; orange round handles in rotate mode
+        (click the selection again to toggle)."""
+        wb = self._selection_bounds_2d()
+        if wb is None:
+            return
+        p1 = self.world_to_screen(wb.topLeft())
+        p2 = self.world_to_screen(wb.bottomRight())
+        srect = QRectF(p1, p2).normalized()
+
+        painter.save()
+        rotate = (self.manip_mode == 'rotate')
+        box_color = QColor(255, 150, 40) if rotate else QColor(255, 235, 0)
+        painter.setPen(QPen(box_color, 1, Qt.DashLine))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(srect)
+
+        hs = 9
+        painter.setPen(QPen(box_color.darker(160), 1))
+        painter.setBrush(QBrush(box_color))
+        for h in self.get_resize_handles(srect):
+            if rotate:
+                painter.drawEllipse(h, hs / 2, hs / 2)
+            else:
+                painter.drawRect(QRectF(h.x() - hs / 2, h.y() - hs / 2, hs, hs))
+        painter.restore()
+
+    def _draw_traveling_arrows(self, painter, p1, p2, color, conn_key):
+        """Draw arrows that travel along the connection line."""
+        if conn_key not in self.arrow_travel_progress:
+            return
+        
+        dx = p2.x() - p1.x()
+        dy = p2.y() - p1.y()
+        length = math.sqrt(dx * dx + dy * dy)
+        if length < 20:
+            return
+        
+        angle = math.atan2(dy, dx)
+        arrow_size = 8
+        
+        # Draw each traveling arrow
+        for arrow_pos in self.arrow_travel_progress[conn_key]:
+            # Calculate position along line
+            ax = p1.x() + dx * arrow_pos
+            ay = p1.y() + dy * arrow_pos
+            arrow_tip = QPointF(ax, ay)
+            
+            # Draw arrow
+            arrow_p1 = QPointF(
+                ax - arrow_size * math.cos(angle - math.pi / 6),
+                ay - arrow_size * math.sin(angle - math.pi / 6)
+            )
+            arrow_p2 = QPointF(
+                ax - arrow_size * math.cos(angle + math.pi / 6),
+                ay - arrow_size * math.sin(angle + math.pi / 6)
+            )
+            
+            # Slightly brighter color for arrows
+            arrow_color = QColor(color.red(), color.green(), color.blue(), 220)
+            painter.setPen(QPen(arrow_color, 1))
+            painter.setBrush(QBrush(arrow_color))
+            painter.drawPolygon(QPolygonF([arrow_tip, arrow_p1, arrow_p2]))
+    
+    def _draw_connection_arrow(self, painter, p1, p2, color):
+        """Draws a static arrowhead at the end of the line (p2)."""
+        angle = math.atan2(p2.y() - p1.y(), p2.x() - p1.x())
+        arrow_size = 10
+        
+        # Calculate arrow points
+        p_arrow1 = QPointF(p2.x() - arrow_size * math.cos(angle - math.pi / 6),
+                           p2.y() - arrow_size * math.sin(angle - math.pi / 6))
+        p_arrow2 = QPointF(p2.x() - arrow_size * math.cos(angle + math.pi / 6),
+                           p2.y() - arrow_size * math.sin(angle + math.pi / 6))
+        
+        painter.setPen(QPen(color, 2))
+        painter.setBrush(QBrush(color))
+        painter.drawPolygon(QPolygonF([p2, p_arrow1, p_arrow2]))
+    
+    def _paced_by_play(self):
+        """True while a game is played: the 3D view then repaints the 2D
+        views itself, at ``QtGameView.PLAY_2D_VIEWS_HZ``, and this view's own
+        60 Hz timers (the camera cone, the connection arrows) stand down --
+        the camera moves every frame of play, and a repaint here is the whole
+        view: 4-9 ms of the GUI thread a frame."""
+        return bool(self.editor.view_3d.play_mode)
+
+    def _update_connection_animations(self):
+        if (not self.isVisible() or self._paced_by_play()
+                or not self._animating_links() or not self.connection_animations):
+            # Nothing to animate here: sleep until links are drawn animated
+            # again (draw_logic_connections restarts the timer).
+            self.animation_timer.stop()
+            return
+        animation_speed = 0.05
+        arrow_speed = 0.015  # Speed of traveling arrows
+        arrow_spacing = 0.25  # Spacing between arrows (as fraction of line length)
+        needs_update = False
+        
+        for conn_key, anim in self.connection_animations.items():
+            if anim['growing']:
+                if anim['progress'] < 1.0:
+                    anim['progress'] = min(1.0, anim['progress'] + animation_speed)
+                    needs_update = True
+            else:
+                if anim['progress'] > 0.0:
+                    anim['progress'] = max(0.0, anim['progress'] - animation_speed)
+                    needs_update = True
+        
+        # Update traveling arrows
+        for conn_key in list(self.arrow_travel_progress.keys()):
+            if conn_key not in self.connection_animations:
+                del self.arrow_travel_progress[conn_key]
+                continue
+            
+            anim = self.connection_animations.get(conn_key)
+            if not anim or anim['progress'] < 1.0:
+                continue
+            
+            arrows = self.arrow_travel_progress[conn_key]
+            
+            # Move all arrows forward
+            new_arrows = []
+            for pos in arrows:
+                new_pos = pos + arrow_speed
+                if new_pos < 1.0:
+                    new_arrows.append(new_pos)
+            
+            # Add new arrow at start if there's room
+            if len(new_arrows) == 0 or new_arrows[0] >= arrow_spacing:
+                new_arrows.insert(0, 0.0)
+            
+            self.arrow_travel_progress[conn_key] = new_arrows
+            needs_update = True
+        
+        if needs_update:
+            # Only the arrows moved: the scene below the links is reused.
+            self._request_arrow_frame()
+
+    def draw_connection_drag(self, painter):
+        ax1, ax2 = self.get_axes()
+        ax_map = {'x': 0, 'y': 1, 'z': 2}
+        
+        if isinstance(self.connection_source, dict):
+            source_pos = self.connection_source['pos']
+        else:
+            source_pos = self.connection_source.pos
+
+        source_2d = QPointF(source_pos[ax_map[ax1]], source_pos[ax_map[ax2]])
+        
+        p1 = self.world_to_screen(source_2d)
+        p2 = self.world_to_screen(self.connection_drag_pos)
+        
+        if self.connection_snap_target:
+            line_color = QColor(0, 255, 0)
+            pen_width = 3
+        else:
+            line_color = QColor(255, 80, 80)
+            pen_width = 2
+        
+        pen = QPen(line_color, pen_width)
+        painter.setPen(pen)
+        painter.drawLine(p1, p2)
+        
+        self._draw_connection_arrow(painter, p1, p2, line_color)
+        
+        painter.setBrush(QBrush(QColor(line_color.red(), line_color.green(), line_color.blue(), 100)))
+        painter.drawEllipse(p1, 8, 8)
+        
+        if self.connection_snap_target:
+            painter.setPen(QPen(QColor(0, 255, 0), 2))
+            painter.setBrush(QBrush(QColor(0, 255, 0, 80)))
+            painter.drawEllipse(p2, 12, 12)
+
+    def get_resize_handles(self, rect):
+        return [rect.topLeft(), rect.topRight(), rect.bottomLeft(), rect.bottomRight(),
+                QPointF(rect.center().x(), rect.top()), QPointF(rect.center().x(), rect.bottom()),
+                QPointF(rect.left(), rect.center().y()), QPointF(rect.right(), rect.center().y())]
+
+    def _middle_click_pan_enabled(self):
+        """Settings > "Middle Click to Drag in 2D Views".
+
+        The Settings window saves ``middle_click_drag``; this view read
+        ``MiddleClickDrag``, and option names are case-sensitive, so the
+        checkbox did nothing. The old name is still honoured when it is the
+        only one present.
+        """
+        config = self.main_window.config
+        legacy = config.getboolean('Controls', 'MiddleClickDrag', fallback=False)
+        return config.getboolean('Controls', 'middle_click_drag', fallback=legacy)
+
+    def mousePressEvent(self, event):
+        world_pos = self.screen_to_world(event.pos())
+        middle_click_pan_enabled = self._middle_click_pan_enabled()
+
+        if event.button() == Qt.RightButton:
+            self.is_panning = False 
+            self.pan_start_pos = event.pos()
+            self.last_pan_pos = event.pos() 
+            return
+        
+        if event.button() == Qt.MiddleButton and middle_click_pan_enabled:
+            self.is_panning = False
+            self.pan_start_pos = event.pos()
+            self.last_pan_pos = event.pos()
+            return
+
+        elif event.button() == Qt.LeftButton:
+            # --- Clone-and-place: the click drops the copies being carried ---
+            if self.main_window.clone_placement_active():
+                self.main_window.finish_clone_placement()
+                self.update()
+                return
+
+            # --- Free-rotate tool: left-drag spins the selection ---
+            if self._rotate_active():
+                self.begin_rotate(world_pos)
+                return
+
+            # --- Clip / slice tool: left clicks place the two cut points ---
+            if self._clip_active():
+                snapped = self.snap_to_grid(world_pos)
+                if len(self.clip_points) >= 2:
+                    self.clip_points = []   # start a fresh cut
+                self.clip_points.append(snapped)
+                self.clip_hover = snapped
+                self._update_clip_keep_side()
+                self.update()
+                return
+
+            # If we're in connection mode (started from property editor), complete on click
+            if self.is_connecting:
+                # Complete the connection
+                target_object = self.connection_snap_target
+                if not target_object:
+                    target_object = self.get_object_at(event.pos())
+                
+                if target_object and target_object != self.connection_source:
+                    self.main_window.save_state()
+                    
+                    # Ensure target has a name
+                    target_name = self._ensure_object_name(target_object)
+                    
+                    # Set the trigger's target
+                    self.connection_source['target'] = target_name
+                    
+                    # Show toast
+                    self.main_window.show_toast(f"Connected to '{target_name}'")
+                    
+                    # Refresh property editor
+                    self.main_window.property_editor.set_object(self.connection_source)
+                
+                # Reset connection state
+                self.is_connecting = False
+                self.connection_source = None
+                self.connection_snap_target = None
+                self.setCursor(Qt.ArrowCursor)
+                self.update()
+                return
+            
+            # --- Component modes: the press grabs a vertex / edge / face ---
+            # What the drag means is decided here, Radiant-style, from the
+            # current mode, what the cursor hit and the modifier held:
+            #   plain      -> drag that component alone
+            #   Shift      -> add it to the component selection and drag the set
+            #   Ctrl+face  -> shear the face (its neighbours tilt to follow)
+            # A press that misses every component falls through to the normal
+            # object selection below, so the brush being worked on can still be
+            # swapped without leaving the mode.
+            if self._component_mode() != ce.MODE_OBJECT:
+                ref = self._pick_component(world_pos)
+                if ref is not None:
+                    shear = bool(event.modifiers() & Qt.ControlModifier) and \
+                        ref.kind == ce.MODE_FACE
+                    additive = bool(event.modifiers() & Qt.ShiftModifier)
+                    if self.begin_component_drag(ref, world_pos, shear=shear,
+                                                 additive=additive):
+                        return
+
+            # Check for CTRL+click to start connection dragging
+            if event.modifiers() & Qt.ControlModifier:
+                clicked_object = self.get_object_at(event.pos())
+                # Check if clicked object is a trigger brush
+                if isinstance(clicked_object, dict) and clicked_object.get('is_trigger', False):
+                    self.is_connecting = True
+                    self.connection_source = clicked_object
+                    self.connection_drag_pos = world_pos
+                    self.setCursor(Qt.CrossCursor)
+                    self.update()
+                    return
+            
+            # --- A selected decal's edges: drag one to size it ---
+            if self._begin_decal_resize(event.pos()):
+                self.update()
+                return
+
+            # --- A selected light volume's box handles and light source ---
+            if self._begin_light_volume_drag(event.pos(), event.modifiers()):
+                self.update()
+                return
+
+            # --- Group bounding-box handles (multi-selection) take priority ---
+            g_handle = self._group_handle_at(event.pos())
+            if g_handle != -1:
+                if self.manip_mode == 'rotate':
+                    if self._begin_group_rotate(world_pos):
+                        self.update()
+                        return
+                else:
+                    self._begin_group_resize(g_handle)
+                    self.update()
+                    return
+
+            # Single-brush resize handles only apply to a lone selection; a
+            # multi-selection is handled by the group box above.
+            handle_ix = -1 if self._group_manip_active() else self.get_handle_at(event.pos())
+            if handle_ix != -1:
+                self.is_resizing_brush = True
+                self.resize_handle_ix = handle_ix
+                brush = self.editor.primary_selection()
+                ax1, ax2 = self.get_axes()
+                ax_map = {'x': 0, 'y': 1, 'z': 2}
+                pos = brush['pos']
+                size = brush['size']
+                self.initial_brush_rect = QRectF(
+                    pos[ax_map[ax1]] - size[ax_map[ax1]]/2,
+                    pos[ax_map[ax2]] - size[ax_map[ax2]]/2,
+                    size[ax_map[ax1]],
+                    size[ax_map[ax2]]
+                ).normalized()
+                self.update()
+                return
+
+            # --- Direct side stretching (Radiant's "side stretch") ---
+            # With brushes selected, pressing on or just beside one of their
+            # sides grabs that side instead of the whole brush, so a brush can
+            # be resized by pointing at the geometry rather than hunting for a
+            # handle.  The existing handles are still checked first, and the
+            # grab is banded to a few pixels so an empty-space press still
+            # starts a marquee.
+            if self._select_tool_active() and \
+                    not (event.modifiers() & (Qt.ControlModifier |
+                                              Qt.ShiftModifier |
+                                              Qt.AltModifier)):
+                if self.begin_side_stretch(world_pos):
+                    return
+
+            # Alt-click cycles through stacked objects; a plain click takes the top.
+            cycle = bool(event.modifiers() & Qt.AltModifier)
+            clicked_object = self.get_object_at(event.pos(), highlight_locked=True, cycle=cycle)
+
+            # The Brush tool draws: a plain click on a brush starts a new brush
+            # there, as on empty space, and Shift+click is what selects one.
+            if (self._brush_tool_active() and isinstance(clicked_object, dict)
+                    and not (event.modifiers() & Qt.ShiftModifier)):
+                clicked_object = None
+
+            # A second plain click inside an existing group (without dragging)
+            # flips the group handles between scale and rotate — decided on release.
+            self._maybe_toggle_manip = False
+
+            # Handle shift-click for multi-selection
+            if event.modifiers() & Qt.ShiftModifier and clicked_object:
+                # Get current selected_objects list
+                selected_objects = [o for o in self.editor.state.selected_objects
+                                    if o is not None]
+                if not selected_objects:
+                    selected_objects = []
+                    if self.editor.primary_selection():
+                        selected_objects = [self.editor.primary_selection()]
+                
+                # Toggle selection: add if not present, remove if present
+                if clicked_object in selected_objects:
+                    selected_objects.remove(clicked_object)
+                else:
+                    selected_objects.append(clicked_object)
+                
+                self.editor.set_selected_objects(selected_objects)
+                # Focus Properties tab when selecting objects
+                if selected_objects:
+                    self._focus_properties_tab()
+            else:
+                # If the clicked object is already part of a multi-selection,
+                # keep the whole group so it can be dragged together.  Otherwise
+                # fall back to normal single selection.
+                current_selection = self.editor.state.selected_objects
+                if clicked_object and clicked_object in current_selection and len(current_selection) > 1:
+                    # Preserve the group; a click-without-drag toggles handle mode.
+                    self._maybe_toggle_manip = True
+                else:
+                    self.editor.set_selected_objects([clicked_object])
+                    self.manip_mode = 'resize'  # fresh selection starts in scale mode
+                    # Focus Properties tab when selecting an object
+                    if clicked_object:
+                        self._focus_properties_tab()
+
+            if clicked_object and not (event.modifiers() & Qt.ShiftModifier):
+                # Check if object is locked (works for both brushes and things)
+                if isinstance(clicked_object, dict):
+                    is_locked = clicked_object.get('lock', False)
+                else:
+                    is_locked = clicked_object.properties.get('lock', False)
+
+                if not is_locked:
+                    ax1, ax2 = self.get_axes()
+                    ax_map = {'x': 0, 'y': 1, 'z': 2}
+                    i1, i2 = ax_map[ax1], ax_map[ax2]
+
+                    # Drag every selected object together (a group drag), moving
+                    # only the unlocked members.  When the click landed on an
+                    # object outside the current selection, just drag that one.
+                    group = self.editor.state.selected_objects
+                    if clicked_object not in group:
+                        group = [clicked_object]
+                    # Brushes grouped with a dragged one are attached to it.
+                    self.drag_group = self.editor.movable_with_mates(group)
+                    self.drag_primary = clicked_object
+
+                    self.is_dragging_object = True
+                    self._object_drag_undo_saved = False
+                    self.drag_start_pos = world_pos
+                    pos_ref = clicked_object['pos'] if isinstance(clicked_object, dict) else clicked_object.pos
+                    obj_pos_2d = QPointF(pos_ref[i1], pos_ref[i2])
+                    self.drag_offset = obj_pos_2d - world_pos
+            elif not clicked_object:
+                # Empty space: the Brush tool draws new geometry, the Select tool
+                # (default) drags a rubber-band marquee instead.
+                if self._brush_tool_active():
+                    self.is_drawing_brush = True
+                    self.draw_start_pos = self.snap_to_grid(world_pos)
+                    self.draw_current_pos = self.draw_start_pos
+                else:
+                    self.is_marquee_select = True
+                    self.marquee_start = world_pos
+                    self.marquee_current = world_pos
+                    self.marquee_hits = []
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        world_pos = self.screen_to_world(event.pos())
+        middle_click_pan_enabled = self._middle_click_pan_enabled()
+
+        # Component drag in progress: it owns the mouse until the button is up.
+        if self._components().drag is not None:
+            if event.buttons() & Qt.LeftButton:
+                self.update_component_drag(world_pos)
+                return
+            self.end_component_drag()   # button released elsewhere
+
+        # A decal's edge being dragged owns the mouse until the button is up.
+        if self._decal_resize is not None:
+            if event.buttons() & Qt.LeftButton:
+                self._update_decal_resize(world_pos)
+                return
+            self._end_decal_resize()
+            self.update()
+
+        # So does a light volume's handle or light source.
+        if self._light_volume_drag is not None:
+            if event.buttons() & Qt.LeftButton:
+                self._update_light_volume_drag(world_pos)
+                return
+            self._end_light_volume_drag()
+            self.update()
+
+        # Clone-and-place: the copies ride the cursor until a click drops them.
+        if self.main_window.clone_placement_active():
+            self._track_clone_placement(world_pos)
+            return
+
+        # Free-rotate tool: a left-drag updates the spin; otherwise fall through.
+        if self.rotate_dragging:
+            if event.buttons() & Qt.LeftButton:
+                self.update_rotate(world_pos)
+                return
+            # Button already released elsewhere — finish the drag.
+            self.commit_rotate()
+
+        # Clip tool: track the cursor so the preview line and kept side follow it.
+        if self._clip_active():
+            # The preview point snaps as the clicked points do (to the grid
+            # [ and ] set), so the line drawn is the cut that will be made.
+            self._clip_hover_raw = QPointF(world_pos)
+            self.clip_hover = self.snap_to_grid(world_pos)
+            self._update_clip_keep_side()
+            if self.clip_points:
+                # The line and the kept side are drawn over the scene.
+                self._request_overlay_frame()
+            # fall through so panning (right/middle drag) still works below
+
+        # Handle connection mode first - works with or without button pressed
+        if self.is_connecting:
+            # Update connection drag line endpoint with snap detection
+            snap_target, snap_screen_pos = self._find_snap_target(event.pos())
+            
+            if snap_target:
+                # Snap to target - convert screen pos back to world
+                self.connection_snap_target = snap_target
+                self.connection_drag_pos = self.screen_to_world(snap_screen_pos)
+            else:
+                self.connection_snap_target = None
+                self.connection_drag_pos = world_pos
+            # The line being dragged is drawn over the scene.
+            self._request_overlay_frame()
+            return
+        
+        if not event.buttons():
+            # Hovering in a component mode highlights what a press would grab.
+            # The pick only tests the selected brushes and only repaints when
+            # the highlight actually changes.
+            if self._component_mode() != ce.MODE_OBJECT:
+                self.update_component_hover(world_pos)
+
+            g_handle = self._group_handle_at(event.pos())
+            single_handle = -1 if self._group_manip_active() else self.get_handle_at(event.pos())
+            handle_ix = g_handle if g_handle != -1 else single_handle
+            if handle_ix != -1:
+                if self._group_manip_active() and self.manip_mode == 'rotate':
+                    self.setCursor(Qt.CrossCursor)   # rotate handles
+                elif handle_ix in [0, 3]: self.setCursor(Qt.SizeFDiagCursor)
+                elif handle_ix in [1, 2]: self.setCursor(Qt.SizeBDiagCursor)
+                elif handle_ix in [4, 5]: self.setCursor(Qt.SizeVerCursor)
+                elif handle_ix in [6, 7]: self.setCursor(Qt.SizeHorCursor)
+            elif self._components().hover is not None:
+                # A component is under the cursor and a press would grab it.
+                self.setCursor(Qt.SizeAllCursor)
+            else:
+                self.setCursor(Qt.ArrowCursor)
+            # Nothing else drawn follows a bare hover: the component highlight
+            # and the clip preview asked for their own frames above, and the
+            # handle under the cursor shows in the cursor's shape. Repainting
+            # here drew the whole view again on every mouse move.
+            return
+
+        elif (event.buttons() & Qt.RightButton) or \
+             (event.buttons() & Qt.MiddleButton and middle_click_pan_enabled):
+            if not self.is_panning:
+                if (event.pos() - self.pan_start_pos).manhattanLength() > 5:
+                    self.is_panning = True
+                    self.last_pan_pos = event.pos() 
+
+            if self.is_panning:
+                delta = event.pos() - self.last_pan_pos
+                self.last_pan_pos = event.pos()
+                if self.view_type in ['front', 'side']:
+                    self.pan_offset -= QPointF(delta.x() / self.zoom_factor, -delta.y() / self.zoom_factor)
+                else:
+                    self.pan_offset -= QPointF(delta.x() / self.zoom_factor, delta.y() / self.zoom_factor)
+        
+        elif self.is_marquee_select:
+            # Live rubber-band: track the corner and recompute the caught set so
+            # it can be highlighted before the selection is committed on release.
+            self.marquee_current = world_pos
+            enclose = bool(event.modifiers() & Qt.AltModifier)  # Alt = enclose-only
+            rect = QRectF(self.marquee_start, self.marquee_current)
+            self.marquee_hits = self._objects_in_rect(rect, enclose=enclose)
+            # The box and its catch are drawn over the scene.
+            self._request_overlay_frame()
+            return
+
+        elif self.is_group_resizing:
+            self._update_group_resize(world_pos)
+            current_time = time.time()
+            if current_time - self.last_3d_update_time > 0.016:
+                self.main_window.view_3d.update()
+                self.last_3d_update_time = current_time
+
+        elif self.is_group_rotating:
+            self._update_group_rotate(world_pos)
+
+        elif self.is_drawing_brush:
+            self.draw_current_pos = self.snap_to_grid(world_pos)
+            # So is the box being drawn.
+            self._request_overlay_frame()
+            return
+
+        elif self.is_dragging_object:
+            # The "grab" object stays under the cursor; every other member of
+            # the drag group follows by the same (snapped) delta so the whole
+            # box-selection moves as one and keeps its relative layout.
+            primary = self.drag_primary or self.editor.primary_selection()
+            group = self.drag_group or ([primary] if primary else [])
+            if primary:
+                ax1, ax2 = self.get_axes()
+                ax_map = {'x': 0, 'y': 1, 'z': 2}
+                i1, i2 = ax_map[ax1], ax_map[ax2]
+
+                p_ref = primary['pos'] if isinstance(primary, dict) else primary.pos
+                new_primary_pos = self.snap_to_grid(world_pos + self.drag_offset)
+                d1 = new_primary_pos.x() - p_ref[i1]
+                d2 = new_primary_pos.y() - p_ref[i2]
+
+                if d1 != 0 or d2 != 0:
+                    # Stage the undo snapshot only once the drag actually moves.
+                    # A press/release click therefore creates no phantom undo step,
+                    # while every real brush move remains undoable.
+                    if not self._object_drag_undo_saved:
+                        self.main_window.save_state()
+                        self._object_drag_undo_saved = True
+                    self._maybe_toggle_manip = False  # a real drag, not a toggle-click
+                    for obj in group:
+                        self._translate_object_2d(obj, d1, d2, i1, i2)
+
+                # THROTTLE FIX: Only update 3D view if enough time has passed (approx 60 FPS)
+                current_time = time.time()
+                if current_time - self.last_3d_update_time > 0.016:
+                    self.main_window.view_3d.update()
+                    self.last_3d_update_time = current_time
+        
+        elif self.is_resizing_brush:
+            self.resize_brush(world_pos)
+            # Apply same throttle to brush resizing for consistency
+            current_time = time.time()
+            if current_time - self.last_3d_update_time > 0.016:
+                self.main_window.view_3d.update()
+                self.last_3d_update_time = current_time
+        
+        self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._decal_resize is not None:
+            self._end_decal_resize()
+            self.update()
+            return
+        if event.button() == Qt.LeftButton and self._light_volume_drag is not None:
+            self._end_light_volume_drag()
+            self.update()
+            return
+        action_taken = self.is_dragging_object or self.is_resizing_brush
+
+        # A component drag commits on button-up — one drag, one undo step.
+        if event.button() == Qt.LeftButton and self._components().drag is not None:
+            self.end_component_drag()
+            self.update()
+            return
+
+        if event.button() == Qt.RightButton and not self.is_panning:
+            # A right-click while carrying clones throws them away rather than
+            # opening a menu on top of geometry that is not placed yet.
+            if self.main_window.clone_placement_active():
+                self.main_window.cancel_clone_placement()
+                self.is_panning = False
+                self.update()
+                return
+            self.contextMenuEvent(event)
+
+        self.is_panning = False
+
+        if event.button() == Qt.LeftButton:
+            # Free-rotate tool: releasing the button commits the spin.
+            if self.rotate_dragging:
+                self.commit_rotate()
+                return
+
+            # Group bounding-box scale released.
+            if self.is_group_resizing:
+                self._end_group_resize()
+                self.main_window.view_3d.update()
+                self.update()
+                return
+
+            # Group bounding-box rotate released.
+            if self.is_group_rotating:
+                self._end_group_rotate()
+                self.update()
+                return
+
+            # Rubber-band marquee released: commit the caught set, or treat a
+            # tiny box as a plain empty-click and deselect.
+            if self.is_marquee_select:
+                self.is_marquee_select = False
+                rect = QRectF(self.marquee_start, self.marquee_current).normalized()
+                min_world = 3.0 / max(self.zoom_factor, 1e-6)
+                self.marquee_hits = []
+                if rect.width() < min_world and rect.height() < min_world:
+                    self.editor.set_selected_objects([])   # click empty = deselect
+                    self.update()
+                    return
+                enclose = bool(event.modifiers() & Qt.AltModifier)
+                hits = self._objects_in_rect(rect, enclose=enclose)
+                if hits:
+                    self.editor.set_selected_objects(hits)
+                    self.manip_mode = 'resize'
+                    if self.main_window.properties_tab_widget:
+                        self._focus_properties_tab()
+                    self.main_window.show_toast(f"Selected {len(hits)} object(s)")
+                else:
+                    self.editor.set_selected_objects([])
+                self.update()
+                return
+
+            if self.is_dragging_object:
+                self.is_dragging_object = False
+                self.drag_group = []
+                self.drag_primary = None
+                self._object_drag_undo_saved = False
+                # A click (no drag) inside an existing group flips scale/rotate.
+                if getattr(self, '_maybe_toggle_manip', False):
+                    self._maybe_toggle_manip = False
+                    if self._group_manip_active():
+                        self.manip_mode = ('rotate' if self.manip_mode == 'resize'
+                                           else 'resize')
+                        self.main_window.show_toast(
+                            "Group handles: ROTATE (drag a corner to spin)"
+                            if self.manip_mode == 'rotate' else
+                            "Group handles: SCALE (drag a handle to resize)")
+                        action_taken = False   # nothing moved; don't stack an undo
+            if self.is_resizing_brush: self.is_resizing_brush = False
+
+            # Handle connection completion
+            if self.is_connecting:
+                self.is_connecting = False
+                self.setCursor(Qt.ArrowCursor)
+                
+                target_object = self.connection_snap_target
+                if not target_object:
+                    target_object = self.get_object_at(event.pos())
+                
+                if target_object and target_object != self.connection_source:
+                    self.main_window.save_state()
+                    
+                    # Ensure target has a name
+                    target_name = self._ensure_object_name(target_object)
+                    
+                    # Set target on Brush OR Thing
+                    if isinstance(self.connection_source, dict):
+                        self.connection_source['target'] = target_name
+                    else:
+                        self.connection_source.properties['target'] = target_name
+                    
+                    self.main_window.show_toast(f"Connected to '{target_name}'")
+                    
+                    # Refresh property editor if needed
+                    if self.editor.primary_selection() == self.connection_source:
+                        self.main_window.property_editor.set_object(self.connection_source)
+                    elif self.editor.primary_selection() == target_object:
+                        self.main_window.property_editor.set_object(target_object)
+                
+                self.connection_source = None
+                self.connection_snap_target = None
+                self.update()
+                return
+
+            if self.is_drawing_brush:
+                self.is_drawing_brush = False
+                rect = QRectF(self.draw_start_pos, self.draw_current_pos).normalized()
+
+                if rect.width() >= self.grid_size and rect.height() >= self.grid_size:
+                    action_taken = True
+                    self.main_window.save_state()
+                    ax1, ax2 = self.get_axes()
+                    ax_map = {'x': 0, 'y': 1, 'z': 2}
+                    pos = [0, 0, 0]
+                    size = [self.grid_size, 128, self.grid_size]
+                    pos[ax_map[ax1]] = rect.center().x()
+                    pos[ax_map[ax2]] = rect.center().y()
+                    size[ax_map[ax1]] = rect.width()
+                    size[ax_map[ax2]] = rect.height()
+
+                    new_brush = {'pos': pos, 'size': size, 'textures': {f: 'default.png' for f in ['north','south','east','west','top','down']}}
+                    self.editor.state.brushes.append(new_brush)
+                    self.editor.set_selected_objects([new_brush])
+            
+            if action_taken:
+                self.main_window.save_state()
+        self.update()
+
+    def contextMenuEvent(self, event):
+        # Capture the exact position
+        click_pos = event.pos()
+        
+        menu = QMenu(self)
+        menu.setStyleSheet(CONTEXT_MENU_STYLE)
+
+        # Check if we clicked on a brush for brush-specific options using click_pos
+        clicked_brush = self.get_brush_at(click_pos)
+        select_inside_action = None
+        add_light_volume_action = None
+        
+        if clicked_brush:
+            select_inside_action = menu.addAction("Select Inside")
+            # An idTech 4-style light filling this brush's box; the brush
+            # was only the sizing guide and is removed (one undo restores it).
+            add_light_volume_action = menu.addAction("Light Volume")
+            add_light_volume_action.setToolTip(
+                "Replace this brush with a light that lights exactly its box")
+            menu.addSeparator()
+        
+        # Standard Things
+        add_light_action = menu.addAction("Light")
+        add_effect_action = menu.addAction("Effect")
+        add_player_start_action = menu.addAction("PlayerStart")
+        add_prop_action = menu.addAction("Prop")
+        add_monster_action = menu.addAction("Monster")
+        add_speaker_action = menu.addAction("Speaker")
+        add_logic_spawner_action = menu.addAction("Spawner")
+        add_levelchanger_action = menu.addAction("LevelChanger")
+        add_probe_action = menu.addAction("Reflection Probe")
+        add_shake_action = menu.addAction("Shaker")
+        add_shake_action.setToolTip("Shakes the screen when its Shake input fires")
+        
+        menu.addSeparator()
+        
+        # Advanced / Import
+        # OBJ import is off; the handler below stays, guarded, so re-enabling
+        # it is a matter of uncommenting this line.
+        add_model_action = None
+        # add_model_action = menu.addAction("Model...")
+        
+        # Logic Menu Sub-section
+        menu.addSeparator()
+        logic_menu = menu.addMenu("Logic Entities")
+        add_logic_relay_action = logic_menu.addAction("LogicRelay")
+        add_logic_timer_action = logic_menu.addAction("LogicTimer")
+        add_logic_gate_action = logic_menu.addAction("LogicGate")
+        add_logic_command_action = logic_menu.addAction("LogicCommand")
+        add_logic_state_action = logic_menu.addAction("State Store")
+
+        # Node / Special submenu
+        ai_menu = menu.addMenu("Nodes")
+        add_logic_camera_action = ai_menu.addAction("_Camera")
+        add_path_node_action = ai_menu.addAction("PathNode")
+
+        # Portal submenu
+        portal_menu = menu.addMenu("Portal")
+        add_portal_action = portal_menu.addAction("Portal (single)")
+        add_portal_pair_action = portal_menu.addAction("Portal Pair (linked)")
+        add_portal_pair_action.setToolTip(
+            "Create two portals already cross-linked and facing each other"
+        )
+
+        plugin_actions = {}
+        from plugins.manager import get_manager
+        manager = get_manager()
+        plugin_entries = [
+            (plugin, label, cls)
+            for plugin, label, cls in manager.menu_entries()
+            if manager.is_enabled(plugin)
+        ]
+        if plugin_entries:
+            plugin_menu = menu.addMenu("Plugins")
+            plugin_submenus = {}
+            for plugin, label, cls in plugin_entries:
+                if plugin not in plugin_submenus:
+                    plugin_submenus[plugin] = plugin_menu.addMenu(plugin.name)
+                submenu = plugin_submenus[plugin]
+                action_item = submenu.addAction(label)
+                plugin_actions[action_item] = (plugin, label, cls)
+
+        # Open the menu using the captured position
+        action = menu.exec_(self.mapToGlobal(click_pos))
+        
+        if action is None:
+            return
+        
+        # Handle Select Inside
+        if select_inside_action and action == select_inside_action:
+            self.select_brushes_inside(clicked_brush)
+            return
+
+        if add_light_volume_action and action == add_light_volume_action:
+            self.create_light_volume_from_brush(clicked_brush)
+            return
+        
+        plugin_choice = plugin_actions.get(action)
+        if plugin_choice is not None:
+            plugin, label, cls = plugin_choice
+            world_pos = self.snap_to_grid(self.screen_to_world(click_pos))
+            ax1, ax2 = self.get_axes()
+            ax_map = {'x': 0, 'y': 1, 'z': 2}
+            pos_3d = [0, 40, 0]
+            pos_3d[ax_map[ax1]] = world_pos.x()
+            pos_3d[ax_map[ax2]] = world_pos.y()
+            if self.view_type == 'top':
+                pos_3d[1] = 40
+            self._place_plugin_entity(plugin, cls, label, pos_3d)
+            return
+
+        # Calculate World Position for new object using the captured position
+        world_pos = self.snap_to_grid(self.screen_to_world(click_pos))
+        ax1, ax2 = self.get_axes()
+        ax_map = {'x': 0, 'y': 1, 'z': 2}
+        pos_3d = [0, 40, 0]
+        pos_3d[ax_map[ax1]] = world_pos.x()
+        pos_3d[ax_map[ax2]] = world_pos.y()
+        if self.view_type == 'top':
+            pos_3d[1] = 40
+
+        new_thing = None
+        
+        # Handle Object Creation
+        if action == add_light_action:
+            new_thing = Light(pos=pos_3d)
+        elif action == add_effect_action:
+            new_thing = Effect(pos=pos_3d)
+        elif action == add_player_start_action:
+            # The clicked height is the feet. Spawn.pos remains the runtime's
+            # hull centre; top view places the feet on the Y=0 reference plane.
+            feet_y = 0.0 if self.view_type == 'top' else pos_3d[1]
+            pos_3d[1] = feet_y + PLAYER_HULL_SIZE[1] / 2.0
+            new_thing = PlayerStart(pos=pos_3d)
+        elif action == add_prop_action:
+            new_thing = Prop(pos=pos_3d)
+        elif action == add_speaker_action: 
+            new_thing = Speaker(pos=pos_3d)
+        elif action == add_probe_action:
+            new_thing = ReflectionProbe(pos=pos_3d)
+        elif action == add_shake_action:
+            new_thing = Shake(pos=pos_3d)
+        elif action == add_levelchanger_action:
+            new_thing = LevelChanger(pos=pos_3d)
+            new_thing.properties['target_map'] = ""
+        
+        # Logic Entities
+        elif action == add_logic_relay_action: new_thing = LogicRelay(pos=pos_3d)
+        elif action == add_logic_timer_action: new_thing = LogicTimer(pos=pos_3d)
+        elif action == add_logic_command_action: new_thing = LogicCommand(pos=pos_3d)
+        elif action == add_monster_action:
+            # Monster.pos is the billboard's centre (the AI grounds it at
+            # floor + sprite_height / 2), so the clicked height is the feet,
+            # exactly as for a PlayerStart. Placing the centre at the click
+            # sank the lower half of the sprite into the floor.
+            feet_y = 0.0 if self.view_type == 'top' else pos_3d[1]
+            new_thing = Monster(pos=list(pos_3d))
+            centre_y = feet_y + float(
+                new_thing.properties['sprite_height']) / 2.0
+            new_thing.pos = [pos_3d[0], centre_y, pos_3d[2]]
+        elif action == add_logic_gate_action:
+            new_thing = LogicGate(pos=pos_3d)
+            new_thing.properties['logic_type'] = 'AND' 
+        elif action == add_logic_state_action:
+            new_thing = LogicState(pos=pos_3d)
+            new_thing.properties['initial_data'] = {}
+        elif action == add_logic_camera_action:
+            new_thing = LogicCamera(pos=pos_3d)
+        elif action == add_logic_spawner_action:
+            new_thing = LogicSpawner(pos=pos_3d)
+
+        # AI / Navigation entities
+        elif action == add_path_node_action:
+            new_thing = PathNode(pos=pos_3d)
+
+        # Portal
+        elif action == add_portal_action:
+            new_thing = Portal(pos=pos_3d)
+            new_thing.properties['rotation'] = [0.0, 0.0, 0.0]
+
+        elif action == add_portal_pair_action:
+            # Create portal A at the clicked position
+            pa = Portal(pos=list(pos_3d))
+            pa.properties['rotation'] = [0.0, 0.0, 0.0]
+            pa.properties['angle'] = 0.0
+
+            # Create portal B 256 units away, facing back toward A
+            pb_pos = list(pos_3d)
+            pb_pos[0] += 256
+            pb = Portal(pos=pb_pos)
+            pb.properties['rotation'] = [180.0, 0.0, 0.0]
+            pb.properties['angle'] = 180.0
+
+            # Name pa first, then add pb to state so its name uniqueness check
+            # correctly avoids colliding with pa's name.
+            self._ensure_object_name(pa)
+            self.editor.state.things.append(pb)
+            self._ensure_object_name(pb)
+
+            # Cross-link the pair
+            pa.properties['portal_target'] = pb.properties['name']
+            pb.properties['portal_target'] = pa.properties['name']
+
+            # pa goes through the standard finalize path (append + select);
+            # pb is already in state above.
+            new_thing = pa
+        
+        # Model
+        elif add_model_action and action == add_model_action:
+            # Packed models too: Fio's filesystem, not the system dialog.
+            from editor.asset_dialog import get_open_asset_file
+            filepath, _ = get_open_asset_file(self, "Select Model", "assets/models",
+                                              "Model Files (*.obj *.glb)")
+            if filepath:
+                try:
+                    rel_path = os.path.relpath(filepath, "assets")
+                    if rel_path.startswith(".."): rel_path = filepath
+                    else: rel_path = os.path.join("assets", rel_path)
+                except Exception:
+                    rel_path = filepath
+                
+                new_thing = Prop.for_model(rel_path, pos=pos_3d)
+
+        # Finalize Creation
+        if new_thing:
+            self.main_window.save_state()
+            self.editor.state.things.append(new_thing)
+            self.editor.set_selected_objects([new_thing])
+            # Focus the Properties tab when creating a new thing
+            if self.main_window.properties_tab_widget:
+                self._focus_properties_tab()
+            self.update()
+
+    def create_light_volume_from_brush(self, brush):
+        """Replace *brush* with a LightVolume filling its world box.
+
+        The box is the brush's derived world bounds (an angled or turned
+        brush included), the light source at its centre. The brush goes and
+        the volume is selected, as one undo step. A locked brush is left
+        alone. Returns the new volume, or None.
+        """
+        from editor.things import LightVolume
+        from engine.brush_placement import world_box
+        if not isinstance(brush, dict) or brush not in self.editor.state.brushes:
+            return None
+        if brush.get('lock', False):
+            self.main_window.show_toast("Cannot replace a locked brush", is_error=True)
+            return None
+        cx, cy, cz, hx, hy, hz = (float(v) for v in world_box(brush))
+        volume = LightVolume.from_bounds((cx - hx, cy - hy, cz - hz),
+                                         (cx + hx, cy + hy, cz + hz))
+        self.main_window.save_state()
+        self.editor.state.brushes.remove(brush)
+        self.editor.state.things.append(volume)
+        self.editor.set_selected_objects([volume])
+        if self.main_window.properties_tab_widget:
+            self._focus_properties_tab()
+        self.main_window.show_toast("Light Volume created from the brush")
+        self.update()
+        view_3d = getattr(self.main_window, 'view_3d', None)
+        if view_3d is not None:
+            view_3d.update()
+        return volume
+
+    def _place_plugin_entity(self, plugin, cls, label, pos_3d):
+        """Place a plugin entity from this view's native context-menu path."""
+        from plugins.manager import get_manager
+
+        manager = get_manager()
+        if not manager.is_enabled(plugin):
+            if hasattr(self.main_window, "show_toast"):
+                self.main_window.show_toast(
+                    f"Plugin '{plugin.name}' is disabled", is_error=True)
+            return
+
+        try:
+            probe = cls(pos=list(pos_3d))
+            properties = probe.properties
+            ttype = properties.get("type")
+            if _singleton_blocked(self.main_window, self.editor.state, ttype):
+                return
+
+            wizard = manager.entity_wizard_for(ttype) if ttype else None
+            if wizard is not None:
+                authored = wizard(self.main_window)
+                if authored is None:
+                    return
+                thing = cls(pos=list(pos_3d), properties=dict(authored))
+            else:
+                thing = probe
+
+            self.main_window.save_state()
+            self.editor.state.things.append(thing)
+            placed = getattr(thing, 'on_editor_placed', None)
+            if callable(placed):
+                placed(self.editor.state)
+            self.editor.set_selected_objects([thing])
+            if self.main_window.properties_tab_widget:
+                self._focus_properties_tab()
+            self.update()
+        except Exception as exc:
+            from editor.debug_console import debug_log
+            debug_log("Plugins", f"2D placement failed: {exc}")
+
+
+    def get_brush_at(self, screen_pos):
+        """Returns the brush at the given screen position, or None."""
+        world_pos = self.screen_to_world(screen_pos)
+        ax1, ax2 = self.get_axes()
+        ax_map = {'x': 0, 'y': 1, 'z': 2}
+        
+        # Check if locked items should be skipped
+        locked_not_selectable = self.main_window.config.getboolean('Display', 'locked_not_selectable_2d', fallback=False)
+        
+        for brush in reversed(self.editor.state.brushes):
+            if self._hidden(brush):
+                continue
+            # Skip locked brushes if setting is enabled
+            if locked_not_selectable and brush.get('lock', False):
+                continue
+            pos = brush['pos']
+            size = brush['size']
+            p1 = QPointF(pos[ax_map[ax1]] - size[ax_map[ax1]]/2, pos[ax_map[ax2]] - size[ax_map[ax2]]/2)
+            p2 = QPointF(pos[ax_map[ax1]] + size[ax_map[ax1]]/2, pos[ax_map[ax2]] + size[ax_map[ax2]]/2)
+            brush_rect = QRectF(p1, p2).normalized()
+            if brush_rect.contains(world_pos):
+                return brush
+        return None
+
+    def _ensure_object_name(self, obj):
+        """Ensure an object has a name, auto-generating one if needed. Returns the name."""
+        if isinstance(obj, dict):
+            # It's a brush
+            existing_name = obj.get('name', '')
+            if existing_name:
+                return existing_name
+            
+            # Generate a unique name
+            base_name = 'brush'
+            counter = 1
+            while True:
+                new_name = f"{base_name}_{counter}"
+                # Check if name is unique
+                name_exists = False
+                for b in self.editor.state.brushes:
+                    if b.get('name') == new_name:
+                        name_exists = True
+                        break
+                if not name_exists:
+                    for t in self.editor.state.things:
+                        if hasattr(t, 'name') and t.name == new_name:
+                            name_exists = True
+                            break
+                if not name_exists:
+                    obj['name'] = new_name
+                    return new_name
+                counter += 1
+        else:
+            # It's a Thing
+            existing_name = getattr(obj, 'name', '') or obj.properties.get('name', '')
+            if existing_name:
+                return existing_name
+            
+            # Generate a unique name based on thing type
+            thing_type = type(obj).__name__.lower()
+            base_name = thing_type
+            counter = 1
+            while True:
+                new_name = f"{base_name}_{counter}"
+                # Check if name is unique
+                name_exists = False
+                for b in self.editor.state.brushes:
+                    if b.get('name') == new_name:
+                        name_exists = True
+                        break
+                if not name_exists:
+                    for t in self.editor.state.things:
+                        if hasattr(t, 'name') and t.name == new_name:
+                            name_exists = True
+                            break
+                if not name_exists:
+                    obj.name = new_name
+                    obj.properties['name'] = new_name
+                    return new_name
+                counter += 1
+
+    def _find_snap_target(self, screen_pos):
+        """Find the nearest valid target object within snap threshold.
+        Returns (object, screen_position) or (None, None)."""
+        ax1, ax2 = self.get_axes()
+        ax_map = {'x': 0, 'y': 1, 'z': 2}
+        
+        best_target = None
+        best_distance = self.connection_snap_threshold
+        best_screen_pos = None
+        
+        # Check all brushes (except the source)
+        for brush in self.editor.state.brushes:
+            if brush is self.connection_source:
+                continue
+            if self._hidden(brush):
+                continue
+            
+            # Get brush center in screen coords
+            pos = brush['pos']
+            brush_center = QPointF(pos[ax_map[ax1]], pos[ax_map[ax2]])
+            brush_screen = self.world_to_screen(brush_center)
+            
+            # Calculate distance
+            dx = screen_pos.x() - brush_screen.x()
+            dy = screen_pos.y() - brush_screen.y()
+            distance = math.sqrt(dx * dx + dy * dy)
+            
+            if distance < best_distance:
+                best_distance = distance
+                best_target = brush
+                best_screen_pos = brush_screen
+        
+        # Check all things
+        for thing in self.editor.state.things:
+            if self._hidden(thing):
+                continue
+            
+            # Get thing position in screen coords
+            thing_center = QPointF(thing.pos[ax_map[ax1]], thing.pos[ax_map[ax2]])
+            thing_screen = self.world_to_screen(thing_center)
+            
+            # Calculate distance
+            dx = screen_pos.x() - thing_screen.x()
+            dy = screen_pos.y() - thing_screen.y()
+            distance = math.sqrt(dx * dx + dy * dy)
+            
+            if distance < best_distance:
+                best_distance = distance
+                best_target = thing
+                best_screen_pos = thing_screen
+        
+        return best_target, best_screen_pos
+
+    def _translate_object_2d(self, obj, d1, d2, i1, i2):
+        """Move a single brush or entity by (d1, d2) along the two view axes.
+
+        Handles all three storage shapes seen in the scene: angled brushes with
+        a world-space plane set (moved via ``translate_brush`` so geometry keeps
+        up), plain box brushes (dict ``pos``), and Things (whose ``pos`` may be a
+        list or a glm vector — normalised to a list to stay JSON-serialisable).
+        """
+        if isinstance(obj, dict):
+            if bg.brush_has_geometry(obj):
+                delta = [0.0, 0.0, 0.0]
+                delta[i1] = d1
+                delta[i2] = d2
+                bg.translate_brush(obj, delta)
+            else:
+                pos = obj['pos']
+                pos[i1] += d1
+                pos[i2] += d2
+        else:
+            # Assign a new list rather than editing obj.pos in place: the
+            # assignment is what journals the move (TrackedPosition), and
+            # without it the 3D view's entity table keeps drawing the sprite
+            # at its old position until something else forces a refresh.
+            pos = [float(obj.pos[0]), float(obj.pos[1]), float(obj.pos[2])]
+            pos[i1] += d1
+            pos[i2] += d2
+            obj.pos = pos
+
+    def select_brushes_inside(self, container_brush):
+        """Select every brush and entity enclosed by the drawn box, then delete
+        the box itself.
+
+        Containment is tested in the plane of *this* 2D view (the two visible
+        axes) rather than in full 3D.  The box the user drags out is only a thin
+        slab on the third axis, so a strict 3D test would reject entities that
+        sit at a different depth even though they clearly fall inside the box
+        on screen.  Entities (Things) are point objects, so an entity counts as
+        inside when its centre lies within the box; brushes count as inside
+        when their footprint is fully enclosed.
+        """
+        self.main_window.save_state()
+
+        ax1, ax2 = self.get_axes()
+        ax_map = {'x': 0, 'y': 1, 'z': 2}
+        i1, i2 = ax_map[ax1], ax_map[ax2]
+
+        # Container bounds in the view plane.
+        c_pos = container_brush['pos']
+        c_size = container_brush['size']
+        c_min1, c_max1 = c_pos[i1] - c_size[i1] / 2, c_pos[i1] + c_size[i1] / 2
+        c_min2, c_max2 = c_pos[i2] - c_size[i2] / 2, c_pos[i2] + c_size[i2] / 2
+
+        inside = []
+
+        # Brushes: fully enclosed footprint.
+        for brush in self.editor.state.brushes:
+            if brush is container_brush:
+                continue
+            if self._hidden(brush):
+                continue
+
+            b_pos = brush['pos']
+            b_size = brush['size']
+            b_min1, b_max1 = b_pos[i1] - b_size[i1] / 2, b_pos[i1] + b_size[i1] / 2
+            b_min2, b_max2 = b_pos[i2] - b_size[i2] / 2, b_pos[i2] + b_size[i2] / 2
+
+            if (b_min1 >= c_min1 and b_max1 <= c_max1 and
+                    b_min2 >= c_min2 and b_max2 <= c_max2):
+                inside.append(brush)
+
+        # Entities (Things): centre inside the box.
+        for thing in self.editor.state.things:
+            if self._hidden(thing):
+                continue
+            p = thing.pos
+            if (c_min1 <= p[i1] <= c_max1 and c_min2 <= p[i2] <= c_max2):
+                inside.append(thing)
+
+        # The box was only a lasso — remove it.
+        if container_brush in self.editor.state.brushes:
+            self.editor.state.brushes.remove(container_brush)
+
+        if inside:
+            self.editor.set_selected_objects(inside)
+            if True:
+                self.main_window.show_toast(f"Selected {len(inside)} object(s) inside box")
+        else:
+            self.editor.set_selected_objects([])
+            if True:
+                self.main_window.show_toast("No objects inside box", is_error=True)
+
+        self.update()
+        self.main_window.view_3d.update()
+
+    def wheelEvent(self, event):
+        modifiers = event.modifiers()
+        delta = event.angleDelta().y()
+        
+        # Check if a Light thing is selected
+        selected = self.editor.primary_selection()
+        if isinstance(selected, Light):
+            # SHIFT + wheel: adjust radius
+            if modifiers & Qt.ShiftModifier:
+                current_radius = float(selected.properties.get('radius', 512.0))
+                step = 32.0  # Radius adjustment step
+                if delta > 0:
+                    new_radius = current_radius + step
+                else:
+                    new_radius = max(32.0, current_radius - step)  # Minimum radius of 32
+                selected.properties['radius'] = new_radius
+                # Update property editor if visible
+                self.main_window.property_editor.set_object(selected)
+                self.update()
+                self.main_window.view_3d.update()
+                if True:
+                    self.main_window.show_toast(f"Light radius: {new_radius:.0f}")
+                event.accept()
+                return
+            
+            # CTRL + wheel: adjust intensity
+            if modifiers & Qt.ControlModifier:
+                current_intensity = float(selected.properties.get('intensity', 1.0))
+                step = 0.1  # Intensity adjustment step
+                if delta > 0:
+                    new_intensity = min(10.0, current_intensity + step)  # Max intensity 10
+                else:
+                    new_intensity = max(0.1, current_intensity - step)  # Min intensity 0.1
+                selected.properties['intensity'] = round(new_intensity, 2)
+                # Update property editor if visible
+                self.main_window.property_editor.set_object(selected)
+                self.update()
+                self.main_window.view_3d.update()
+                if True:
+                    self.main_window.show_toast(f"Light intensity: {new_intensity:.2f}")
+                event.accept()
+                return
+        
+        # Default zoom behavior — zoom toward the cursor (Radiant/Hammer style)
+        # so the world point under the mouse stays fixed on screen.
+        factor = 1.25 if delta > 0 else 0.8
+        self.zoom_at(event.pos(), factor)
+
+    def get_object_at(self, screen_pos, highlight_locked=False, cycle=False):
+        world_pos = self.screen_to_world(screen_pos)
+        ax1, ax2 = self.get_axes()
+        ax_map = {'x': 0, 'y': 1, 'z': 2}
+        candidates = []
+        locked_at_pos = []  # Track locked objects at this position
+        
+        # Check if locked items should be skipped
+        locked_not_selectable = self.main_window.config.getboolean('Display', 'locked_not_selectable_2d', fallback=False)
+
+        for thing in reversed(self.editor.state.things):
+            if self._hidden(thing):
+                continue
+            
+            is_hit = False
+            
+            # Portal gizmos are their own pick target; do not reduce them to
+            # the tiny generic Thing-icon hitbox.
+            if isinstance(thing, Portal):
+                is_hit = self._portal_gizmo_hit_test(thing, screen_pos, ax1, ax2)
+            elif isinstance(thing, LightVolume):
+                # Its outline or its light source; never its inside, so a
+                # brush within the box stays clickable.
+                is_hit = self._light_volume_hit_test(thing, screen_pos)
+                if not is_hit:
+                    continue        # not by its centre, as an icon would be
+
+            # Standard Thing Hit Test
+            elif entity_model_path(thing):
+                # Advanced Model Hit Test: Check Bounding Box of projected vertices
+                coords = self._compute_model_screen_coords(thing, ax_map, ax1, ax2)
+                if coords:
+                    pts_x, pts_y = coords
+                    # Compute BBox
+                    min_x, max_x = np.min(pts_x), np.max(pts_x)
+                    min_y, max_y = np.min(pts_y), np.max(pts_y)
+                    # Check contains
+                    sx, sy = screen_pos.x(), screen_pos.y()
+                    if sx >= min_x and sx <= max_x and sy >= min_y and sy <= max_y:
+                        is_hit = True
+            
+            # Fallback (or non-model) hit test
+            # Use sprite size for accurate hit detection so entities on brushes
+            # are always selectable when clicked on their visible sprite.
+            if not is_hit:
+                w_pos = QPointF(thing.pos[ax_map[ax1]], thing.pos[ax_map[ax2]])
+                s_pos = self.world_to_screen(w_pos)
+
+                # Determine hit size based on the thing's actual visual representation
+                if isinstance(thing, PathNode):
+                    # PathNode draws as a 20px square (half=10)
+                    hit_half = 10
+                elif hasattr(thing, 'get_icon_pixmap'):
+                    pixmap = thing.get_icon_pixmap()
+                    hit_half = None if pixmap else 12
+                elif hasattr(thing, 'get_instance_pixmap'):
+                    pixmap = thing.get_instance_pixmap()
+                    hit_half = None if pixmap else 12
+                else:
+                    hit_half = 12  # Default fallback
+
+                if hit_half is None:
+                    is_hit = self._sprite_rect(pixmap, s_pos).contains(screen_pos)
+                elif abs(screen_pos.x() - s_pos.x()) <= hit_half and abs(screen_pos.y() - s_pos.y()) <= hit_half:
+                    is_hit = True
+
+            if is_hit:
+                # Track locked things separately if setting is enabled
+                if locked_not_selectable and thing.properties.get('lock', False):
+                    locked_at_pos.append(thing)
+                else:
+                    candidates.append(thing)
+        
+        for brush in reversed(self.editor.state.brushes):
+            if self._hidden(brush):
+                continue
+
+            if brush.get('pos') is None or brush.get('size') is None:
+                continue
+
+            # Derived bounds (brush_placement): an angled brush's planes, a
+            # previewed mover where it is drawn.
+            b = brush_placement.world_bounds(brush)
+            i1, i2 = ax_map[ax1], ax_map[ax2]
+            brush_rect = QRectF(QPointF(b[i1], b[i2]),
+                                QPointF(b[i1 + 3], b[i2 + 3])).normalized()
+            
+            if brush_rect.contains(world_pos):
+                # Track locked brushes separately if setting is enabled
+                if locked_not_selectable and brush.get('lock', False):
+                    locked_at_pos.append(brush)
+                else:
+                    candidates.append(brush)
+
+        # If highlight_locked is True and we found locked objects, highlight them in hierarchy
+        if highlight_locked and locked_at_pos and locked_not_selectable:
+            # Highlight the first locked object in the hierarchy (without selecting)
+            if hasattr(self.main_window, 'highlight_in_hierarchy'):
+                self.main_window.highlight_in_hierarchy(locked_at_pos[0])
+
+        if not candidates:
+            return None
+
+        # Alt-click walks through stacked objects at the cursor; a plain click
+        # always takes the topmost so selection stays predictable.  The walk
+        # goes through the shared cycling helper (the same one the 3D view
+        # uses) over a list built in scene order, so repeating the click always
+        # visits the same brushes in the same sequence — including ones buried
+        # completely behind others.
+        if cycle:
+            return ce.cycle_pick(candidates, self.editor.primary_selection())
+
+        return candidates[0]
+
+    def get_handle_at(self, screen_pos):
+        brush = self.editor.primary_selection()
+        if not isinstance(brush, dict) or brush.get('lock', False): 
+            return -1
+        
+        # FIX: Use .get() to prevent KeyError if 'pos' or 'size' are missing
+        pos = brush.get('pos')
+        size = brush.get('size')
+        
+        # If the brush is missing essential data, we cannot calculate handles
+        if pos is None or size is None:
+            return -1
+            
+        ax1, ax2 = self.get_axes()
+        ax_map = {'x': 0, 'y': 1, 'z': 2}
+        
+        # Accessing indices is now safe because we verified pos/size exist
+        w_pos = QPointF(pos[ax_map[ax1]] - size[ax_map[ax1]]/2, 
+                        pos[ax_map[ax2]] - size[ax_map[ax2]]/2)
+        w_size = QPointF(size[ax_map[ax1]], size[ax_map[ax2]])
+        
+        p1, p2 = self.world_to_screen(w_pos), self.world_to_screen(w_pos + w_size)
+        screen_rect = QRectF(p1, p2).normalized()
+        
+        handles = self.get_resize_handles(screen_rect)
+        handle_size = 10
+        for i, handle in enumerate(handles):
+            if (screen_pos - handle).manhattanLength() < handle_size:
+                return i
+        return -1
+        
+    def resize_brush(self, world_pos):
+        brush = self.editor.primary_selection()
+        if not brush: return
+        snapped_pos = self.snap_to_grid(world_pos)
+        ax1, ax2 = self.get_axes()
+        ax_map = {'x': 0, 'y': 1, 'z': 2}
+        ix1, ix2 = ax_map[ax1], ax_map[ax2]
+
+        old_pos, old_size = list(brush['pos']), list(brush['size'])
+        min_x, max_x = old_pos[ix1] - old_size[ix1]/2, old_pos[ix1] + old_size[ix1]/2
+        min_y, max_y = old_pos[ix2] - old_size[ix2]/2, old_pos[ix2] + old_size[ix2]/2
+
+        is_front_view = self.view_type in ['front', 'side']
+        
+        if self.resize_handle_ix in [0, 2, 6]: min_x = snapped_pos.x()
+        if self.resize_handle_ix in [1, 3, 7]: max_x = snapped_pos.x()
+        
+        if is_front_view:
+            if self.resize_handle_ix in [0, 1, 4]: max_y = snapped_pos.y()
+            if self.resize_handle_ix in [2, 3, 5]: min_y = snapped_pos.y()
+        else:
+            if self.resize_handle_ix in [0, 1, 4]: min_y = snapped_pos.y()
+            if self.resize_handle_ix in [2, 3, 5]: max_y = snapped_pos.y()
+
+        if max_x < min_x: min_x, max_x = max_x, min_x
+        if max_y < min_y: min_y, max_y = max_y, min_y
+
+        if self.resize_handle_ix in [4, 5]:
+            min_x, max_x = old_pos[ix1] - old_size[ix1]/2, old_pos[ix1] + old_size[ix1]/2
+        if self.resize_handle_ix in [6, 7]: 
+            min_y, max_y = old_pos[ix2] - old_size[ix2]/2, old_pos[ix2] + old_size[ix2]/2
+        
+        new_size_x = max_x - min_x
+        new_size_y = max_y - min_y
+
+        if new_size_x < self.grid_size: new_size_x = self.grid_size
+        if new_size_y < self.grid_size: new_size_y = self.grid_size
+
+        # Angled brushes: scale the convex geometry to the new handle box (its
+        # slope/shape is preserved, just refitted) rather than only resizing
+        # the AABB — otherwise the plane set would be left behind, exactly like
+        # the move bug.  The depth axis is untouched (handles only edit ix1/ix2).
+        if bg.brush_has_geometry(brush):
+            new_lo = [old_pos[k] - old_size[k] / 2 for k in range(3)]
+            new_hi = [old_pos[k] + old_size[k] / 2 for k in range(3)]
+            new_lo[ix1], new_hi[ix1] = min_x, min_x + new_size_x
+            new_lo[ix2], new_hi[ix2] = min_y, min_y + new_size_y
+            if bg.fit_brush_to_bounds(brush, new_lo, new_hi):
+                return
+
+        brush['pos'][ix1] = min_x + new_size_x / 2
+        brush['pos'][ix2] = min_y + new_size_y / 2
+        brush['size'][ix1] = new_size_x
+        brush['size'][ix2] = new_size_y
+
+    def zoom_at(self, screen_pos, factor):
+        """Scale the zoom by ``factor`` while keeping the world point currently
+        under ``screen_pos`` pinned to that same pixel (zoom-to-cursor)."""
+        old_zoom = self.zoom_factor
+        new_zoom = max(0.02, min(200.0, old_zoom * factor))
+        if abs(new_zoom - old_zoom) < 1e-9:
+            return
+        before = self.screen_to_world(screen_pos)   # world point under cursor
+        self.zoom_factor = new_zoom
+        after = self.screen_to_world(screen_pos)     # where it landed after zoom
+        # Shift the pan so the point doesn't move on screen.  screen_y is flipped
+        # for front/side views, but screen_to_world already accounts for that, so
+        # the pan correction is a plain difference in world space.
+        self.pan_offset += QPointF(before.x() - after.x(), before.y() - after.y())
+        self.update()
+
+
+def singleton_instance(things, ttype):
+    """Return the existing entity for a registered per-map singleton type."""
+    if not ttype:
+        return None
+    from plugins.manager import get_manager
+    manager = get_manager()
+    if not manager.is_singleton_entity(ttype):
+        return None
+    norm = manager._normalise_type(ttype)
+    for thing in things or []:
+        props = thing.properties
+        if manager._normalise_type(props.get("type", "")) == norm:
+            return thing
+    return None
+
+
+def _singleton_blocked(main_window, editor_state, ttype) -> bool:
+    """Select an existing singleton instead of creating a duplicate."""
+    existing = singleton_instance(editor_state.things, ttype)
+    if existing is None:
+        return False
+    main_window.set_selected_objects([existing])
+    main_window.update_views()
+    main_window.show_toast(
+        "Only one of this entity is allowed per map - selected the existing one.",
+        is_error=True)
+    return True
+
+

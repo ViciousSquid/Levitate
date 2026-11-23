@@ -1,0 +1,279 @@
+"""A disabled plugin's menu actions are hidden, not greyed out.
+
+``_run_plugin_menu_action`` refuses to invoke a plugin-owned action whose
+plugin is off, so a visible-but-dead entry is an offer the editor cannot
+honour. Tidy's "Load Demo map" looked available with Tidy disabled and silently
+did nothing when clicked.
+"""
+
+import pytest
+
+pytest.importorskip("PyQt5", reason="the plugins menu is editor-tier")
+
+
+from editor.ui import (_build_plugins_menu, _plugin_menu_name, _toggle_plugin) # noqa: E402
+from plugins.manager import get_manager, load_plugins   # noqa: E402
+
+pytestmark = pytest.mark.qt
+
+
+def plugin_action_items(window, plugin):
+    """The (label, visible, enabled) triples for one plugin's own actions."""
+    for action in window.menuBar().actions():
+        if action.text().replace("&", "") != "Plugins":
+            continue
+        for sub in action.menu().actions():
+            if sub.text() != _plugin_menu_name(plugin) or sub.menu() is None:
+                continue
+            items = []
+            for entry in sub.menu().actions():
+                if entry.text() == "Enabled":
+                    break          # plugin-owned actions all sit above this
+                items.append((entry.text(), entry.isVisible(), entry.isEnabled()))
+            return items
+    return []
+
+
+@pytest.fixture
+def window(main_window):
+    return main_window
+
+
+def _tidy():
+    load_plugins()
+    mgr = get_manager()
+    tidy = mgr.find_plugin("tidy")
+    if tidy is None:
+        pytest.skip("the Tidy plugin is not present in this build")
+    return mgr, tidy
+
+
+def test_plugin_names_in_plugins_menu_start_with_a_capital(window):
+    """The Plugins menu uses human-readable plugin labels, not raw module names."""
+    load_plugins()
+    _build_plugins_menu(window)
+
+    for action in window.menuBar().actions():
+        if action.text().replace("&", "") != "Plugins":
+            continue
+        labels = [
+            sub.text()
+            for sub in action.menu().actions()
+            if sub.menu() is not None
+        ]
+        assert labels, "the Plugins menu contains no plugin submenus"
+        assert all(label[:1].isupper() for label in labels), labels
+        return
+
+    pytest.fail("the Plugins menu was not created")
+
+
+def test_a_disabled_plugins_actions_are_hidden(window):
+    mgr, tidy = _tidy()
+    was = mgr.is_enabled(tidy)
+    try:
+        mgr.set_enabled(tidy, False)
+        _build_plugins_menu(window)
+        items = plugin_action_items(window, tidy)
+        assert items, "Tidy registered no menu actions; this test is looking in the wrong place"
+        for label, visible, _enabled in items:
+            assert not visible, (
+                "'%s' is visible with Tidy disabled; clicking it does nothing"
+                % label)
+    finally:
+        mgr.set_enabled(tidy, was)
+
+
+def test_an_enabled_plugins_actions_are_shown(window):
+    mgr, tidy = _tidy()
+    was = mgr.is_enabled(tidy)
+    try:
+        mgr.set_enabled(tidy, True)
+        _build_plugins_menu(window)
+        items = plugin_action_items(window, tidy)
+        assert any(label.startswith("Load Demo map") for label, _v, _e in items), (
+            "Tidy's demo-map action is missing entirely: %r" % (items,))
+        for label, visible, enabled in items:
+            assert visible and enabled, (
+                "'%s' is hidden or greyed with Tidy enabled" % label)
+    finally:
+        mgr.set_enabled(tidy, was)
+
+
+def test_toggling_the_plugin_flips_its_actions_without_a_rebuild(window):
+    """The Enabled checkbox updates the entries already on screen."""
+    mgr, tidy = _tidy()
+    was = mgr.is_enabled(tidy)
+    try:
+        mgr.set_enabled(tidy, True)
+        _build_plugins_menu(window)
+        before = plugin_action_items(window, tidy)
+        assert all(v for _l, v, _e in before)
+
+        _toggle_plugin(window, tidy, False,
+                                   _live_actions(window, tidy))
+        after = plugin_action_items(window, tidy)
+        assert not any(v for _l, v, _e in after), (
+            "toggling Tidy off left its actions on screen: %r" % (after,))
+    finally:
+        mgr.set_enabled(tidy, was)
+
+
+def _live_actions(window, plugin):
+    for action in window.menuBar().actions():
+        if action.text().replace("&", "") != "Plugins":
+            continue
+        for sub in action.menu().actions():
+            if sub.text() == _plugin_menu_name(plugin) and sub.menu() is not None:
+                out = []
+                for entry in sub.menu().actions():
+                    if entry.text() == "Enabled":
+                        break
+                    out.append(entry)
+                return out
+    return []
+
+
+def test_a_persisted_disable_really_stops_the_plugin(window, monkeypatch):
+    """settings.ini's ``[Plugins] disabled`` must turn the plugin off for real.
+
+    Building the menu used to write ``plugin.enabled = False`` directly. The
+    manager caches the list of plugins it dispatches to, keyed on a generation
+    that only ``set_enabled`` bumps, so a plugin that had already been
+    dispatched to kept ticking with its menu toggle showing it off.
+    """
+    import configparser
+    mgr, tidy = _tidy()
+    if not mgr._overrides(tidy, "on_tick"):
+        pytest.skip("Tidy no longer ticks; pick another plugin")
+    ticks = []
+    monkeypatch.setattr(tidy, "on_tick", lambda logic, ctx: ticks.append(1))
+    was = mgr.is_enabled(tidy)
+    logic = window.view_3d.logic_thread
+    try:
+        mgr.set_enabled(tidy, True)
+        mgr.tick(logic)
+        assert ticks == [1], "fixture: an enabled Tidy should tick"
+
+        window.config = configparser.ConfigParser()
+        window.config["Plugins"] = {"disabled": "tidy"}
+        _build_plugins_menu(window)
+
+        assert not mgr.is_enabled(tidy)
+        mgr.tick(logic)
+        assert ticks == [1], "a plugin disabled in settings.ini still ticked"
+    finally:
+        mgr.set_enabled(tidy, was)
+
+
+def _enabled_toggle(window, plugin):
+    for action in window.menuBar().actions():
+        if action.text().replace("&", "") != "Plugins":
+            continue
+        for sub in action.menu().actions():
+            if sub.text() == _plugin_menu_name(plugin) and sub.menu() is not None:
+                for entry in sub.menu().actions():
+                    if entry.text() == "Enabled":
+                        return action.menu(), entry
+    return None, None
+
+
+def test_the_toggle_shows_a_plugin_a_level_auto_enabled(window):
+    """The menu is built at startup; a map loaded later auto-enables its
+    plugin. Opening the menu must show that plugin as on -- it used to keep
+    showing Big World unticked while its session ran."""
+    load_plugins()
+    mgr = get_manager()
+    bigworld = mgr.find_plugin("bigworld")
+    if bigworld is None:
+        pytest.skip("the Big World plugin is not present in this build")
+    was = mgr.is_enabled(bigworld)
+    try:
+        mgr.set_enabled(bigworld, False)
+        _build_plugins_menu(window)
+        menu, toggle = _enabled_toggle(window, bigworld)
+        assert toggle is not None and not toggle.isChecked()
+
+        mgr.auto_enable_for_map(
+            {"things": [{"type": "bigworldsettings", "properties": {}}]})
+        assert mgr.is_enabled(bigworld)
+
+        menu.aboutToShow.emit()
+        assert toggle.isChecked(), "the menu still shows Big World as off"
+        # Reflecting the state is not a manual toggle: the level still owns
+        # the enable, so File > New can switch it back off.
+        assert bigworld in mgr._auto_enabled
+    finally:
+        mgr.set_enabled(bigworld, was)
+
+
+def _plugin_submenu(window, plugin):
+    for action in window.menuBar().actions():
+        if action.text().replace("&", "") != "Plugins":
+            continue
+        for sub in action.menu().actions():
+            if sub.text() == _plugin_menu_name(plugin) and sub.menu() is not None:
+                return sub.menu()
+    return None
+
+
+def test_add_entity_at_origin_places_the_entity(window):
+    """The Plugins menu's "Add entity (at origin)" entries place an entity.
+
+    The menu moved into editor.ui while its placement helper stayed behind in
+    the deleted monkey-patch module, so every entry raised NameError on click.
+    """
+    mgr, tidy = _tidy()
+    was = mgr.is_enabled(tidy)
+    try:
+        mgr.set_enabled(tidy, True)
+        _build_plugins_menu(window)
+        menu = _plugin_submenu(window, tidy)
+        assert menu is not None, "Tidy has no Plugins submenu"
+        entries = [a for a in menu.actions() if a.text() == "   Tidy Goal"]
+        assert entries, "Tidy Goal is not offered under Add entity"
+        before = len(window.state.things)
+        entries[0].trigger()
+        assert len(window.state.things) == before + 1
+        placed = window.state.things[-1]
+        assert placed.properties.get("type") == "tidygoal"
+        assert list(placed.pos) == [0.0, 40.0, 0.0]
+    finally:
+        mgr.set_enabled(tidy, was)
+
+
+@pytest.mark.parametrize("view_name", ["view_top", "view_front", "view_side"])
+def test_context_menu_groups_deathmatch_entities_in_one_submenu(window, monkeypatch, view_name):
+    """Five Deathmatch entities must not produce four extra empty submenus."""
+    from PyQt5.QtCore import QPoint
+    from PyQt5.QtGui import QContextMenuEvent
+    from PyQt5.QtWidgets import QMenu
+
+    mgr = get_manager()
+    deathmatch = mgr.find_plugin("deathmatch")
+    assert deathmatch is not None
+    was = mgr.is_enabled(deathmatch)
+    inspected = []
+
+    def inspect_menu(menu, *args):
+        plugins = next(action.menu() for action in menu.actions()
+                       if action.text() == "Plugins")
+        submenus = [action.menu() for action in plugins.actions()
+                    if action.text() == "deathmatch"]
+        assert len(submenus) == 1
+        assert [action.text() for action in submenus[0].actions()] == [
+            "Match Settings", "Bot Opponent", "Respawn Point",
+            "Bot Navigation Node", "CTF Flag",
+        ]
+        assert all(action.menu().actions() for action in plugins.actions())
+        inspected.append(True)
+        return None
+
+    monkeypatch.setattr(QMenu, "exec_", inspect_menu)
+    try:
+        mgr.set_enabled(deathmatch, True)
+        view = getattr(window, view_name)
+        view.contextMenuEvent(QContextMenuEvent(QContextMenuEvent.Mouse, QPoint(80, 80)))
+        assert inspected == [True]
+    finally:
+        mgr.set_enabled(deathmatch, was)

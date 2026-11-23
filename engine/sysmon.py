@@ -1,0 +1,673 @@
+"""System Monitor widget for QtGameView.
+
+PERFORMANCE-OPTIMIZED:
+  - Pre-allocated numpy ring buffer for frame times (O(1) append)
+  - Incremental max tracking (no deque scan)
+  - FPS string cached (only rebuilds when value changes)
+  - 60-point graph resolution
+  - Pre-allocated QPoint array for graph (zero per-frame allocation)
+  - All stats text and metrics cached (rebuilt once/sec)
+  - All drawing via QPainter directly (no QPixmap cache, no raw GL)
+"""
+
+import math
+import time
+
+from PyQt5.QtCore import Qt, QRect, QPoint
+from PyQt5.QtGui import (
+    QPainter, QColor, QFont, QPen, QBrush, QPolygon, QFontMetrics
+)
+import OpenGL.GL as gl
+import numpy as np
+
+# OpenGL GPU memory query constants
+GL_GPU_MEM_INFO_TOTAL_AVAILABLE_MEM_NVX = 0x9048
+GL_GPU_MEM_INFO_CURRENT_AVAILABLE_MEM_NVX = 0x9049
+GL_GPU_MEM_INFO_DEDICATED_VIDMEM_NVX = 0x9047
+GL_TEXTURE_FREE_MEMORY_ATI = 0x87FC
+GL_RENDERBUFFER_FREE_MEMORY_ATI = 0x87FD
+
+
+class SysMon:
+    """Self-contained system-monitor overlay — performance-optimized.
+
+    Usage (inside QtGameView):
+        self.sysmon = SysMon(self)          # self == QtGameView instance
+        # in paintGL:
+        if self.sysmon.is_active():
+            self.sysmon.draw(painter, fps, logic_thread, renderer, editor_state, terrain)
+        # in mouse events, key events, etc.:
+        self.sysmon.handle_mouse_press(event, play_mode)
+        self.sysmon.handle_mouse_move(event, play_mode, view_width, view_height)
+        self.sysmon.handle_mouse_release(event, play_mode)
+        self.sysmon.toggle()
+    """
+
+    # Graph configuration
+    GRAPH_POINTS = 60
+    # The panel's layout, 0.9 of its first size (it covered too much of
+    # the view); the text keeps its size. Collapsed, the panel is its title
+    # bar and the frame-time graph.
+    WIDTH = 360
+    HEADER = 23                 # title bar height, and its two buttons' width
+    EXPANDED_HEIGHT = 248
+    GRAPH_WIDTH = 351
+    GRAPH_HEIGHT = 45
+    GRAPH_GAP = 4               # between the title bar, the graph and the edge
+    COLLAPSED_HEIGHT = HEADER + GRAPH_GAP + GRAPH_HEIGHT + GRAPH_GAP + 1
+    LINE_HEIGHT = 18
+    MARGIN = 9
+    FONT_POINTS = 9
+    CACHE_INTERVAL_SEC = 1.0    # Stats text cache rebuild interval
+    DISPLAY_SMOOTHING_SECONDS = 0.5
+    DISPLAY_REFRESH_INTERVAL_SEC = 0.2  # Five numeric updates per second
+
+    def __init__(self, parent_view):
+        self.parent = parent_view
+
+        self.expanded = False
+        self.stats = {
+            'visible_brushes': 0,
+            'visible_tris': 0,
+            'visible_surfaces': 0,
+            'culled_brushes': 0,
+            'culled_tris': 0,
+            'culled_surfaces': 0,
+            'total_brushes': 0,
+        }
+        self.dragging = False
+        self.drag_offset = QPoint(0, 0)
+        self.active = False
+        self.window_rect = QRect(20, 20, self.WIDTH, 200)
+
+        # Frame time ring buffer (pre-allocated numpy array)
+        self._ft_buffer = np.zeros(self.GRAPH_POINTS, dtype=np.float32)
+        self._ft_index = 0
+        self._ft_count = 0
+        self._ft_sum = 0.0
+        self._ft_max = 16.67
+        self._ft_max_age = 0
+        self._fps = 0.0
+        self._last_rendered_frame_time = None
+        # Smoothed readouts are separate from the raw frame-time ring buffer.
+        self._smoothed_fps = None
+        self._smoothed_frame_time_ms = None
+        self._display_fps = 0.0
+        self._display_frame_time_ms = 0.0
+        self._display_values_time = None
+
+        # Font & metrics
+        self.font = QFont("Fio UI")
+        self.font.setPointSizeF(self.FONT_POINTS)
+        self.font.setStyleHint(QFont.Monospace)
+        self._font_metrics = QFontMetrics(self.font)
+
+        # Pre-allocated graph points (eliminates per-frame QPoint creation)
+        self._graph_points = [QPoint(0, 0) for _ in range(self.GRAPH_POINTS)]
+        self._graph_poly = QPolygon(self._graph_points + [QPoint(0, 0), QPoint(0, 0)])
+
+        # --- Caching systems ---
+
+        # VRAM cache
+        self._vram_cache = (None, None)
+        self._vram_extension_flags = None      # (NVX, ATI), once known
+        self._vram_cache_time = 0
+
+        # FPS string cache
+        self._fps_str = ""
+        self._fps_cached_val = -1
+        self._ft_cached_val = -1.0
+
+        # Stats text cache (rebuilt once/sec)
+        self._stats_cache = {}
+        self._stats_cache_time = 0
+
+        # Pre-computed colors (avoid per-frame QColor creation)
+        self._bg_color = QColor(20, 20, 25, 235)
+        self._border_color = QColor(80, 80, 90)
+        self._header_color = QColor(66, 95, 93)
+        self._text_color = QColor(220, 220, 220)
+        self._graph_bg_color = QColor(10, 10, 15, 200)
+        self._graph_line_color = QColor(100, 255, 100)
+        self._graph_fill_color = QColor(100, 200, 100, 40)
+        self._white = QColor(255, 255, 255)
+        self._shadow_color = QColor(0, 0, 0, 200)
+        self._vram_color = QColor(255, 200, 100)
+        self._green = QColor(50, 200, 50)
+        self._grey = QColor(180, 180, 180)
+
+        # Reusable pens/brushes (avoid per-frame creation)
+        self._border_pen = QPen(self._border_color, 1)
+        self._bg_brush = QBrush(self._bg_color)
+        self._header_brush = QBrush(self._header_color)
+        self._theme_version = None          # follows Edit > Colours (_apply_theme)
+        self._graph_bg_brush = QBrush(self._graph_bg_color)
+        self._graph_fill_brush = QBrush(self._graph_fill_color)
+        self._graph_line_pen = QPen(self._graph_line_color, 1)
+        self._no_pen = QPen(Qt.NoPen)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def toggle(self):
+        self.active = not self.active
+        return self.active
+
+    def set_active(self, active):
+        self.active = active
+
+    def is_active(self):
+        return self.active
+
+    def set_expanded(self, expanded):
+        if self.expanded != expanded:
+            self.expanded = expanded
+
+
+    def record_frame_time(self, delta_ms):
+        """Record a frame time. Uses ring buffer — O(1)."""
+        old_val = float(self._ft_buffer[self._ft_index])
+        if self._ft_count < self.GRAPH_POINTS:
+            self._ft_count += 1
+        else:
+            self._ft_sum -= old_val
+        self._ft_buffer[self._ft_index] = delta_ms
+        new_val = float(self._ft_buffer[self._ft_index])
+        self._ft_sum += new_val
+        self._ft_index = (self._ft_index + 1) % self.GRAPH_POINTS
+
+        # FPS is the reciprocal of the mean interval in this same rolling
+        # window. It is derived only from completed rendered-frame intervals.
+        self._fps = (
+            1000.0 * self._ft_count / self._ft_sum
+            if self._ft_sum > 0.0 else 0.0
+        )
+
+        # Time-based exponential smoothing damps short-lived fluctuations.
+        # The raw samples remain untouched in the ring buffer and graph.
+        interval_ms = max(float(delta_ms), 0.0)
+        alpha = 1.0 - math.exp(
+            -interval_ms / (1000.0 * self.DISPLAY_SMOOTHING_SECONDS)
+        )
+        if self._smoothed_frame_time_ms is None:
+            self._smoothed_frame_time_ms = float(delta_ms)
+            self._smoothed_fps = self._fps
+        else:
+            self._smoothed_frame_time_ms += alpha * (
+                float(delta_ms) - self._smoothed_frame_time_ms
+            )
+            self._smoothed_fps += alpha * (
+                self._fps - self._smoothed_fps
+            )
+
+        # Incremental max tracking
+        if delta_ms >= self._ft_max:
+            self._ft_max = delta_ms
+            self._ft_max_age = self._ft_index
+        elif self._ft_max_age == self._ft_index:
+            if self._ft_count > 0:
+                count = self._ft_count
+                self._ft_max = np.max(self._ft_buffer[:count])
+                self._ft_max_age = int(np.argmax(self._ft_buffer[:count]))
+            else:
+                self._ft_max = 16.67
+
+
+    def update_stats(self, visible_brushes=0, culled_brushes=0, total_brushes=0):
+        self.stats['visible_brushes'] = visible_brushes
+        self.stats['culled_brushes'] = culled_brushes
+        self.stats['total_brushes'] = total_brushes
+
+    def record_rendered_frame(self, timestamp=None):
+        """Record an interval after a successful QOpenGLWidget paint."""
+        timestamp = time.perf_counter() if timestamp is None else float(timestamp)
+        previous = self._last_rendered_frame_time
+        if previous is not None:
+            interval = timestamp - previous
+            if interval > 0.0:
+                self.record_frame_time(interval * 1000.0)
+        self._last_rendered_frame_time = timestamp
+        return self._fps
+
+    def reset_metrics(self):
+        """Clear the frame-time history and the per-frame stat counters."""
+        self._ft_buffer.fill(0.0)
+        self._ft_index = 0
+        self._ft_count = 0
+        self._ft_sum = 0.0
+        self._ft_max = 16.67
+        self._ft_max_age = 0
+        self._fps = 0.0
+        self._last_rendered_frame_time = None
+        self._smoothed_fps = None
+        self._smoothed_frame_time_ms = None
+        self._display_fps = 0.0
+        self._display_frame_time_ms = 0.0
+        self._display_values_time = None
+        self._fps_cached_val = -1
+        self._ft_cached_val = -1.0
+        self._fps_str = ""
+        for key in self.stats:
+            self.stats[key] = 0
+        self._stats_cache = {}
+        self._stats_cache_time = 0.0
+
+    def get_metrics(self):
+        """Return a machine-readable snapshot without adding work to the frame path.
+
+        Everything is derived on demand from state the overlay already keeps,
+        so a caller that never asks costs the frame path nothing.
+        """
+        count = int(self._ft_count)
+        if count:
+            frame_times = np.asarray(self._ft_buffer[:count], dtype=np.float64)
+            current_frame_ms = float(
+                self._ft_buffer[(self._ft_index - 1) % self.GRAPH_POINTS]
+            )
+            average_frame_ms = self._ft_sum / count
+            p95_frame_ms = float(np.percentile(frame_times, 95))
+        else:
+            current_frame_ms = 0.0
+            average_frame_ms = 0.0
+            p95_frame_ms = 0.0
+
+        vram_used_mb, vram_total_mb = self._get_vram_info()
+        logic_thread = self.parent.logic_thread
+        renderer = self.parent.renderer
+        editor = self.parent.editor
+
+        visible_tris = int(self.stats.get("visible_tris", 0))
+        culled_tris = int(self.stats.get("culled_tris", 0))
+        visible_surfaces = int(self.stats.get("visible_surfaces", 0))
+        culled_surfaces = int(self.stats.get("culled_surfaces", 0))
+
+        if renderer is not None:
+            render_stats = getattr(renderer, "render_stats", None)
+            if render_stats is not None:
+                visible_tris = int(
+                    getattr(render_stats, "visible_tris", visible_tris) or 0
+                )
+
+        if editor is not None:
+            state = editor.state
+            brushes = state.brushes
+            total_tris = len(brushes) * 12
+            terrain = editor.terrain
+            if terrain is not None:
+                try:
+                    total_tris += int(terrain.get_tri_count())
+                except (AttributeError, TypeError, ValueError):
+                    pass
+            culled_tris = max(0, total_tris - visible_tris)
+            visible_surfaces = int(self.stats.get("visible_brushes", 0))
+            culled_surfaces = int(self.stats.get("culled_brushes", 0))
+
+        # FPS comes only from successful Qt paintGL renders; never infer it
+        # from a timer interval or from a frame-time fallback.
+        fps = float(self._fps)
+
+        return {
+            "fps": fps,
+            "frame_time_ms": current_frame_ms,
+            "average_frame_time_ms": average_frame_ms,
+            "p95_frame_time_ms": p95_frame_ms,
+            "vram_used_mb": vram_used_mb,
+            "vram_total_mb": vram_total_mb,
+            "visible_brushes": int(self.stats.get("visible_brushes", 0)),
+            "culled_brushes": int(self.stats.get("culled_brushes", 0)),
+            "total_brushes": int(self.stats.get("total_brushes", 0)),
+            "visible_tris": visible_tris,
+            "culled_tris": culled_tris,
+            "visible_surfaces": visible_surfaces,
+            "culled_surfaces": culled_surfaces,
+            "tps": float(logic_thread.actual_tps or 0.0),
+            "things": int(
+                len(editor.state.things)
+            ),
+            "draw_calls": int(
+                getattr(
+                    getattr(renderer, "render_stats", None), "draw_calls", 0
+                ) or 0
+            ),
+        }
+
+
+    # Mouse interaction
+    # ------------------------------------------------------------------
+
+    def handle_mouse_press(self, event, play_mode):
+        if play_mode or not self.active or event.button() != Qt.LeftButton:
+            return False
+        if not self.window_rect.contains(event.pos()):
+            return False
+
+        # Close button.
+        if (event.x() > self.window_rect.right() - self.HEADER
+                and event.y() < self.window_rect.y() + self.HEADER):
+            self.active = False
+            return True
+
+        # Title bar
+        title_bar = QRect(self.window_rect.x(), self.window_rect.y(),
+                          self.window_rect.width(), self.HEADER)
+        if title_bar.contains(event.pos()):
+            # Collapse/expand arrow.
+            if event.x() > self.window_rect.right() - 2 * self.HEADER:
+                self.expanded = not self.expanded
+                return True
+            self.dragging = True
+            self.drag_offset = event.pos() - QPoint(self.window_rect.x(),
+                                                    self.window_rect.y())
+            return True
+        return True
+
+    def handle_mouse_move(self, event, play_mode, view_width, view_height):
+        if play_mode or not self.dragging:
+            return False
+        new_pos = event.pos() - self.drag_offset
+        new_x = max(5, min(new_pos.x(), view_width - self.window_rect.width() - 5))
+        new_y = max(5, min(new_pos.y(), view_height - 120))
+        self.window_rect.moveTo(new_x, new_y)
+        return True
+
+    def handle_mouse_release(self, event, play_mode):
+        if play_mode or not self.dragging or event.button() != Qt.LeftButton:
+            return False
+        self.dragging = False
+        return True
+
+    # ------------------------------------------------------------------
+    # Caching
+    # ------------------------------------------------------------------
+
+    def _rebuild_stats_cache(self, fps, logic_thread, renderer, editor_state, terrain):
+        """Recompute all expensive stats. Called once per second."""
+        cache = {}
+        fm = self._font_metrics
+
+        brush_tris = len(editor_state.brushes) * 12
+        terrain_total_tris = 0
+        terrain_visible_tris = 0
+        if terrain is not None:
+            terrain_total_tris = terrain.get_tri_count()
+            terrain_visible_tris = terrain.total_triangles
+
+        total_tris = brush_tris + terrain_total_tris
+        visible_tris = (renderer.render_stats.visible_tris if renderer else 0) + terrain_visible_tris
+
+        cache['total_tris'] = total_tris
+        cache['visible_tris'] = visible_tris
+
+        vram_used, vram_total = self._get_vram_info()
+        cache['vram_str'] = self._format_memory(vram_used, vram_total)
+
+        cache['things_count'] = len(editor_state.things)
+        cache['draw_calls'] = renderer.render_stats.draw_calls if renderer else 0
+        cache['total_brushes'] = self.stats.get('total_brushes', 0)
+        cache['visible_brushes'] = self.stats.get('visible_brushes', 0)
+        cache['culled_brushes'] = self.stats.get('culled_brushes', 0)
+        cache['tps'] = logic_thread.actual_tps
+
+        cache['brush_text'] = f"Brushes:  {cache['total_brushes']} "
+        cache['tri_text'] = f"Tris:     {total_tris} "
+        cache['visible_brush_text'] = f"(Visible: {cache['visible_brushes']})"
+        cache['visible_tri_text'] = f"(Visible: {visible_tris})"
+        cache['things_text'] = f"Things:   {cache['things_count']}"
+        cache['draws_text'] = f"Draws:    {cache['draw_calls']}"
+        cache['vram_text'] = f"VRAM:     {cache['vram_str']}"
+        cache['tps_text'] = f"TPS: {cache['tps']:.1f}"
+
+        culled = cache['culled_brushes']
+        total = cache['total_brushes']
+        cull_pct = (culled / total * 100) if total > 0 else 0
+        cache['cull_text'] = f"Culled: {cull_pct:.1f}%"
+
+        cache['brush_text_width'] = fm.horizontalAdvance(cache['brush_text'])
+        cache['tri_text_width'] = fm.horizontalAdvance(cache['tri_text'])
+        cache['tps_text_width'] = fm.horizontalAdvance(cache['tps_text'])
+
+        self._stats_cache = cache
+        self._stats_cache_time = time.perf_counter()
+
+    def _get_fps_str(self, current_ft, fps):
+        """Cache FPS string — only rebuild when values change meaningfully."""
+        fps_int = int(fps)
+        ft_tenths = round(current_ft, 1)
+        if fps_int != self._fps_cached_val or ft_tenths != self._ft_cached_val:
+            self._fps_cached_val = fps_int
+            self._ft_cached_val = ft_tenths
+            self._fps_str = f"Frame: {ft_tenths:.1f}ms  FPS: {fps_int}"
+        return self._fps_str
+
+    def _refresh_display_values(self, now=None):
+        """Latch smoothed metrics for display at a steady five-Hz cadence."""
+        now = time.perf_counter() if now is None else float(now)
+        if (self._display_values_time is not None
+                and now - self._display_values_time < self.DISPLAY_REFRESH_INTERVAL_SEC):
+            return False
+
+        self._display_fps = float(
+            self._smoothed_fps if self._smoothed_fps is not None else self._fps
+        )
+        self._display_frame_time_ms = float(
+            self._smoothed_frame_time_ms
+            if self._smoothed_frame_time_ms is not None else 0.0
+        )
+        self._display_values_time = now
+        return True
+
+    def _draw_graph(self, painter, graph_x, graph_y):
+        """Draw graph line using pre-allocated QPoint array — zero allocation."""
+        if self._ft_count < 2:
+            return
+
+        count = self._ft_count
+        max_ft = max(self._ft_max, 16.67)
+        step = self.GRAPH_WIDTH / max(count - 1, 1)
+        buf = self._ft_buffer
+        idx = self._ft_index
+        gh = self.GRAPH_HEIGHT
+
+        # Mutate pre-allocated QPoint objects in-place
+        points = self._graph_points
+        for i in range(count):
+            buf_idx = (idx - count + i) % self.GRAPH_POINTS
+            ft = buf[buf_idx]
+            points[i].setX(int(graph_x + i * step))
+            points[i].setY(int(graph_y + gh - (ft / max_ft) * gh))
+
+        # Fill polygon (reuse pre-allocated poly)
+        poly = self._graph_poly
+        for i in range(count):
+            poly.setPoint(i, points[i])
+        poly.setPoint(count, QPoint(points[count - 1].x(), graph_y + gh))
+        poly.setPoint(count + 1, QPoint(points[0].x(), graph_y + gh))
+
+        painter.setPen(self._no_pen)
+        painter.setBrush(self._graph_fill_brush)
+        painter.drawPolygon(poly)
+
+        # Line
+        painter.setPen(self._graph_line_pen)
+        painter.drawPolyline(QPolygon(points[:count]))
+
+    # ------------------------------------------------------------------
+    # Drawing — ALWAYS draws every frame called, no early returns
+    # ------------------------------------------------------------------
+
+    def _apply_theme(self):
+        """Take the floating windows' colours (Edit > Colours)."""
+        from engine import floating_windows as fw
+        self._theme_version = fw.theme_version()
+        self._bg_color = fw.theme('background')
+        self._border_color = fw.theme('border')
+        self._header_color = fw.theme('header')
+        self._text_color = fw.theme('text')
+        self._border_pen = QPen(self._border_color, 1)
+        self._bg_brush = QBrush(self._bg_color)
+        self._header_brush = QBrush(self._header_color)
+
+    def draw(self, painter, fps, logic_thread, renderer, editor_state, terrain):
+        """Draw the sysmon overlay. Always paints — caller controls call rate."""
+        from engine.floating_windows import theme_version
+        if self._theme_version != theme_version():
+            self._apply_theme()
+        target_height = self.EXPANDED_HEIGHT if self.expanded else self.COLLAPSED_HEIGHT
+        # Clicks land on what is drawn: a collapsed panel no longer takes the
+        # clicks below it.
+        self.window_rect.setHeight(target_height)
+        rect = QRect(self.window_rect.x(), self.window_rect.y(),
+                     self.window_rect.width(), target_height)
+
+        # --- Background ---
+        painter.setPen(self._border_pen)
+        painter.setBrush(self._bg_brush)
+        painter.drawRect(rect)
+
+        # --- Header ---
+        header = self.HEADER
+        header_rect = QRect(rect.x(), rect.y(), rect.width(), header)
+        painter.fillRect(header_rect, self._header_color)
+        painter.setPen(self._border_pen)
+        painter.drawLine(rect.x(), rect.y() + header, rect.right(), rect.y() + header)
+
+        painter.setFont(self.font)
+        painter.setPen(self._white)
+        painter.drawText(header_rect.adjusted(self.MARGIN, 0, 0, 0),
+                         Qt.AlignVCenter | Qt.AlignLeft, "SysMon [F3]")
+        painter.drawText(QRect(rect.right() - 2 * header, rect.y(), header, header),
+                         Qt.AlignCenter, "▼" if self.expanded else "▶")
+        painter.drawText(QRect(rect.right() - header, rect.y(), header, header),
+                         Qt.AlignCenter, "[X]")
+
+        # --- Graph background (shown collapsed too) ---
+        graph_x = rect.x() + (rect.width() - self.GRAPH_WIDTH) // 2
+        graph_y = rect.y() + header + self.GRAPH_GAP
+        painter.setPen(self._border_pen)
+        painter.setBrush(self._graph_bg_brush)
+        painter.drawRect(graph_x, graph_y, self.GRAPH_WIDTH, self.GRAPH_HEIGHT)
+
+        # --- Graph line ---
+        self._draw_graph(painter, graph_x, graph_y)
+
+        current_ft = self._ft_buffer[(self._ft_index - 1) % self.GRAPH_POINTS] if self._ft_count > 0 else 0
+        now = time.perf_counter()
+        self._refresh_display_values(now)
+        if not self.expanded:
+            # Collapsed, show a smoothed value refreshed five times per second.
+            # The graph above continues to show the raw frame-time samples.
+            text = f"Frame time: {self._display_frame_time_ms:.1f} ms"
+            tx = graph_x + 6
+            ty = graph_y + self.GRAPH_HEIGHT - 4 - self._font_metrics.descent()
+            painter.setPen(self._shadow_color)
+            painter.drawText(tx + 1, ty + 1, text)
+            painter.setPen(self._white)
+            painter.drawText(tx, ty, text)
+            return
+
+        # --- Stats text (cached once/sec) ---
+        if now - self._stats_cache_time >= self.CACHE_INTERVAL_SEC:
+            self._rebuild_stats_cache(fps, logic_thread, renderer, editor_state, terrain)
+        cache = self._stats_cache
+
+        left_margin = rect.x() + self.MARGIN
+        stats_start_y = graph_y + self.GRAPH_HEIGHT + 22
+        line_height = self.LINE_HEIGHT
+
+        # FPS (cached string)
+        painter.setPen(self._white)
+        painter.drawText(
+            left_margin, stats_start_y,
+            self._get_fps_str(self._display_frame_time_ms, self._display_fps)
+        )
+
+        # Cached stats
+        painter.setPen(self._vram_color)
+        painter.drawText(left_margin, stats_start_y + line_height * 1,
+                         cache.get('vram_text', 'VRAM:     N/A'))
+
+        painter.setPen(self._text_color)
+        painter.drawText(left_margin, stats_start_y + line_height * 2,
+                         cache.get('things_text', 'Things:   0'))
+        painter.drawText(left_margin, stats_start_y + line_height * 3,
+                         cache.get('draws_text', 'Draws:    0'))
+        painter.drawText(left_margin, stats_start_y + line_height * 4,
+                         cache.get('brush_text', 'Brushes:  0 '))
+        painter.drawText(left_margin, stats_start_y + line_height * 5,
+                         cache.get('tri_text', 'Tris:     0 '))
+
+        painter.setPen(self._green)
+        painter.drawText(left_margin + cache.get('brush_text_width', 0),
+                         stats_start_y + line_height * 4,
+                         cache.get('visible_brush_text', '(Visible: 0)'))
+        painter.drawText(left_margin + cache.get('tri_text_width', 0),
+                         stats_start_y + line_height * 5,
+                         cache.get('visible_tri_text', '(Visible: 0)'))
+
+        painter.setPen(self._grey)
+        painter.drawText(left_margin, rect.bottom() - self.MARGIN,
+                         cache.get('cull_text', 'Culled: 0.0%'))
+        painter.drawText(rect.right() - cache.get('tps_text_width', 0) - self.MARGIN,
+                         rect.bottom() - self.MARGIN,
+                         cache.get('tps_text', 'TPS: 0.0'))
+
+    # ------------------------------------------------------------------
+    # VRAM helper
+    # ------------------------------------------------------------------
+
+    def _vram_extensions(self):
+        """Which vendor memory queries this context advertises: (NVX, ATI),
+        read once. A driver without them answers GL_INVALID_ENUM and writes
+        nothing, and with PyOpenGL's error checking off (as Fio runs) the
+        panel then showed whatever the result buffer held. (Mesa's llvmpipe
+        advertises both and reports numbers of its own invention: that line
+        is the driver's.)"""
+        found = self._vram_extension_flags
+        if found is None:
+            names = set()
+            try:
+                for index in range(int(gl.glGetIntegerv(gl.GL_NUM_EXTENSIONS))):
+                    name = gl.glGetStringi(gl.GL_EXTENSIONS, index)
+                    names.add(name.decode() if isinstance(name, bytes) else str(name))
+            except Exception:
+                names = set()
+            found = self._vram_extension_flags = (
+                'GL_NVX_gpu_memory_info' in names, 'GL_ATI_meminfo' in names)
+        return found
+
+    def _get_vram_info(self):
+        """Get GPU VRAM info. Cached to avoid per-frame GL queries."""
+        current_time = time.perf_counter()
+        if current_time - getattr(self, '_vram_cache_time', 0) < 1.0:
+            return getattr(self, '_vram_cache', (None, None))
+
+        result = (None, None)
+        nvx, ati = self._vram_extensions()
+        try:
+            if nvx:
+                total_kb = int(gl.glGetIntegerv(GL_GPU_MEM_INFO_DEDICATED_VIDMEM_NVX))
+                available_kb = int(gl.glGetIntegerv(GL_GPU_MEM_INFO_CURRENT_AVAILABLE_MEM_NVX))
+                if total_kb > 0:
+                    total_mb = total_kb // 1024
+                    result = (total_mb - (available_kb // 1024), total_mb)
+            elif ati:
+                mem_info = gl.glGetIntegerv(GL_TEXTURE_FREE_MEMORY_ATI)
+                if mem_info is not None and len(mem_info) > 0 and mem_info[0] > 0:
+                    result = (None, int(mem_info[0]) // 1024)
+        except Exception:
+            gl.glGetError()
+
+        self._vram_cache = result
+        self._vram_cache_time = current_time
+        return result
+
+    def _format_memory(self, used_mb, total_mb):
+        if used_mb is None and total_mb is None:
+            return "N/A"
+        if used_mb is None:
+            return f"{total_mb}MB free"
+        if total_mb is None:
+            return f"{used_mb}MB used"
+        pct = (used_mb / total_mb * 100) if total_mb > 0 else 0
+        return f"{used_mb}/{total_mb}MB ({pct:.0f}%)"

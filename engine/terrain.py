@@ -1,0 +1,3867 @@
+import contextlib
+import itertools
+import os
+import sys
+import numpy as np
+import glm
+import ctypes
+from dataclasses import dataclass, field, fields
+from typing import List, Dict, Tuple, Optional
+import math
+import time
+import random
+from . import shaders
+from . import terrain_style
+import queue
+import threading
+from .terrain_frame import (                      # noqa: F401
+    TerrainFrame, TerrainProducts, grass_vertex_count, heightfield_indices,
+    new_publication_key, read_only)
+from .terrain_table import GRID_BORDER, STORED_GRID, TerrainTable
+
+
+
+
+# Old maps keep their exact scatter/cap below the previous density ceiling.
+LEGACY_GRASS_DENSITY_MAX = 0.06
+MAX_GRASS_DENSITY = 0.24
+GRASS_MAX_DENSITY = MAX_GRASS_DENSITY
+DEFAULT_GRASS_HEIGHT = 5.0
+GRASS_HEIGHT_LIMITS = (0.1, 256.0)
+
+
+
+
+
+# ============================================================================
+# OPTIMIZED NOISE FUNCTIONS
+# ============================================================================
+
+class PerlinNoise:
+    """Perlin noise with both scalar and batch methods."""
+    
+    def __init__(self, seed: int = 42):
+        self.seed = seed
+        np.random.seed(seed)
+        self.perm = np.arange(256, dtype=np.int32)
+        np.random.shuffle(self.perm)
+        self.perm = np.tile(self.perm, 2)
+        self._grad_x = np.array([1, -1, 1, -1], dtype=np.float32)
+        self._grad_y = np.array([1, 1, -1, -1], dtype=np.float32)
+    
+    def _fade(self, t):
+        return t * t * t * (t * (t * 6 - 15) + 10)
+    
+    def _fade_scalar(self, t: float) -> float:
+        return t * t * t * (t * (t * 6 - 15) + 10)
+    
+    def _grad_scalar(self, hash_val: int, x: float, y: float) -> float:
+        h = hash_val & 3
+        if h == 0: return x + y
+        elif h == 1: return -x + y
+        elif h == 2: return x - y
+        else: return -x - y
+    
+    def _grad(self, hash_arr, x, y):
+        # The low two bits independently select each coordinate's sign.
+        # Avoid four full sums and four pairs of fancy-indexed arrays.
+        gx = np.where(hash_arr & 1, -x, x)
+        gy = np.where(hash_arr & 2, -y, y)
+        return (gx + gy).astype(x.dtype, copy=False)
+    
+    def noise2d_scalar(self, x: float, y: float) -> float:
+        xi = int(math.floor(x)) & 255
+        yi = int(math.floor(y)) & 255
+        xf = x - math.floor(x)
+        yf = y - math.floor(y)
+        u = self._fade_scalar(xf)
+        v = self._fade_scalar(yf)
+        aa = self.perm[self.perm[xi] + yi]
+        ab = self.perm[self.perm[xi] + yi + 1]
+        ba = self.perm[self.perm[xi + 1] + yi]
+        bb = self.perm[self.perm[xi + 1] + yi + 1]
+        g_aa = self._grad_scalar(aa, xf, yf)
+        g_ba = self._grad_scalar(ba, xf - 1, yf)
+        g_ab = self._grad_scalar(ab, xf, yf - 1)
+        g_bb = self._grad_scalar(bb, xf - 1, yf - 1)
+        x1 = g_aa + u * (g_ba - g_aa)
+        x2 = g_ab + u * (g_bb - g_ab)
+        return x1 + v * (x2 - x1)
+    
+    def fbm_scalar(self, x: float, y: float, octaves: int = 4, persistence: float = 0.5, lacunarity: float = 2.0) -> float:
+        total = 0.0
+        amplitude = 1.0
+        frequency = 1.0
+        max_value = 0.0
+        for _ in range(octaves):
+            total += self.noise2d_scalar(x * frequency, y * frequency) * amplitude
+            max_value += amplitude
+            amplitude *= persistence
+            frequency *= lacunarity
+        return total / max_value
+    
+    def ridge_scalar(self, x: float, y: float, octaves: int = 4, persistence: float = 0.5, lacunarity: float = 2.0) -> float:
+        total = 0.0
+        amplitude = 1.0
+        frequency = 1.0
+        max_value = 0.0
+        for _ in range(octaves):
+            n = 1.0 - abs(self.noise2d_scalar(x * frequency, y * frequency))
+            n = n * n
+            total += n * amplitude
+            max_value += amplitude
+            amplitude *= persistence
+            frequency *= lacunarity
+        return total / max_value
+    
+    def noise2d_batch(self, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        floor_x = np.floor(x)
+        floor_y = np.floor(y)
+        xi = floor_x.astype(np.int32) & 255
+        yi = floor_y.astype(np.int32) & 255
+        xf = x - floor_x
+        yf = y - floor_y
+        u = self._fade(xf)
+        v = self._fade(yf)
+        aa = self.perm[self.perm[xi] + yi]
+        ab = self.perm[self.perm[xi] + yi + 1]
+        ba = self.perm[self.perm[xi + 1] + yi]
+        bb = self.perm[self.perm[xi + 1] + yi + 1]
+        g_aa = self._grad(aa, xf, yf)
+        g_ba = self._grad(ba, xf - 1, yf)
+        g_ab = self._grad(ab, xf, yf - 1)
+        g_bb = self._grad(bb, xf - 1, yf - 1)
+        x1 = g_aa + u * (g_ba - g_aa)
+        x2 = g_ab + u * (g_bb - g_ab)
+        return x1 + v * (x2 - x1)
+    
+    def fbm_batch(self, x: np.ndarray, y: np.ndarray, octaves: int = 4, persistence: float = 0.5, lacunarity: float = 2.0) -> np.ndarray:
+        total = np.zeros_like(x)
+        amplitude = 1.0
+        frequency = 1.0
+        max_value = 0.0
+        for _ in range(octaves):
+            total += self.noise2d_batch(x * frequency, y * frequency) * amplitude
+            max_value += amplitude
+            amplitude *= persistence
+            frequency *= lacunarity
+        return total / max_value
+    
+    def ridge_batch(self, x: np.ndarray, y: np.ndarray, octaves: int = 4, persistence: float = 0.5, lacunarity: float = 2.0) -> np.ndarray:
+        total = np.zeros_like(x)
+        amplitude = 1.0
+        frequency = 1.0
+        max_value = 0.0
+        for _ in range(octaves):
+            n = 1.0 - np.abs(self.noise2d_batch(x * frequency, y * frequency))
+            n = n * n
+            total += n * amplitude
+            max_value += amplitude
+            amplitude *= persistence
+            frequency *= lacunarity
+        return total / max_value
+
+# ============================================================================
+# TERRAIN FEATURE GENERATION
+# ============================================================================
+
+_PAINT_PACKERS = None
+
+
+def _pack_paint(paint):
+    """One paint chunk as base64 text of its zlib stream."""
+    import base64, zlib
+    # Level 1: a 256 chunk in under half the time of level 6 for the same
+    # size (measured: 2.2 against 5.1 ms a chunk, 85 KB either way).
+    payload = zlib.compress(np.ascontiguousarray(paint).tobytes(), 1)
+    return base64.b64encode(payload).decode('ascii')
+
+
+def _compress_paint(paints):
+    """:func:`_pack_paint` of each of *paints*, in order; several at once
+    when there are several (the arrays are never written after they are
+    stored, so reading them from other threads is safe)."""
+    global _PAINT_PACKERS
+    if len(paints) < 2:
+        return [_pack_paint(paint) for paint in paints]
+    if _PAINT_PACKERS is None:
+        import os
+        from concurrent.futures import ThreadPoolExecutor
+        _PAINT_PACKERS = ThreadPoolExecutor(
+            max_workers=max(1, min(4, os.cpu_count() or 1)),
+            thread_name_prefix='TerrainPaintPack')
+    return list(_PAINT_PACKERS.map(_pack_paint, paints))
+
+
+class TerrainFeatures:
+    def __init__(self, noise: PerlinNoise, seed: int = 42):
+        self.noise = noise
+        self.seed = seed
+        self.feature_noise = PerlinNoise(seed + 1000)
+        self.valley_noise = PerlinNoise(seed + 2000)
+    
+    def get_rolling_hills_scalar(self, x: float, z: float, scale: float = 0.005) -> float:
+        hills = self.noise.fbm_scalar(x * scale, z * scale, octaves=2, persistence=0.4, lacunarity=2.0)
+        big_hills = self.noise.fbm_scalar(x * scale * 0.3, z * scale * 0.3, octaves=1, persistence=0.5, lacunarity=2.0)
+        return hills * 0.7 + big_hills * 0.3
+    
+    def get_mountains_scalar(self, x: float, z: float, scale: float = 0.008, sharpness: float = 0.5) -> float:
+        mask_value = self.feature_noise.fbm_scalar(x * scale * 0.5, z * scale * 0.5, octaves=2, persistence=0.5, lacunarity=2.0)
+        mask = max(0, (mask_value - 0.1) * 2.0)
+        mask = mask ** 1.5
+        mask = min(1, mask)
+        ridge = self.noise.ridge_scalar(x * scale, z * scale, octaves=3, persistence=0.5, lacunarity=2.2)
+        detail = self.noise.fbm_scalar(x * scale * 2, z * scale * 2, octaves=2, persistence=0.4, lacunarity=2.0)
+        mountain_height = ridge * 0.8 + detail * 0.2 * (1 - sharpness) + ridge * sharpness * 0.2
+        return mountain_height * mask
+    
+    def get_valleys_scalar(self, x: float, z: float, scale: float = 0.003, depth: float = 0.5) -> float:
+        valley = self.valley_noise.fbm_scalar(x * scale, z * scale, octaves=2, persistence=0.4, lacunarity=2.0)
+        valley = abs(valley)
+        valley = 1.0 - valley
+        valley = valley ** 3
+        return -valley * depth
+    
+    def get_plateaus_scalar(self, x: float, z: float, scale: float = 0.004, flatness: float = 0.7) -> float:
+        mask_value = self.feature_noise.fbm_scalar(x * scale * 0.4 + 50, z * scale * 0.4 + 50, octaves=2, persistence=0.5, lacunarity=2.0)
+        mask = max(0, min(1, (mask_value - 0.2) * 2.5))
+        base = self.noise.fbm_scalar(x * scale, z * scale, octaves=1, persistence=0.5, lacunarity=2.0)
+        if base > 0.3:
+            plateau_height = 0.3 + (base - 0.3) * (1.0 - flatness)
+        else:
+            plateau_height = base
+        return plateau_height * mask
+    
+    def get_rolling_hills_batch(self, x: np.ndarray, z: np.ndarray, scale: float = 0.005) -> np.ndarray:
+        hills = self.noise.fbm_batch(x * scale, z * scale, octaves=2, persistence=0.4, lacunarity=2.0)
+        big_hills = self.noise.fbm_batch(x * scale * 0.3, z * scale * 0.3, octaves=1, persistence=0.5, lacunarity=2.0)
+        return hills * 0.7 + big_hills * 0.3
+    
+    def get_mountains_batch(self, x: np.ndarray, z: np.ndarray, scale: float = 0.008, sharpness: float = 0.5) -> np.ndarray:
+        mask_value = self.feature_noise.fbm_batch(x * scale * 0.5, z * scale * 0.5, octaves=2, persistence=0.5, lacunarity=2.0)
+        mask = np.clip((mask_value - 0.1) * 2.0, 0, None)
+        mask = np.power(mask, 1.5)
+        mask = np.clip(mask, 0, 1)
+        ridge = self.noise.ridge_batch(x * scale, z * scale, octaves=3, persistence=0.5, lacunarity=2.2)
+        detail = self.noise.fbm_batch(x * scale * 2, z * scale * 2, octaves=2, persistence=0.4, lacunarity=2.0)
+        mountain_height = ridge * 0.8 + detail * 0.2 * (1 - sharpness) + ridge * sharpness * 0.2
+        return mountain_height * mask
+    
+    def get_valleys_batch(self, x: np.ndarray, z: np.ndarray, scale: float = 0.003, depth: float = 0.5) -> np.ndarray:
+        valley = self.valley_noise.fbm_batch(x * scale, z * scale, octaves=2, persistence=0.4, lacunarity=2.0)
+        valley = np.abs(valley)
+        valley = 1.0 - valley
+        valley = np.power(valley, 3)
+        return -valley * depth
+    
+    def get_plateaus_batch(self, x: np.ndarray, z: np.ndarray, scale: float = 0.004, flatness: float = 0.7) -> np.ndarray:
+        mask_value = self.feature_noise.fbm_batch(x * scale * 0.4 + 50, z * scale * 0.4 + 50, octaves=2, persistence=0.5, lacunarity=2.0)
+        mask = np.clip((mask_value - 0.2) * 2.5, 0, 1)
+        base = self.noise.fbm_batch(x * scale, z * scale, octaves=1, persistence=0.5, lacunarity=2.0)
+        plateau_height = np.where(base > 0.3, 0.3 + (base - 0.3) * (1.0 - flatness), base)
+        return plateau_height * mask
+
+# ============================================================================
+# BIOME DEFINITIONS
+# ============================================================================
+
+@dataclass
+class BiomeConfig:
+    name: str
+    base_height: float = 0.0
+    height_scale: float = 200.0
+    hills_scale: float = 0.005
+    hills_intensity: float = 1.0
+    mountains_enabled: bool = False
+    mountains_scale: float = 0.002
+    mountains_intensity: float = 1.0
+    mountains_sharpness: float = 1.0
+    valleys_enabled: bool = False
+    valleys_scale: float = 0.003
+    valleys_depth: float = 0.5
+    plateaus_enabled: bool = False
+    plateaus_scale: float = 0.004
+    plateaus_intensity: float = 0.5
+    plateaus_flatness: float = 0.7
+    trees_enabled: bool = False
+    tree_density: float = 0.0
+    color_gradient: List[Tuple[float, Tuple[float, float, float]]] = field(default_factory=lambda: [
+        (0.0, (0.2, 0.3, 0.1)),
+        (0.4, (0.1, 0.5, 0.2)),
+        (0.7, (0.3, 0.3, 0.3)),
+        (1.0, (1.0, 1.0, 1.0))
+    ])
+    blend_weights: Tuple[float, float, float, float] = (1.0, 0.3, 0.0, 0.0)
+    terrain_height_scale: float = 0.003
+
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "base_height": self.base_height,
+            "height_scale": self.height_scale,
+            "hills_scale": self.hills_scale,
+            "hills_intensity": self.hills_intensity,
+            "mountains_enabled": self.mountains_enabled,
+            "mountains_scale": self.mountains_scale,
+            "mountains_intensity": self.mountains_intensity,
+            "mountains_sharpness": self.mountains_sharpness,
+            "valleys_enabled": self.valleys_enabled,
+            "valleys_scale": self.valleys_scale,
+            "valleys_depth": self.valleys_depth,
+            "plateaus_enabled": self.plateaus_enabled,
+            "plateaus_scale": self.plateaus_scale,
+            "plateaus_intensity": self.plateaus_intensity,
+            "plateaus_flatness": self.plateaus_flatness,
+            "trees_enabled": self.trees_enabled,
+            "tree_density": self.tree_density,
+            "color_gradient": self.color_gradient,
+            "blend_weights": self.blend_weights,
+            "terrain_height_scale": self.terrain_height_scale
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        """A biome from a map file's ``custom_biome``.
+
+        The map is untrusted and its biome feeds every height sample: a field
+        of the wrong type (a string ``height_scale``, a gradient that is not
+        ``[position, [r, g, b]]`` stops) keeps its default instead of raising
+        on every chunk build.
+        """
+        if not isinstance(data, dict):
+            data = {}
+        name = data.get("name", "Custom")
+        instance = cls(name=name if isinstance(name, str) else "Custom")
+        for f in fields(cls):
+            if f.name == "name" or f.name not in data:
+                continue
+            value, default = data[f.name], getattr(instance, f.name)
+            if isinstance(default, bool):
+                value = _flag(value, default)
+            elif isinstance(default, float):
+                value = _finite_number(value, default, -1e9, 1e9)
+            elif f.name == "color_gradient":
+                value = _gradient_stops(value) or default
+            elif f.name == "blend_weights":
+                weights = _number_list(value, 4)
+                value = tuple(weights) if weights is not None else default
+            setattr(instance, f.name, value)
+        return instance
+
+BIOMES = {
+    'grassy_hills': BiomeConfig(name='Grassy Hills', height_scale=200, hills_scale=0.005, hills_intensity=1.2, blend_weights=(1.5, 0.5, 0.1, 0.0), terrain_height_scale=1.0/300.0, trees_enabled=True, tree_density=0.2),
+    'low_poly_valley': BiomeConfig(name='Low Poly Valley', base_height=10.0, height_scale=250.0, hills_scale=0.004, hills_intensity=0.8, mountains_enabled=True, mountains_scale=0.006, mountains_intensity=1.2, mountains_sharpness=0.2, valleys_enabled=True, valleys_depth=0.2, color_gradient=[(0.0, (0.38, 0.60, 0.25)), (0.25, (0.35, 0.55, 0.22)), (0.28, (0.55, 0.40, 0.25)), (1.0, (0.65, 0.45, 0.30))], blend_weights=(1.0, 0.0, 0.0, 0.0), trees_enabled=True, tree_density=0.15),
+    'dark_cliffs': BiomeConfig(name='Dark Cliffs', base_height=0.0, height_scale=350.0, hills_scale=0.008, hills_intensity=0.5, mountains_enabled=True, mountains_scale=0.005, mountains_intensity=1.8, mountains_sharpness=0.9, plateaus_enabled=True, plateaus_scale=0.01, plateaus_intensity=0.5, color_gradient=[(0.0, (0.15, 0.15, 0.18)), (0.4, (0.25, 0.25, 0.28)), (0.7, (0.10, 0.10, 0.12)), (0.95, (0.28, 0.35, 0.25))], trees_enabled=False),
+    'desert_canyon': BiomeConfig(name='Desert Canyon', base_height=20.0, height_scale=200.0, hills_scale=0.002, hills_intensity=0.3, mountains_enabled=False, plateaus_enabled=True, plateaus_scale=0.005, plateaus_intensity=1.5, plateaus_flatness=0.95, valleys_enabled=True, valleys_scale=0.004, valleys_depth=0.4, color_gradient=[(0.0, (0.60, 0.40, 0.25)), (0.2, (0.60, 0.40, 0.25)), (0.21, (0.50, 0.30, 0.15)), (0.4, (0.50, 0.30, 0.15)), (0.41, (0.70, 0.50, 0.35)), (0.6, (0.70, 0.50, 0.35)), (0.61, (0.45, 0.25, 0.15)), (1.0, (0.45, 0.25, 0.15))], trees_enabled=False),
+    'jagged_peaks': BiomeConfig(name='Jagged Peaks', base_height=50.0, height_scale=500.0, hills_scale=0.005, hills_intensity=0.2, mountains_enabled=True, mountains_scale=0.004, mountains_intensity=1.5, mountains_sharpness=1.0, valleys_enabled=True, valleys_scale=0.002, valleys_depth=0.3, color_gradient=[(0.0, (0.25, 0.30, 0.20)), (0.15, (0.35, 0.35, 0.35)), (0.6, (0.50, 0.50, 0.55)), (0.8, (0.90, 0.90, 0.95))], trees_enabled=False),
+    'desert': BiomeConfig(name='Desert', height_scale=100, hills_scale=0.008, hills_intensity=0.8, blend_weights=(0.2, 0.3, 1.2, 0.0), terrain_height_scale=1.0/150.0, trees_enabled=False, tree_density=0.0),
+    'mountains': BiomeConfig(name='Mountains', height_scale=500, mountains_enabled=True, mountains_intensity=1.5, blend_weights=(0.0, 1.0, 0.0, 0.6), terrain_height_scale=1.0/700.0, trees_enabled=True, tree_density=0.15),
+    'gentle_meadow': BiomeConfig(name='Gentle Meadow', base_height=0.0, height_scale=80.0, hills_scale=0.003, hills_intensity=0.8, mountains_enabled=False, valleys_enabled=True, valleys_scale=0.002, valleys_depth=0.15, plateaus_enabled=False, color_gradient=[(0.0, (0.30, 0.50, 0.22)), (0.2, (0.38, 0.58, 0.28)), (0.5, (0.45, 0.62, 0.32)), (0.7, (0.50, 0.65, 0.35)), (1.0, (0.55, 0.68, 0.38))], blend_weights=(1.2, 0.2, 0.1, 0.0), terrain_height_scale=1.0/120.0, trees_enabled=True, tree_density=0.4),
+    'rolling_highlands': BiomeConfig(name='Rolling Highlands', base_height=20.0, height_scale=150.0, hills_scale=0.004, hills_intensity=0.7, mountains_enabled=True, mountains_scale=0.006, mountains_intensity=0.5, mountains_sharpness=0.3, valleys_enabled=True, valleys_scale=0.003, valleys_depth=0.25, plateaus_enabled=False, color_gradient=[(0.0, (0.28, 0.48, 0.20)), (0.25, (0.38, 0.55, 0.28)), (0.5, (0.45, 0.60, 0.32)), (0.7, (0.50, 0.55, 0.38)), (0.85, (0.55, 0.52, 0.42)), (1.0, (0.65, 0.62, 0.55))], blend_weights=(1.0, 0.4, 0.2, 0.1), terrain_height_scale=1.0/225.0, trees_enabled=True, tree_density=0.3),
+    'rocky_mountains': BiomeConfig(name='Rocky Mountains', base_height=50.0, height_scale=300.0, hills_scale=0.003, hills_intensity=0.4, mountains_enabled=True, mountains_scale=0.008, mountains_intensity=1.0, mountains_sharpness=0.6, valleys_enabled=True, valleys_scale=0.004, valleys_depth=0.35, plateaus_enabled=False, color_gradient=[(0.0, (0.30, 0.45, 0.22)), (0.15, (0.38, 0.52, 0.28)), (0.3, (0.42, 0.40, 0.32)), (0.5, (0.50, 0.45, 0.38)), (0.7, (0.58, 0.52, 0.45)), (0.85, (0.68, 0.65, 0.58)), (1.0, (0.88, 0.86, 0.82))], blend_weights=(0.1, 1.2, 0.0, 0.5), terrain_height_scale=1.0/450.0, trees_enabled=True, tree_density=0.15),
+    'desert_mesas': BiomeConfig(name='Desert Mesas', base_height=10.0, height_scale=180.0, hills_scale=0.004, hills_intensity=0.5, mountains_enabled=False, plateaus_enabled=True, plateaus_scale=0.005, plateaus_intensity=0.9, plateaus_flatness=0.85, valleys_enabled=True, valleys_scale=0.003, valleys_depth=0.2, color_gradient=[(0.0, (0.35, 0.50, 0.25)), (0.15, (0.55, 0.42, 0.28)), (0.3, (0.68, 0.50, 0.32)), (0.5, (0.75, 0.55, 0.35)), (0.7, (0.80, 0.62, 0.40)), (1.0, (0.85, 0.70, 0.48))], blend_weights=(0.0, 0.4, 1.5, 0.0), terrain_height_scale=1.0/270.0, trees_enabled=False, tree_density=0.0),
+    'alpine_forest': BiomeConfig(name='Alpine Forest', base_height=30.0, height_scale=220.0, hills_scale=0.004, hills_intensity=0.6, mountains_enabled=True, mountains_scale=0.007, mountains_intensity=0.8, mountains_sharpness=0.45, valleys_enabled=True, valleys_scale=0.003, valleys_depth=0.3, plateaus_enabled=False, color_gradient=[(0.0, (0.18, 0.35, 0.15)), (0.2, (0.25, 0.45, 0.20)), (0.4, (0.35, 0.52, 0.28)), (0.55, (0.42, 0.48, 0.32)), (0.7, (0.52, 0.50, 0.45)), (0.85, (0.65, 0.63, 0.58)), (1.0, (0.92, 0.94, 0.96))], blend_weights=(0.8, 0.6, 0.0, 0.4), terrain_height_scale=1.0/330.0, trees_enabled=True, tree_density=0.8),
+    'coastal_cliffs': BiomeConfig(name='Coastal Cliffs', base_height=0.0, height_scale=120.0, hills_scale=0.005, hills_intensity=0.5, mountains_enabled=True, mountains_scale=0.01, mountains_intensity=0.6, mountains_sharpness=0.7, valleys_enabled=False, plateaus_enabled=True, plateaus_scale=0.008, plateaus_intensity=0.4, plateaus_flatness=0.6, color_gradient=[(0.0, (0.25, 0.45, 0.20)), (0.2, (0.35, 0.52, 0.28)), (0.4, (0.40, 0.38, 0.30)), (0.6, (0.48, 0.44, 0.38)), (0.8, (0.55, 0.50, 0.42)), (1.0, (0.62, 0.58, 0.48))], blend_weights=(0.3, 0.8, 0.2, 0.0), terrain_height_scale=1.0/180.0, trees_enabled=True, tree_density=0.1),
+}
+
+def _finite_number(value, default, lo, hi):
+    """*value* when it is a finite number within [lo, hi], else *default*.
+
+    For numbers read from a map file. The value keeps its type (an int stays
+    an int, so a round trip writes back what was read); a bool, a string, NaN
+    or an out-of-range number is replaced by *default*.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    if not math.isfinite(value) or not lo <= value <= hi:
+        return default
+    return value
+
+
+def _as_list(value):
+    """*value* when it is a list (a map field that holds records), else []."""
+    return value if isinstance(value, list) else []
+
+
+def _flag(value, default):
+    """A map file's on/off field: a bool, or a finite number read as one;
+    anything else (a string, a list, NaN) is *default*."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and math.isfinite(value):
+        return bool(value)
+    return default
+
+
+def _gradient_stops(value):
+    """The ``[position, [r, g, b]]`` stops of a saved colour gradient that
+    are well formed, as saved; None when *value* holds none."""
+    if not isinstance(value, (list, tuple)):
+        return None
+    stops = [stop for stop in value
+             if isinstance(stop, (list, tuple)) and len(stop) == 2
+             and _number_list([stop[0]], 1) is not None
+             and isinstance(stop[1], (list, tuple)) and len(stop[1]) == 3
+             and _number_list(stop[1], 3) is not None]
+    return stops or None
+
+
+def _number_list(value, length):
+    """The first *length* entries of *value* as floats when it is a list of at
+    least that many finite numbers; otherwise None."""
+    if not isinstance(value, (list, tuple)) or len(value) < length:
+        return None
+    head = value[:length]
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+               and math.isfinite(v) for v in head):
+        return None
+    return [float(v) for v in head]
+
+
+#: Furthest chunk index a map may name (a Big World fills larger extents at
+#: run time, through set_world_extent, not through the saved bounds).
+_MAX_CHUNK_INDEX = 1 << 20
+
+
+def _chunk_index(value, default):
+    """An integral chunk index from a map file, or *default*."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    if not math.isfinite(value) or value != int(value) or abs(value) > _MAX_CHUNK_INDEX:
+        return default
+    return int(value)
+
+
+def biome_display_name(name) -> str:
+    """A biome name without decoration: printable ASCII, trimmed.
+
+    The built-in names used to carry emoji ("Grassy Hills 🌿"), and maps saved
+    then still do; this is the name those maps mean.
+    """
+    return ''.join(ch for ch in str(name) if ' ' <= ch <= '~').strip()
+
+
+def biome_key_for_name(name) -> str:
+    """The BIOMES key a biome display name refers to ("Low Poly Valley" ->
+    "low_poly_valley"), ignoring any decoration an older map saved with it."""
+    return biome_display_name(name).lower().replace(' ', '_')
+
+
+#: What a newly created terrain starts as. A map that saves its terrain keeps
+#: whatever it saved; these apply to terrain created fresh in the editor.
+DEFAULT_BIOME = 'rocky_mountains'
+DEFAULT_USE_TEXTURES = True
+DEFAULT_GRASS_ENABLED = True
+
+# ============================================================================
+# MAIN TERRAIN CLASS
+# ============================================================================
+
+class Terrain:
+    # Terrain inside this radius is a protected high-detail zone. A chunk is
+    # never allowed to change LOD while any part of it lies within 4096 world
+    # units of the camera -- or within the stream radius, if streaming keeps
+    # less than that resident (see _near_detail_radius).
+    NEAR_DETAIL_RADIUS = 4096.0
+    NEAR_DETAIL_RADIUS_SQ = NEAR_DETAIL_RADIUS ** 2
+    LOD_DISTANCES_SQ = [4608**2, 6144**2, 8192**2, 12288**2]
+    LOD_RESOLUTIONS = [48, 32, 16, 8]
+    LOD_HYSTERESIS_FRAMES = 10
+    MAX_UPDATES_PER_FRAME = 2
+    #: Build height grids on a background thread (``TerrainBuilder``) instead
+    #: of inside :meth:`advance`. ``main.py`` turns it on for the editor and
+    #: the game; off, a terrain is built where it is advanced, a bounded
+    #: number of chunks a call, which is what tests and tools step through.
+    BACKGROUND_BUILDS = False
+    #: Most grids waiting on the builder thread at once: the nearest work is
+    #: asked for first, and what is further waits for a later frame's queue,
+    #: so the camera moving on re-orders it.
+    BUILD_QUEUE_LIMIT = 8
+    #: Milliseconds of chunk meshing a frame may spend before the rest waits
+    #: for the next frame. One chunk is always built, so terrain keeps
+    #: streaming however slow the machine; a second only fits on a fast one.
+    #: Two builds back to back in one frame were the hitch felt when walking
+    #: into new terrain.
+    UPDATE_BUDGET_MS = 4.0
+    #: Largest colour gradient the heightfield shader holds (MAX_GRADIENT_STOPS).
+    MAX_GRADIENT_STOPS = 32
+    #: Fixed per-chunk albedo paint resolution. Paint is baked into the terrain
+    #: material, rather than retained as a render-time stamp/decal list.
+    #: 256 a chunk is one texel a world unit at the default chunk size (it
+    #: was 128: a texel every two units, which is what made paint muddy).
+    #: Maps saved at another resolution are converted when loaded.
+    TERRAIN_PAINT_RESOLUTION = 256
+    #: World units one pixel of a tiled paint texture covers: a 512-pixel
+    #: image repeats every 256 units, whatever the size of the stamp.
+    STAMP_TILE_UNITS_PER_PIXEL = 0.5
+    #: Texture layers per paint-map page; clamped to the driver's limit.
+    #: A layer goes to a painted chunk only (TerrainGL hands them out), so a
+    #: page is small: 32 layers is 11 MB of video memory with its mips, and
+    #: a map gets as many pages as its painted chunks need. (It was one
+    #: layer a chunk slot, painted or not: 32 MB a page at 128.)
+    PAINT_PAGE_LAYERS = 32
+    #: Texture layers per height-grid page; clamped to the driver's limit.
+    HEIGHT_PAGE_LAYERS = 512
+    #: Every uniform the terrain programs are driven through.
+    _UNIFORM_NAMES = (
+        'projection', 'view', 'active_lights', 'use_textures', 'lod_level',
+        'texGrass', 'texRock', 'texSand', 'texSnow',
+        'terrainPaintMap', 'uPaintLayer', 'uPaintEnabled',
+        'uHeights', 'uChunkI', 'uChunkX', 'uChunkY', 'uTiling', 'uFlatMode',
+        'uGradCount', 'uGradH', 'uGradC', 'uGradW', 'uGradD',
+    ) + terrain_style.UNIFORM_NAMES
+    #: World units per repeat of the terrain textures (they are 1024 px).
+    #: At 20 a tile was half a player-height across, so at any ordinary
+    #: viewing distance the texture was minified to its average colour and
+    #: textured terrain looked untextured.
+    TILING_SCALE = 64.0
+    # Physical mesh scale is a true uniform terrain scale. It changes the
+    # world-space footprint and vertical relief together; procedural sampling
+    # remains in terrain-space so enlarging the mesh cannot flatten it.
+    DEFAULT_CHUNK_SIZE = 256.0
+    #: Most chunks a terrain's authored bounds may cover when it is not
+    #: streaming (every one is made resident). The Terrain Editor offers
+    #: -20..20 a side, 1,681 chunks.
+    MAX_BOUNDED_CHUNKS = 128 * 128
+    
+    def __init__(self, texture_manager=None, seed: int = 42):
+        self.seed = seed
+        self.noise = PerlinNoise(seed)
+        self.features = TerrainFeatures(self.noise, seed)
+        self.biome: BiomeConfig = BIOMES[DEFAULT_BIOME]
+        self.chunk_size: float = self.DEFAULT_CHUNK_SIZE
+        self.mesh_scale: float = 1.0
+        self.base_resolution: int = 48
+        self.offset_x: float = 0.0
+        self.offset_z: float = 0.0
+        self.offset_y: float = 0.0
+        # New terrain starts textured; maps that saved use_textures keep it.
+        self.use_textures: bool = DEFAULT_USE_TEXTURES
+        self.flat_mode: bool = False
+        #: Dense per-chunk state (residency, LOD, the one heightfield both
+        #: rendering and collision read). See engine.terrain_table.
+        self.table = TerrainTable()
+        self.min_chunk_x: int = -2
+        self.max_chunk_x: int = 2
+        self.min_chunk_z: int = -2
+        self.max_chunk_z: int = 2
+        self.tree_positions: List[Tuple[float, float, float]] = []
+        self.total_triangles: int = 0
+        self.drawn_slots = np.zeros(0, dtype=np.intp)
+        self.visible_chunks: int = 0
+        self.culled_chunks: int = 0
+        # Baked terrain material paint. Each resident chunk owns one RGBA8
+        # albedo map at TERRAIN_PAINT_RESOLUTION². The source image is sampled
+        # once by the editor and the resulting colour/coverage becomes part
+        # of the terrain data itself.
+        self.texture_paint_maps: Dict[Tuple[int, int], np.ndarray] = {}
+        # Placed texture stamps. Each record (id, texture, x, z, radius,
+        # angle, feather, opacity) is also baked into texture_paint_maps, which
+        # stays what renders and what the game loads; the records let the
+        # editor select a stamp and rebake its chunks when it moves.
+        # texture_paint_base is the paint no stamp record owns (maps painted
+        # before stamps were kept), composited under the stamps.
+        self.paint_stamps: List[dict] = []
+        self.texture_paint_base: Dict[Tuple[int, int], np.ndarray] = {}
+        # Editor-only: selected stamps draw tinted from _paint_display, which
+        # overrides texture_paint_maps for the chunks they touch.
+        self.selected_stamp_ids: set = set()
+        self._paint_display: Dict[Tuple[int, int], np.ndarray] = {}
+        self._stamp_dirty_chunks: set = set()
+        # Grass slots whose only change is a stamp added over them:
+        # slot -> (allocation order, table.grass_epoch) when it was marked.
+        self._grass_thin: dict = {}
+        self._paint_added_only = False
+        # What a drag does not move, by chunk (see _drag_layers).
+        self._drag_cache: dict = {}
+        # Chunks whose *stored* paint has a selected stamp in it; None when
+        # that is not known. Known from the start of a move of selected
+        # stamps (the stored paint is current then) until anything else
+        # changes the paint. For any other chunk the stored paint is already
+        # "the chunk without the selection", and needs no baking.
+        self._stored_with_selection = None
+        self._paint_image_cache: Dict[str, Optional[np.ndarray]] = {}
+        # Stamp lookup index (see _stamp_index); None until first needed.
+        self._stamp_rows: Optional[Dict[str, int]] = None
+        self._stamp_ranges: List[Tuple[int, int, int, int]] = []
+        self._stamp_range_arr: Optional[np.ndarray] = None
+        self._stamp_index_key = None
+        # to_dict runs for every sculpt step and stamp click; these hold the
+        # serialised form of data that has not changed since the last call.
+        # Paint chunks: {coord: (array, entry)} per paint dict, valid while
+        # the chunk's array is the same object (arrays are never written in
+        # place, see _bake_texture_rect).
+        self._paint_serial_cache: Dict[Tuple[int, int], tuple] = {}
+        self._base_serial_cache: Dict[Tuple[int, int], tuple] = {}
+        # Sculpt tiles: (key, {tile: entry}, dirty tiles, entry list) for
+        # the sculpt as of key (see _sculpt_tile_entries); None when unknown.
+        self._sculpt_tile_cache: Optional[tuple] = None
+        self._heightmap_blob_cache: tuple = (None, None)
+        self._paint_map_versions: Dict[Tuple[int, int], int] = {}
+        self._paint_version_counter = 0
+        #: Bumped when the paint dictionaries are replaced (a clear, a
+        #: load): a renderer then forgets every paint version it holds.
+        self._paint_epoch = 0
+        self._gradient_warned = False
+        # Grass is a separate GL 3.3 instanced pass. The CPU scatters tufts,
+        # places every blade of a tuft on the terrain surface and uploads one
+        # compact position/size/phase record per blade; the GPU builds the
+        # tapered, curved blade and animates it (see shaders 'grass.vert').
+        # New terrain grows grass; maps saved without it stay grass-free.
+        self.grass_enabled: bool = DEFAULT_GRASS_ENABLED
+        self.grass_density: float = 0.02
+        self.grass_color: Tuple[float, float, float] = tuple(self.biome.color_gradient[0][1])
+        self.grass_color_custom: bool = False
+        #: Colour of the blade tips; None derives a sun-bleached shade of
+        #: grass_color.
+        self.grass_tip_color: Optional[Tuple[float, float, float]] = None
+        #: (lowest, highest) heights grass grows at, as fractions of the
+        #: terrain's height range; None follows the grass texture layer.
+        self.grass_height_range: Optional[Tuple[float, float]] = None
+        self.GRASS_MAX_PER_CHUNK = 4096          # tufts per chunk
+        self.GRASS_BLADES_PER_TUFT = 5
+        self.GRASS_TUFT_RADIUS = 2.5             # world units
+        self.GRASS_BLADE_HEIGHT = DEFAULT_GRASS_HEIGHT  # world units at size 1.0
+        self.GRASS_BLADE_WIDTH = 0.35            # half width at the root
+        self.GRASS_MAX_DISTANCE = 3072.0
+        # Chunks nearer than this draw detailed blades; blades morph onto the
+        # single-triangle far blade between LOD_START and LOD_DISTANCE.
+        self.GRASS_SEGMENTS = 5
+        self.GRASS_LOD_START = 350.0
+        self.GRASS_LOD_DISTANCE = 700.0
+        # Blades shrink away over the last stretch before the cut-off
+        # instead of popping out.
+        self.GRASS_FADE_START = 2400.0
+        # Grass only grows where the ground is flatter than this (normal.y).
+        self.GRASS_MIN_NORMAL_Y = 0.78
+        # Look options: texture layers, terracing and the stylised modes.
+        self.appearance = terrain_style.TerrainAppearance()
+        self._height_range: Optional[Tuple[float, float]] = None
+        # 'blocks' terracing draws square columns from per-chunk meshes with
+        # a mesh vertex shader instead of the heightfield.
+        self.enabled: bool = True
+        self.wireframe: bool = False
+        self.solid: bool = True
+        # Sculpt deformation map — sparse dict of (grid_x, grid_z) -> height offset
+        self.sculpt_offsets: Dict[Tuple[int, int], float] = {}
+        self.sculpt_grid_resolution: float = 4.0  # world units per grid cell
+        # Terrain CSG subtraction volumes. Each entry is an AABB as
+        # [min_x, min_y, min_z, max_x, max_y, max_z]. The heightfield remains the
+        # authoritative representation: a cut lowers the surface to the cutter's
+        # bottom wherever the current surface intersects the cutter volume.
+        self.csg_subtractions: List[List[float]] = []
+
+        # Heightmap overlay
+        self.heightmap_data: Optional[np.ndarray] = None  # 2D float32, 0..1
+        self.heightmap_strength: float = 100.0
+        self.heightmap_blend: str = 'additive'  # 'additive' or 'replace'
+        # -- Chunk streaming (Big World "fill world with terrain") -----------
+        # When ``streaming`` is on, only the chunks within ``stream_radius`` of
+        # the camera are kept resident; chunks beyond ``stream_radius +
+        # stream_evict_padding`` are freed. This lets a world-spanning terrain
+        # (bounds widened by ``set_world_extent``) render without tessellating
+        # the whole grid up-front — meshes appear around the camera as it moves.
+        self.streaming: bool = False
+        # Keep the protected high-detail zone resident while the camera moves.
+        self.stream_radius: float = 4096.0
+        self.stream_evict_padding: float = 512.0
+        self.streamed_chunks: int = 0
+        # A ``set_bounds(..., prune=False)`` defers its out-of-bounds chunk
+        # deletion (a GL op) to the next render on the GL thread.
+        self._pending_prune: bool = False
+        # Authored chunk bounds / enabled flag stashed while the editor is
+        # previewing a world fill, so the expansion is reversible and never
+        # saved to the map file.
+        self._authored_bounds: Optional[Tuple[int, int, int, int]] = None
+        self._authored_enabled: Optional[bool] = None
+        # What a renderer is handed (engine/terrain_frame.py): the table
+        # above, the per-slot products, and this key naming the publication.
+        self.products = TerrainProducts()
+        self._publication_key = new_publication_key()
+        # The builder thread (BACKGROUND_BUILDS): slot -> the allocation
+        # order it was asked for, the requests and the finished grids.
+        self._building: Dict[int, int] = {}
+        self._build_requests: "queue.Queue" = queue.Queue()
+        self._build_results: "queue.Queue" = queue.Queue()
+        self._builder = None
+        self._builder_stop = False
+    
+
+
+
+    
+    def is_solid(self) -> bool:
+        return self.enabled and self.solid
+
+    def get_tri_count(self) -> int:
+        return self.table.triangle_count()
+    
+    def _get_height_scalar(self, world_x: float, world_z: float) -> float:
+        """Surface height including any terracing - what collision sees."""
+        mode = self.appearance.terrace_mode
+        if mode == 'none':
+            return self._get_raw_height_scalar(world_x, world_z)
+        if mode == 'blocks':
+            world_x, world_z = self._block_centre(world_x, world_z)
+        return self._terrace_scalar(self._get_raw_height_scalar(world_x, world_z))
+
+    def _get_raw_height_scalar(self, world_x: float, world_z: float) -> float:
+        x = (world_x - self.offset_x) / self.mesh_scale
+        z = (world_z - self.offset_z) / self.mesh_scale
+        height = self.features.get_rolling_hills_scalar(x, z, self.biome.hills_scale)
+        height = height * self.biome.hills_intensity
+        if self.biome.mountains_enabled:
+            mountain_h = self.features.get_mountains_scalar(x, z, self.biome.mountains_scale, self.biome.mountains_sharpness)
+            height = height + mountain_h * self.biome.mountains_intensity
+        if self.biome.valleys_enabled:
+            valley = self.features.get_valleys_scalar(x, z, self.biome.valleys_scale, self.biome.valleys_depth)
+            height = height + valley
+        if self.biome.plateaus_enabled:
+            plateau_h = self.features.get_plateaus_scalar(x, z, self.biome.plateaus_scale, self.biome.plateaus_flatness)
+            height = height + plateau_h * self.biome.plateaus_intensity
+        height = (height + 1.0) * 0.5
+        height = max(0.0, min(1.0, height))
+        base = self.biome.base_height + height * self.biome.height_scale + self.offset_y
+        # All height sources are authored in terrain-space. Apply physical
+        # scale once at the representation boundary so horizontal enlargement
+        # preserves the same vertical proportions.
+        base += self._sample_heightmap_scalar(world_x, world_z, base)
+        base += self._sample_sculpt_scalar(world_x, world_z)
+        base *= self.mesh_scale
+        return self._apply_csg_subtractions_scalar(world_x, world_z, base)
+    
+    def get_height_at(self, world_x: float, world_z: float) -> float:
+        """Terrain height at a world point, as collision should see it.
+
+        Where the chunk has been built this is the built surface itself --
+        the table's heightfield, interpolated over the triangles the renderer
+        draws -- so the player stands on what is on screen. Elsewhere (a chunk
+        not resident, or not built yet) it is the height function.
+        """
+        if self.appearance.terrace_mode == 'blocks':
+            # A block is flat at the height its centre was built at. The
+            # heightfield ramps between blocks over one grid cell, so read it
+            # where it is flat - the block's centre, which may lie in the
+            # neighbouring chunk.
+            world_x, world_z = self._block_centre(world_x, world_z)
+        chunk_x = int(math.floor((world_x - self.offset_x) / self.chunk_size))
+        chunk_z = int(math.floor((world_z - self.offset_z) / self.chunk_size))
+        height = self.table.height_at(chunk_x, chunk_z, world_x, world_z)
+        if height is not None:
+            return height
+        return self._get_height_scalar(world_x, world_z)
+    
+    def get_height_at_safe(self, world_x: float, world_z: float) -> Optional[float]:
+        if not self.enabled: return None
+        min_world_x = self.min_chunk_x * self.chunk_size + self.offset_x
+        max_world_x = (self.max_chunk_x + 1) * self.chunk_size + self.offset_x
+        min_world_z = self.min_chunk_z * self.chunk_size + self.offset_z
+        max_world_z = (self.max_chunk_z + 1) * self.chunk_size + self.offset_z
+        if world_x < min_world_x or world_x > max_world_x: return None
+        if world_z < min_world_z or world_z > max_world_z: return None
+        return self.get_height_at(world_x, world_z)
+    
+    def get_heights_at_safe(self, world_x, world_z) -> np.ndarray:
+        """:meth:`get_height_at_safe` for many points at once: float64, NaN
+        where it is ``None`` (terrain off, or the point outside it).
+
+        Where a chunk is built this is the built surface, to the last bit
+        what the scalar query answers (:meth:`TerrainTable.heights_at`), so
+        whatever asks in bulk -- physics bodies, five points each -- stands on
+        what the player stands on. Elsewhere it is the height function,
+        evaluated in bulk.
+        """
+        world_x = np.asarray(world_x, dtype=np.float64)
+        world_z = np.asarray(world_z, dtype=np.float64)
+        out = np.full(world_x.shape, np.nan)
+        if not self.enabled or not out.size:
+            return out
+        min_world_x = self.min_chunk_x * self.chunk_size + self.offset_x
+        max_world_x = (self.max_chunk_x + 1) * self.chunk_size + self.offset_x
+        min_world_z = self.min_chunk_z * self.chunk_size + self.offset_z
+        max_world_z = (self.max_chunk_z + 1) * self.chunk_size + self.offset_z
+        inside = ~((world_x < min_world_x) | (world_x > max_world_x)
+                   | (world_z < min_world_z) | (world_z > max_world_z))
+        if not inside.any():
+            return out
+        x = world_x[inside]
+        z = world_z[inside]
+        if self.appearance.terrace_mode == 'blocks':
+            # As the scalar query: a block is flat at its centre's height.
+            x, z = terrain_style.block_cell_centres(
+                x, z, self._block_world_size(), self.offset_x, self.offset_z)
+        chunk_x = np.floor((x - self.offset_x) / self.chunk_size).astype(np.int64)
+        chunk_z = np.floor((z - self.offset_z) / self.chunk_size).astype(np.int64)
+        heights = self.table.heights_at(chunk_x, chunk_z, x, z)
+        unbuilt = np.isnan(heights)
+        if unbuilt.any():
+            heights[unbuilt] = self._get_heights_batch(
+                x[unbuilt].astype(np.float32), z[unbuilt].astype(np.float32))
+        out[inside] = heights
+        return out
+
+    def get_terrain_bounds(self) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+        min_x = self.min_chunk_x * self.chunk_size + self.offset_x
+        max_x = (self.max_chunk_x + 1) * self.chunk_size + self.offset_x
+        min_z = self.min_chunk_z * self.chunk_size + self.offset_z
+        max_z = (self.max_chunk_z + 1) * self.chunk_size + self.offset_z
+        return ((min_x, max_x), (min_z, max_z))
+    
+    def set_mesh_scale(self, factor: float):
+        """Set uniform physical terrain scale without changing morphology."""
+        factor = max(0.01, float(factor))
+        self.mesh_scale = factor
+        self.chunk_size = self.DEFAULT_CHUNK_SIZE * factor
+        self.cleanup()
+        self.mark_all_dirty()
+
+    # ------------------------------------------------------------------
+    # Appearance
+    # ------------------------------------------------------------------
+    def _textures_active(self) -> bool:
+        return bool(getattr(self, 'use_textures', False)) and not self.flat_mode
+
+    def set_use_textures(self, enabled: bool):
+        """Textures on/off; ground-coloured grass follows the change."""
+        self.use_textures = bool(enabled)
+        if not self.grass_color_custom:
+            self.table.mark_grass_dirty()
+
+    def _layer_heights(self) -> Tuple[float, float, float]:
+        """Texture layer boundaries: the user's, else the biome's defaults."""
+        if self.appearance.layer_heights is not None:
+            return tuple(self.appearance.layer_heights)
+        return terrain_style.layer_heights_for_biome(biome_key_for_name(self.biome.name))
+
+    def _layer_height_range(self) -> Tuple[float, float]:
+        """World-space (low, high) of the terrain surface, estimated once.
+
+        Sampled on a coarse grid over the authored bounds from the raw surface
+        (sculpting and heightmaps included), so layers sit at the same place
+        on every chunk. Cached until the shape of the whole terrain changes;
+        sculpting does not move the layers mid-stroke.
+        """
+        if self._height_range is None:
+            if self._authored_bounds is not None:
+                min_cx, max_cx, min_cz, max_cz = self._authored_bounds
+            else:
+                min_cx, max_cx, min_cz, max_cz = self._chunk_bounds()
+            xs = np.linspace(min_cx * self.chunk_size + self.offset_x,
+                             (max_cx + 1) * self.chunk_size + self.offset_x, 48)
+            zs = np.linspace(min_cz * self.chunk_size + self.offset_z,
+                             (max_cz + 1) * self.chunk_size + self.offset_z, 48)
+            gx, gz = np.meshgrid(xs, zs, indexing='ij')
+            h = self._get_raw_heights_batch(gx.ravel().astype(np.float32),
+                                            gz.ravel().astype(np.float32))
+            lo, hi = float(np.min(h)), float(np.max(h))
+            if hi - lo < 1.0:
+                hi = lo + 1.0
+            self._height_range = (lo, hi)
+        return self._height_range
+
+    def _normalized_layer_height(self, heights: np.ndarray) -> np.ndarray:
+        lo, hi = self._layer_height_range()
+        return np.clip((np.asarray(heights) - lo) / max(hi - lo, 1e-3), 0.0, 1.0)
+
+    def invalidate_height_range(self):
+        self._height_range = None
+
+    def set_appearance(self, **options):
+        """Change any appearance options by name (see TerrainAppearance).
+
+        Options that change the terrain's shape rebuild every chunk; the rest
+        are shader uniforms and apply on the next frame. Changing an option
+        by hand marks the look as 'custom' unless ``preset`` is given too.
+        """
+        a = self.appearance
+        old_shape = a.shape_key()
+        old_grass = (a.color_mode, a.layer_heights, a.layer_blend)
+        if (options.get('palette') == 'custom' and 'custom_palette' not in options
+                and not a.custom_palette):
+            # Start a custom palette from the colours on screen.
+            options['custom_palette'] = terrain_style.palette_colors(a)
+        for key, value in options.items():
+            if not hasattr(a, key):
+                raise AttributeError(f"unknown terrain appearance option: {key}")
+            setattr(a, key, value)
+        if 'preset' not in options and any(
+                k not in ('layer_heights', 'layer_blend', 'slope_rock') for k in options):
+            a.preset = 'custom'
+        a.sanitize()
+        self._appearance_changed(old_shape, old_grass)
+
+    def set_palette_color(self, index: int, color):
+        """Change one palette colour (a strata band, or a height step).
+
+        Editing a built-in palette turns it into a custom palette that starts
+        from that palette's colours.
+        """
+        colors = terrain_style.palette_colors(self.appearance)
+        if not 0 <= index < len(colors):
+            raise IndexError(index)
+        colors[index] = tuple(float(np.clip(c, 0.0, 1.0)) for c in color[:3])
+        self.set_appearance(palette='custom', custom_palette=colors)
+
+    def resize_palette(self, count: int):
+        """Grow or shrink the palette to *count* colours (2..8), as custom."""
+        colors = terrain_style.palette_colors(self.appearance)
+        count = int(np.clip(count, terrain_style.MIN_PALETTE, terrain_style.MAX_PALETTE))
+        while len(colors) < count:
+            colors.append(colors[len(colors) % max(1, len(colors) - 1)])
+        self.set_appearance(palette='custom', custom_palette=colors[:count])
+
+    def apply_appearance_preset(self, name: str):
+        a = self.appearance
+        old_shape = a.shape_key()
+        old_grass = (a.color_mode, a.layer_heights, a.layer_blend)
+        terrain_style.apply_preset(a, name)
+        self._appearance_changed(old_shape, old_grass)
+
+    def _appearance_changed(self, old_shape, old_grass):
+        a = self.appearance
+        if a.shape_key() != old_shape:
+            self.mark_all_dirty()
+        elif not self.grass_color_custom:
+            # Blades carry the ground colour under them: any look change
+            # that recolours the ground recolours the grass.
+            self.table.mark_grass_dirty()
+        elif (a.color_mode, a.layer_heights, a.layer_blend) != old_grass:
+            # The grass follows the texture layers unless given its own range.
+            self.table.mark_grass_dirty()
+
+    def appearance_uniforms(self) -> Dict[str, object]:
+        return terrain_style.shader_uniforms(
+            self.appearance, self._layer_height_range(), self._layer_heights(),
+            self.mesh_scale, (self.offset_x, self.offset_z))
+
+
+    def set_biome(self, biome_name: str):
+        if biome_name in BIOMES:
+            self.biome = BIOMES[biome_name]
+            if not self.grass_color_custom:
+                self.grass_color = tuple(self.biome.color_gradient[0][1])
+            # Each biome brings its own texture layer heights.
+            self.appearance.layer_heights = None
+            self.invalidate_height_range()
+            self.table.mark_all_dirty()
+
+    @property
+    def grass_height(self) -> float:
+        """Authored blade height, sharing the existing shader-height setting."""
+        return self.GRASS_BLADE_HEIGHT
+
+    @grass_height.setter
+    def grass_height(self, height: float) -> None:
+        value = float(height)
+        self.GRASS_BLADE_HEIGHT = (float(np.clip(value, *GRASS_HEIGHT_LIMITS))
+                                   if math.isfinite(value) else DEFAULT_GRASS_HEIGHT)
+
+    def set_grass(self, enabled: bool, density: Optional[float] = None,
+                  color: Optional[Tuple[float, float, float]] = None,
+                  tip_color=None, height_range=None,
+                  height: Optional[float] = None):
+        """Configure terrain grass; geometry is rebuilt lazily on the GL thread.
+
+        ``color`` is the blade colour, or ``'ground'`` for blades that take
+        the colour of the ground they grow on (the default); ``tip_color`` the
+        colour the blades
+        fade to at their tips. Pass ``tip_color='auto'`` to go back to a
+        sun-bleached shade of the blade colour. Colours alone need no rebuild.
+        ``height_range`` is ``(lowest, highest)`` as fractions of the
+        terrain's height range; ``'auto'`` follows the grass texture layer.
+        ``height`` is blade height in world units (default 5); it changes
+        only a shader uniform, so existing instance records need no rebuild.
+        """
+        rebuild = (bool(enabled) != self.grass_enabled or density is not None
+                   or height_range is not None)
+        if isinstance(height_range, str) and height_range == 'auto':
+            self.grass_height_range = None
+        elif height_range is not None:
+            lo, hi = (float(np.clip(v, 0.0, 1.0)) for v in list(height_range)[:2])
+            self.grass_height_range = (min(lo, hi), max(lo, hi))
+        self.grass_enabled = bool(enabled)
+        if density is not None:
+            self.grass_density = float(np.clip(density, 0.0, MAX_GRASS_DENSITY))
+        if height is not None:
+            self.grass_height = height
+        if isinstance(color, str) and color == 'ground':
+            # Blades take the colour of the ground they grow on (the default).
+            # Their ground colours are baked at build time and may be stale
+            # while a custom colour was in use, so rebuild.
+            self.grass_color_custom = False
+            self.grass_color = tuple(self.biome.color_gradient[0][1])
+            rebuild = True
+        elif color is not None:
+            self.grass_color = tuple(float(np.clip(c, 0.0, 1.0)) for c in color)
+            self.grass_color_custom = True
+        if isinstance(tip_color, str) and tip_color == 'auto':
+            self.grass_tip_color = None
+        elif tip_color is not None:
+            self.grass_tip_color = tuple(float(np.clip(c, 0.0, 1.0)) for c in tip_color)
+        if rebuild:
+            self.table.mark_grass_dirty()
+
+    def grass_height_bounds(self) -> Tuple[float, float]:
+        """(lowest, highest) grass heights as fractions of the height range."""
+        if self.grass_height_range is not None:
+            return tuple(self.grass_height_range)
+        layers = self._layer_heights()
+        return (float(layers[0]), float(layers[1]))
+
+    def grass_tip_colour(self) -> Tuple[float, float, float]:
+        """The tip colour in use: the chosen one, else a sun-bleached shade."""
+        if self.grass_tip_color is not None:
+            return tuple(self.grass_tip_color)
+        base = np.asarray(self.grass_color, dtype=np.float64)
+        tip = np.clip(base * 1.3, 0.0, 1.0) * 0.7 + np.array([0.80, 0.78, 0.55]) * 0.3
+        return tuple(float(c) for c in tip)
+    
+    def set_seed(self, seed: int):
+        self.seed = seed
+        self.noise = PerlinNoise(seed)
+        self.features = TerrainFeatures(self.noise, seed)
+        self.mark_all_dirty()
+    
+    def set_bounds(self, min_x: int, max_x: int, min_z: int, max_z: int,
+                   prune: bool = True):
+        self.min_chunk_x = min_x
+        self.max_chunk_x = max_x
+        self.min_chunk_z = min_z
+        self.max_chunk_z = max_z
+        self.invalidate_height_range()
+        if prune:
+            self._remove_out_of_bounds_chunks()
+        else:
+            # Defer the GL chunk deletion to the render thread's next frame.
+            self._pending_prune = True
+
+    def set_streaming(self, enabled: bool, radius: Optional[float] = None):
+        """Turn chunk streaming on/off (see :attr:`streaming`).
+
+        ``radius`` (world units) sets how far terrain is kept resident around
+        the camera; ``None``/0 leaves the current radius untouched.
+        """
+        self.streaming = bool(enabled)
+        if radius is not None and radius > 0:
+            self.stream_radius = float(radius)
+
+    def set_world_extent(self, min_wx: float, min_wz: float,
+                         max_wx: float, max_wz: float, prune: bool = True):
+        """Widen (or shrink) the terrain to cover a world-space XZ rectangle.
+
+        Converts world coordinates to chunk indices and calls :meth:`set_bounds`,
+        so the terrain height field — a pure function of world position — spans
+        the whole rectangle. Paired with :meth:`set_streaming` this fills a Big
+        World map's terrain without meshing the entire grid at once.
+        """
+        cs = self.chunk_size
+        # The rectangle's max edge is exclusive: a world that ends exactly on a
+        # chunk boundary must not gain a chunk row/column lying wholly past it.
+        min_cx = int(math.floor((min_wx - self.offset_x) / cs))
+        min_cz = int(math.floor((min_wz - self.offset_z) / cs))
+        max_cx = max(min_cx, int(math.ceil((max_wx - self.offset_x) / cs)) - 1)
+        max_cz = max(min_cz, int(math.ceil((max_wz - self.offset_z) / cs)) - 1)
+        self.set_bounds(min_cx, max_cx, min_cz, max_cz, prune=prune)
+
+    def _chunk_bounds(self):
+        return (self.min_chunk_x, self.max_chunk_x,
+                self.min_chunk_z, self.max_chunk_z)
+
+    def _stream_chunks(self, camera_pos):
+        """Keep only the chunks near ``camera_pos`` resident (streaming mode).
+
+        Ensures every in-bounds chunk whose nearest point is within
+        ``stream_radius`` of the camera, and evicts any resident chunk beyond
+        ``stream_radius + stream_evict_padding``. Bounded work per call and
+        bounded residency regardless of how far the camera has travelled, so a
+        world-spanning terrain never tessellates its whole grid. The maths is
+        :meth:`TerrainTable.stream`; this frees the GL side of what it evicts
+        (nothing, for a chunk that was never uploaded), so it runs headlessly.
+        """
+        freed = self.table.stream(
+            camera_pos.x, camera_pos.z, self.chunk_size, self.stream_radius,
+            self.stream_evict_padding, self._chunk_bounds(),
+            self.offset_x, self.offset_z)
+        self._released(freed)
+        self.streamed_chunks = self.table.count
+
+    # -- Editor "fill world with terrain" preview -------------------------
+    def editor_fill_world(self, min_wx: float, min_wz: float,
+                          max_wx: float, max_wz: float, stream_radius: float):
+        """Expand + stream the terrain in the editor, reversibly.
+
+        Unlike the runtime session (which snapshots/restores across play), the
+        editor preview must not persist the widened bounds: the authored bounds
+        are stashed the first time this runs and re-emitted by :meth:`to_dict`,
+        so saving a filled map writes exactly the terrain the author set up.
+        Idempotent — safe to call every repaint.
+        """
+        cs = self.chunk_size
+        new_bounds = (
+            int(math.floor((min_wx - self.offset_x) / cs)),
+            int(math.floor((max_wx - self.offset_x) / cs)),
+            int(math.floor((min_wz - self.offset_z) / cs)),
+            int(math.floor((max_wz - self.offset_z) / cs)),
+        )
+        if self._authored_bounds is None:
+            self._authored_bounds = (self.min_chunk_x, self.max_chunk_x,
+                                     self.min_chunk_z, self.max_chunk_z)
+            self._authored_enabled = self.enabled
+        cur = (self.min_chunk_x, self.max_chunk_x,
+               self.min_chunk_z, self.max_chunk_z)
+        if new_bounds != cur:
+            self.set_bounds(*new_bounds, prune=False)
+        # The user asked to see terrain — make sure it's drawn during the
+        # preview (the authored enabled flag is restored on unfill / save).
+        self.enabled = True
+        self.set_streaming(True, stream_radius)
+
+    def editor_unfill_world(self):
+        """Undo :meth:`editor_fill_world`, restoring the authored bounds/state."""
+        if self._authored_bounds is None:
+            return
+        mnx, mxx, mnz, mxz = self._authored_bounds
+        authored_enabled = self._authored_enabled
+        self._authored_bounds = None
+        self._authored_enabled = None
+        self.set_bounds(mnx, mxx, mnz, mxz, prune=False)
+        if authored_enabled is not None:
+            self.enabled = authored_enabled
+        self.set_streaming(False)
+    
+    def mark_all_dirty(self):
+        self.invalidate_height_range()
+        self.table.mark_all_dirty()
+
+    def _remove_out_of_bounds_chunks(self):
+        self._released(self.table.prune_out_of_bounds(self._chunk_bounds()))
+
+
+
+
+
+    def _get_heights_batch(self, world_x: np.ndarray, world_z: np.ndarray) -> np.ndarray:
+        """Surface heights including any terracing."""
+        mode = self.appearance.terrace_mode
+        if mode == 'none':
+            return self._get_raw_heights_batch(world_x, world_z)
+        if mode == 'blocks':
+            cx, cz = terrain_style.block_cell_centres(
+                world_x, world_z, self._block_world_size(), self.offset_x, self.offset_z)
+            raw = self._get_raw_heights_batch(cx.astype(np.float32), cz.astype(np.float32))
+        else:
+            raw = self._get_raw_heights_batch(world_x, world_z)
+        return np.asarray(self._terrace_batch(raw), dtype=np.float32)
+
+    # -- Terracing helpers ----------------------------------------------------
+    def _terrace_step_world(self) -> float:
+        return self.appearance.terrace_step * self.mesh_scale
+
+    def _block_world_size(self) -> float:
+        return self.appearance.block_size * self.mesh_scale
+
+    def _block_centre(self, world_x: float, world_z: float) -> Tuple[float, float]:
+        cell = self._block_world_size()
+        cx = self.offset_x + (math.floor((world_x - self.offset_x) / cell) + 0.5) * cell
+        cz = self.offset_z + (math.floor((world_z - self.offset_z) / cell) + 0.5) * cell
+        return cx, cz
+
+    def _terrace_scalar(self, h: float) -> float:
+        a = self.appearance
+        return terrain_style.terrace_heights(
+            float(h), self._terrace_step_world(), a.terrace_ramp, a.terrace_mode)
+
+    def _terrace_batch(self, h: np.ndarray) -> np.ndarray:
+        a = self.appearance
+        return terrain_style.terrace_heights(
+            h, self._terrace_step_world(), a.terrace_ramp, a.terrace_mode)
+
+    def _get_raw_heights_batch(self, world_x: np.ndarray, world_z: np.ndarray) -> np.ndarray:
+        x = (world_x - self.offset_x) / self.mesh_scale
+        z = (world_z - self.offset_z) / self.mesh_scale
+        height = self.features.get_rolling_hills_batch(x, z, self.biome.hills_scale)
+        height = height * self.biome.hills_intensity
+        if self.biome.mountains_enabled:
+            mountain_h = self.features.get_mountains_batch(x, z, self.biome.mountains_scale, self.biome.mountains_sharpness)
+            height = height + mountain_h * self.biome.mountains_intensity
+        if self.biome.valleys_enabled:
+            valley = self.features.get_valleys_batch(x, z, self.biome.valleys_scale, self.biome.valleys_depth)
+            height = height + valley
+        if self.biome.plateaus_enabled:
+            plateau_h = self.features.get_plateaus_batch(x, z, self.biome.plateaus_scale, self.biome.plateaus_flatness)
+            height = height + plateau_h * self.biome.plateaus_intensity
+        height = (height + 1.0) * 0.5
+        height = np.clip(height, 0.0, 1.0)
+        result = self.biome.base_height + height * self.biome.height_scale + self.offset_y
+        # Keep the generator in terrain-space; physical scaling is applied once
+        # after all height sources have been combined.
+        result = result + self._sample_heightmap_batch(world_x, world_z, result)
+        result = result + self._sample_sculpt_batch(world_x, world_z)
+        result = result * self.mesh_scale
+        return self._apply_csg_subtractions_batch(world_x, world_z, result)
+    
+    def _get_colors_batch(self, heights: np.ndarray, normalized_heights: np.ndarray) -> np.ndarray:
+        colors = self.biome.color_gradient
+        if not colors:
+            return np.full((len(heights), 3), 0.5, dtype=np.float32)
+        h = np.clip(normalized_heights, 0.0, 1.0)
+        result = np.zeros((len(h), 3), dtype=np.float32)
+        for i in range(len(colors) - 1):
+            h0, c0 = colors[i]
+            h1, c1 = colors[i + 1]
+            mask = (h >= h0) & (h <= h1)
+            if not np.any(mask): continue
+            if h1 > h0:
+                t = np.asarray((h[mask] - h0) / (h1 - h0), dtype=np.float32)
+            else:
+                t = np.zeros(np.count_nonzero(mask), dtype=np.float32)
+            for j in range(3):
+                result[mask, j] = c0[j] + t * (c1[j] - c0[j])
+        last_h, last_c = colors[-1]
+        above_mask = h > last_h
+        if np.any(above_mask):
+            result[above_mask] = last_c
+        return result
+    
+    def _chunk_heights(self, slot: int, resolution: int) -> np.ndarray:
+        """The bordered height grid of a table slot.
+
+        The one heightfield per chunk: the renderer draws it and collision
+        reads it. The drawn ``(resolution + 1)^2`` grid is sampled at exactly
+        the float32 grid positions the mesh has always used, so its heights are
+        bit-for-bit the ones it was built from; ``GRID_BORDER`` more samples,
+        at the same spacing, run beyond each edge for the smooth normals.
+        """
+        table = self.table
+        return self._grid_heights(float(table.world[slot, 0]),
+                                  float(table.world[slot, 1]),
+                                  float(table.size[slot]), resolution)
+
+    def _grid_heights(self, base_x: float, base_z: float, size: float,
+                      resolution: int) -> np.ndarray:
+        """The bordered grid of a chunk with origin (*base_x*, *base_z*) and
+        edge *size*: :meth:`_chunk_heights` without the table, so the builder
+        thread can run it from numbers taken when the build was asked for."""
+        step = size / resolution
+        b = GRID_BORDER
+        m = resolution + 1 + 2 * b
+
+        ix_vals = np.arange(-b, resolution + 1 + b, dtype=np.float32)
+        iz_vals = np.arange(-b, resolution + 1 + b, dtype=np.float32)
+        ix_grid, iz_grid = np.meshgrid(ix_vals, iz_vals, indexing='ij')
+
+        wx = base_x + ix_grid * step
+        wz = base_z + iz_grid * step
+
+        wx_flat = wx.flatten().astype(np.float32)
+        wz_flat = wz.flatten().astype(np.float32)
+
+        # --- FIXED: Use real heights even in flat mode ---
+        heights_flat = self._get_heights_batch(wx_flat, wz_flat)
+        return heights_flat.reshape((m, m))
+
+
+    # -- Blocks ---------------------------------------------------------------
+
+    def _block_mesh(self, slot: int) -> np.ndarray:
+        """Vertex data (N, 14) of one chunk's land columns and their walls."""
+        table = self.table
+        lo, hi = self._layer_height_range()
+        span = max(hi - lo, 1e-3)
+
+        def colors(h):
+            if self.flat_mode:
+                return np.full((len(h), 3), 0.7, dtype=np.float32)
+            return self._get_colors_batch(h, (h - lo) / span)
+
+        (min_x, max_x), (min_z, max_z) = self.get_terrain_bounds()
+        floor_height = None
+        if self.appearance.skirt:
+            floor_height = lo - 2.0 * self._terrace_step_world()
+        vertices, _, _ = terrain_style.build_block_mesh(
+            float(table.world[slot, 0]), float(table.world[slot, 1]),
+            float(table.size[slot]), self._block_world_size(),
+            self.offset_x, self.offset_z, self._get_heights_batch, colors,
+            (min_x, max_x, min_z, max_z), floor_height, self.TILING_SCALE)
+        return vertices
+
+
+
+
+    # -- GPU heightfield --------------------------------------------------
+
+
+
+    def gradient_uniforms(self):
+        """``(count, H, C, W, D)``: the biome gradient as the shader reads it.
+
+        Each value is cast the way the old NumPy colour code cast it: stop
+        heights and colours to float32, and per segment the width ``h1 - h0``
+        (0 when ``h1 <= h0``) and the colour delta ``c1 - c0`` computed in
+        double precision and then rounded once to float32.
+        """
+        stops = list(self.biome.color_gradient or ())
+        limit = self.MAX_GRADIENT_STOPS
+        if len(stops) > limit and not self._gradient_warned:
+            print(f"[Terrain] colour gradient has {len(stops)} stops; the "
+                  f"heightfield shader uses the first {limit}")
+            self._gradient_warned = True
+        stops = stops[:limit]
+        H = np.zeros(limit, dtype=np.float32)
+        C = np.zeros((limit, 3), dtype=np.float32)
+        W = np.zeros(limit, dtype=np.float32)
+        D = np.zeros((limit, 3), dtype=np.float32)
+        for i, (h, c) in enumerate(stops):
+            H[i] = h
+            C[i] = [c[0], c[1], c[2]]
+        for i in range(len(stops) - 1):
+            h0, c0 = stops[i]
+            h1, c1 = stops[i + 1]
+            W[i] = (h1 - h0) if h1 > h0 else 0.0
+            D[i] = [c1[j] - c0[j] for j in range(3)]
+        return len(stops), H, C, W, D
+
+
+
+
+
+    def _generate_grass_blades(self, slot: int) -> np.ndarray:
+        """Deterministic per-blade instance records ``(x, y, z, size, yaw, tint)``.
+
+        Tufts are scattered over the chunk and each spreads a handful of
+        blades around its centre, so a field reads as clumps rather than an
+        even carpet. Every blade root is sampled on the (possibly terraced)
+        surface. Tufts are dropped on steep ground, outside the grass height
+        layer (high rock and snow, low sand) and in broad noise clearings.
+        """
+        table = self.table
+        size = float(table.size[slot])
+        limit = self.GRASS_MAX_PER_CHUNK
+        if self.grass_density > LEGACY_GRASS_DENSITY_MAX:
+            limit = int(limit * (self.grass_density / LEGACY_GRASS_DENSITY_MAX))
+        tufts = min(
+            limit,
+            int(max(0.0, self.grass_density) * size * size)
+        )
+        if tufts <= 0:
+            return np.empty((0, 9), dtype=np.float32)
+
+        seed = (
+            (int(self.seed) * 73856093)
+            ^ (int(table.coord[slot, 0]) * 19349663)
+            ^ (int(table.coord[slot, 1]) * 83492791)
+        ) & 0xFFFFFFFF
+        rng = np.random.default_rng(seed)
+        tx = float(table.world[slot, 0]) + rng.random(tufts) * size
+        tz = float(table.world[slot, 1]) + rng.random(tufts) * size
+        edge_roll = rng.random(tufts)
+
+        # Slope from the unterraced surface: terrace risers are a styling of
+        # the ground, not cliffs, and should not strip the grass off a hill.
+        eps = 1.0
+        h0 = self._get_raw_heights_batch(tx, tz)
+        gx = (self._get_raw_heights_batch(tx + eps, tz) - h0) / eps
+        gz = (self._get_raw_heights_batch(tx, tz + eps) - h0) / eps
+        normal_y = 1.0 / np.sqrt(1.0 + gx * gx + gz * gz)
+        keep = normal_y >= self.GRASS_MIN_NORMAL_Y
+        # Grass grows only between its lowest and highest height - by
+        # default the grass texture layer, so never on the high rock and
+        # snow nor down on the sand - thinning out across each edge.
+        low, high = self.grass_height_bounds()
+        weight = terrain_style.grass_layer_weight(
+            self._normalized_layer_height(h0), (low, high, 1.0),
+            self.appearance.layer_blend * 2.0)
+        # Broad clearings so a meadow is never an even carpet.
+        clearing = self.noise.noise2d_batch(
+            (tx - self.offset_x) * 0.0035 + 91.7, (tz - self.offset_z) * 0.0035 - 13.3)
+        weight = weight * np.clip((clearing + 0.3) / 0.45, 0.0, 1.0)
+        keep &= edge_roll < weight
+        tx = tx[keep]
+        tz = tz[keep]
+        tuft_raw = h0[keep]
+        tuft_slope = 1.0 - normal_y[keep]
+        if len(tx) == 0:
+            return np.empty((0, 9), dtype=np.float32)
+
+        per_tuft = self.GRASS_BLADES_PER_TUFT
+        count = len(tx) * per_tuft
+        angle = rng.uniform(0.0, 6.2831853, count)
+        radius = np.sqrt(rng.random(count)) * self.GRASS_TUFT_RADIUS
+        bx = np.repeat(tx, per_tuft) + np.cos(angle) * radius
+        bz = np.repeat(tz, per_tuft) + np.sin(angle) * radius
+
+        size_roll = rng.uniform(0.65, 1.25, count)
+        yaw_roll = rng.uniform(0.0, 6.2831853, count)
+        tint_roll = rng.uniform(0.82, 1.12, count)
+        # No grass on painted ground: a stamp or a painted path is a
+        # clearing. Blade by blade, so the edge of the paint is the edge of
+        # the grass, thinning out across a feathered one. (Drawn after the
+        # rolls above, so painting changes no other blade.)
+        if self.texture_paint_maps:
+            # Asked at the blade's published (float32) position and rolled
+            # from it, so thinning the published blades under a new stamp
+            # (_thin_grass) keeps exactly the blades a rebuild would.
+            px, pz = bx.astype(np.float32), bz.astype(np.float32)
+            covered = self._paint_cover_at(px.astype(np.float64), pz.astype(np.float64))
+            if covered is not None:
+                grows = self._grass_grow_roll(px, pz) >= covered
+                if not np.all(grows):
+                    bx, bz = bx[grows], bz[grows]
+                    size_roll, yaw_roll, tint_roll = (
+                        size_roll[grows], yaw_roll[grows], tint_roll[grows])
+                    tuft_of = np.repeat(np.arange(len(tx)), per_tuft)[grows]
+                    tuft_raw, tuft_slope = tuft_raw[tuft_of], tuft_slope[tuft_of]
+                    per_tuft, count = 1, len(bx)
+                    if count == 0:
+                        return np.empty((0, 9), dtype=np.float32)
+
+        data = np.empty((count, 9), dtype=np.float32)
+        data[:, 0] = bx
+        data[:, 1] = self._get_heights_batch(bx, bz)
+        data[:, 2] = bz
+        data[:, 3] = size_roll
+        data[:, 4] = yaw_roll
+        data[:, 5] = tint_roll
+        # The colour of the ground each blade stands on, for grass that
+        # matches the terrain (the default until a blade colour is chosen).
+        data[:, 6:9] = self._ground_colors(
+            slot, data[:, 1], np.repeat(tuft_raw, per_tuft),
+            np.repeat(tuft_slope, per_tuft))
+        return data
+
+    @staticmethod
+    def _grass_grow_roll(x, z):
+        """A blade's fixed roll in 0..1 against the paint over it, from its
+        position alone: paint more over it and the same blades go."""
+        v = np.sin(x.astype(np.float64) * 12.9898 + z.astype(np.float64) * 78.233) * 43758.5453
+        return v - np.floor(v)
+
+    def _thin_grass(self, slot: int):
+        """A stamp was added over this chunk and nothing else changed: paint
+        only ever covers more, so its grass is the grass it has without the
+        blades now under paint. Costs a paint lookup per blade instead of
+        growing the chunk again (noise heights for every tuft and blade).
+        ``None`` when the chunk has no current grass to thin."""
+        held = self.products.grass.get(int(slot))
+        if held is None or held[1] != int(self.table.order[slot]):
+            return None
+        blades = held[2]
+        if not len(blades):
+            return blades
+        covered = self._paint_cover_at(blades[:, 0].astype(np.float64),
+                                       blades[:, 2].astype(np.float64))
+        if covered is None:
+            return blades
+        grows = self._grass_grow_roll(blades[:, 0], blades[:, 2]) >= covered
+        return blades if np.all(grows) else blades[grows]
+
+    def _paint_cover_at(self, x, z):
+        """How covered by paint the ground is at world points, 0..1 (the
+        stored paint's alpha); None when none of their chunks is painted."""
+        res = self.TERRAIN_PAINT_RESOLUTION
+        cs = float(self.chunk_size)
+        fx = (np.asarray(x, dtype=np.float64) - self.offset_x) / cs
+        fz = (np.asarray(z, dtype=np.float64) - self.offset_z) / cs
+        cx = np.floor(fx).astype(np.int64)
+        cz = np.floor(fz).astype(np.int64)
+        out = None
+        maps = self.texture_paint_maps
+        for key in {(int(a), int(b)) for a, b in zip(cx.tolist(), cz.tolist())}:
+            paint = maps.get(key)
+            if paint is None:
+                continue
+            here = (cx == key[0]) & (cz == key[1])
+            ix = np.clip(((fx[here] - key[0]) * res).astype(np.int64), 0, res - 1)
+            iz = np.clip(((fz[here] - key[1]) * res).astype(np.int64), 0, res - 1)
+            if out is None:
+                out = np.zeros(len(fx), dtype=np.float32)
+            out[here] = paint[ix, iz, 3] * np.float32(1.0 / 255.0)
+        return out
+
+    def _paint_changed_grass(self, keys):
+        """The stored paint of chunks *keys* changed: their grass is due."""
+        if not self.grass_enabled or not keys:
+            return
+        table = self.table
+        cap = table._capacity
+        coords = table.coord[:cap]
+        live = table.live[:cap]
+        dirty = table.grass_dirty[:cap]
+        thin = self._grass_thin
+        added_only = self._paint_added_only
+        for cx, cz in keys:
+            hit = live & (coords[:, 0] == cx) & (coords[:, 1] == cz)
+            for slot in np.flatnonzero(hit).tolist():
+                if added_only and (not dirty[slot] or slot in thin):
+                    # Its grass is current but for this stamp: thin it.
+                    thin[slot] = (int(table.order[slot]), table.grass_epoch)
+                else:
+                    thin.pop(slot, None)
+            dirty[hit] = True
+
+    def _ground_colors(self, slot: int, y: np.ndarray, raw: np.ndarray,
+                       slope: np.ndarray) -> np.ndarray:
+        """Base colour terrain.frag paints at points on this chunk.
+
+        *y* is the drawn (possibly terraced) height, *raw* the unterraced one
+        and *slope* ``1 - normal.y``. Colour details (contours, patches,
+        tile variation) and lighting are left out: this is the albedo.
+        """
+        n = len(y)
+        a = self.appearance
+        if self.flat_mode:
+            return np.full((n, 3), 0.7, dtype=np.float32)
+        if a.color_mode in ('palette', 'bands'):
+            out = terrain_style.palette_ground_colors(
+                a, y, self._layer_height_range(), self.mesh_scale)
+            return np.clip(out, 0.0, 1.0).astype(np.float32)
+        if self._textures_active():
+            averages = terrain_style.terrain_texture_averages()
+            if averages is not None:
+                out = terrain_style.textured_ground_colors(
+                    self._normalized_layer_height(raw), slope,
+                    self._layer_heights(), a.layer_blend, a.slope_rock, averages)
+                return np.clip(out, 0.0, 1.0).astype(np.float32)
+        # Biome vertex colours, normalised by the chunk's own height range as
+        # terrain.vert does.
+        table = self.table
+        lo, hi = float(table.min_y[slot]), float(table.max_y[slot])
+        if not table.built[slot] or hi <= lo:
+            lo, hi = self._layer_height_range()
+        out = self._get_colors_batch(y, (np.asarray(y) - lo) / max(hi - lo, 1e-3)) * 1.1
+        return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+
+
+    def _get_lod_resolution(self, dist_sq: float) -> int:
+        for i, threshold in enumerate(self.LOD_DISTANCES_SQ):
+            if dist_sq < threshold:
+                return self.LOD_RESOLUTIONS[i]
+        return self.LOD_RESOLUTIONS[-1]
+
+    def _near_detail_radius(self) -> float:
+        """Radius of the protected full-detail zone for this frame.
+
+        :data:`NEAR_DETAIL_RADIUS` normally, but never wider than the stream
+        radius while streaming: a chunk outside the stream radius is evicted,
+        so protecting it only forced chunks to be resident that the streamer
+        was told not to keep.
+        """
+        if self.streaming and self.stream_radius > 0.0:
+            return min(self.NEAR_DETAIL_RADIUS, float(self.stream_radius))
+        return self.NEAR_DETAIL_RADIUS
+
+
+    # -- publication (engine/terrain_frame.py) -----------------------------
+
+    def publish(self) -> TerrainFrame:
+        """This frame's terrain, as a renderer may see it: the dense table,
+        the per-slot products and paint maps, and the appearance as numbers.
+        Immutable; nothing in it leads back to this object."""
+        return TerrainFrame(
+            key=self._publication_key, enabled=bool(self.enabled),
+            table=self.table, products=self.products,
+            flat_mode=bool(self.flat_mode), wireframe=bool(self.wireframe),
+            use_textures=bool(getattr(self, 'use_textures', True)),
+            blocks=self.appearance.terrace_mode == 'blocks',
+            appearance=read_only(self.appearance_uniforms()),
+            gradient=self.gradient_uniforms(),
+            tiling=self.TILING_SCALE,
+            grass_enabled=bool(self.grass_enabled),
+            grass_color=tuple(self.grass_color),
+            grass_tip_colour=tuple(self.grass_tip_colour()),
+            grass_match_ground=not self.grass_color_custom,
+            grass_tip_auto=self.grass_tip_color is None,
+            grass_height=float(self.grass_height),
+            grass_lod_start=self.GRASS_LOD_START,
+            grass_lod_distance=self.GRASS_LOD_DISTANCE,
+            grass_fade_start=self.GRASS_FADE_START,
+            grass_max_distance=self.GRASS_MAX_DISTANCE,
+            grass_segments=self.GRASS_SEGMENTS,
+            grass_blade_width=self.GRASS_BLADE_WIDTH,
+            paint_display=read_only(self._paint_display),
+            paint_maps=read_only(self.texture_paint_maps),
+            paint_versions=read_only(self._paint_map_versions),
+            paint_epoch=self._paint_epoch,
+            paint_resolution=self.TERRAIN_PAINT_RESOLUTION,
+            paint_page_layers=self.PAINT_PAGE_LAYERS,
+            height_page_layers=self.HEIGHT_PAGE_LAYERS,
+            max_gradient_stops=self.MAX_GRADIENT_STOPS,
+            triangle_count=self.table.triangle_count())
+
+    def _released(self, slots):
+        """Table slots were freed: their published products go with them. (A
+        renderer frees what it built for a slot when it next sees the table.)"""
+        if len(slots):
+            self.products.drop(slots)
+            for slot in slots:
+                self._building.pop(int(slot), None)
+
+    def cleanup(self):
+        """Drop every chunk. No GL here: a renderer's side goes with the
+        publication key, which a cleaned-up terrain no longer offers."""
+        self.stop_builder()
+        self._released(self.table.clear())
+        self.products.clear_store(self.products.grass)
+        self.products.clear_store(self.products.blocks)
+
+    # -- upkeep: what exists, at what detail, built (no GL) -------------------
+
+    def advance(self, camera_pos, frustum_planes=None):
+        """Bring the published terrain up to date for a camera, before the
+        frame is drawn: stream chunks in and out, advance the LOD hysteresis,
+        and build what is due -- height grids (inline within the frame's
+        budget, or on the builder thread when :attr:`BACKGROUND_BUILDS`), then
+        block meshes and grass. Everything it writes is what
+        :meth:`publish` hands a renderer; it makes no GL call."""
+        if not self.enabled:
+            return
+        if self._pending_prune:
+            self._remove_out_of_bounds_chunks()
+            self._pending_prune = False
+        # Rows made before the chunk size or offset changed (from_dict on a
+        # terrain that already drew a frame, or an offset edit) would hold
+        # their chunk indices at the old geometry for good.
+        self._released(self.table.prune_stale_geometry(
+            self.chunk_size, self.offset_x, self.offset_z))
+        if self.streaming:
+            # The stream radius is the caller's to set (Big World derives it
+            # from its activation radius) and is not inflated here; the
+            # protected zone shrinks to it instead (_near_detail_radius()).
+            self._stream_chunks(camera_pos)
+        else:
+            self.table.ensure_bounds(self._chunk_bounds(), self.chunk_size,
+                                     self.offset_x, self.offset_z)
+        table = self.table
+        self._collect_built()
+        slots = table.live_slots()
+        cam_x = float(camera_pos.x)
+        cam_z = float(camera_pos.z)
+        # The frustum only orders the work: mesh upkeep runs for every
+        # resident chunk, so turning round never exposes one that was skipped
+        # while it was behind the camera. Nearest chunk-point distance, so an
+        # edge cannot drop LOD while it is still inside the protected radius.
+        visible = table.visible(slots, frustum_planes)
+        dist_sq = table.nearest_dist_sq(slots, cam_x, cam_z)
+        queue_slots, queue_res = table.schedule(
+            slots, dist_sq, visible, self._near_detail_radius(),
+            self.LOD_RESOLUTIONS, self.LOD_DISTANCES_SQ,
+            self.LOD_HYSTERESIS_FRAMES)
+        if self.BACKGROUND_BUILDS:
+            self._request_builds(queue_slots, queue_res)
+        else:
+            # Dirty meshes first, then what the camera can see, nearest first.
+            budget_end = time.perf_counter() + self.UPDATE_BUDGET_MS / 1000.0
+            limit = self.MAX_UPDATES_PER_FRAME
+            for i, (slot, resolution) in enumerate(zip(queue_slots[:limit], queue_res[:limit])):
+                if i and time.perf_counter() >= budget_end:
+                    break
+                self._build_chunk(int(slot), int(resolution))
+
+        # Grass has its own dirty queue, built in the same bounded fashion,
+        # so moving the density slider cannot spike a frame by rebuilding
+        # every resident chunk at once.
+        if self.grass_enabled:
+            grass_updates = slots[table.grass_dirty[slots] & table.built[slots]]
+            for slot in grass_updates[:self.MAX_UPDATES_PER_FRAME]:
+                self._build_grass(int(slot))
+        elif self.products.grass:
+            self.products.clear_store(self.products.grass)
+
+    def _store_heights(self, slot: int, resolution: int, heights):
+        lod_index = (self.LOD_RESOLUTIONS.index(resolution)
+                     if resolution in self.LOD_RESOLUTIONS else 0)
+        self.table.store(slot, resolution, lod_index, heights)
+        if self.appearance.terrace_mode == 'blocks':
+            self.products.put(self.products.blocks, slot,
+                              self.table.order[slot], self._block_mesh(slot))
+
+    def _build_chunk(self, slot: int, resolution: int):
+        """Build one chunk at *resolution*, here and now: its height grid --
+        the whole of a chunk, from which the vertex shader rebuilds position,
+        normals, colour and UVs -- and, terraced as blocks, its mesh."""
+        self._store_heights(slot, resolution, self._chunk_heights(slot, resolution))
+
+    def _build_grass(self, slot: int):
+        """Publish one chunk's deterministic grass instances."""
+        blades = None
+        thin = self._grass_thin.pop(int(slot), None)
+        if thin == (int(self.table.order[slot]), self.table.grass_epoch):
+            blades = self._thin_grass(slot)
+        if blades is None:
+            blades = self._generate_grass_blades(slot)
+        self.products.put(self.products.grass, slot, self.table.order[slot], blades)
+        self.table.grass_dirty[slot] = False
+
+    # -- the builder thread ---------------------------------------------------
+
+    def _request_builds(self, queue_slots, queue_res):
+        """Hand the build queue to the builder thread, nearest work first.
+
+        Only the height grid is computed there, from the chunk's frozen
+        origin and size; the table is written back here, on the caller's
+        thread, by :meth:`_collect_built`, so every table write stays on one
+        thread. A slot waits at most once in the queue."""
+        table = self.table
+        for slot, resolution in zip(queue_slots.tolist(), queue_res.tolist()):
+            if slot in self._building or len(self._building) >= self.BUILD_QUEUE_LIMIT:
+                continue
+            order = int(table.order[slot])
+            self._building[slot] = order
+            # An edit that arrives while this is in flight must dirty the
+            # row again: clear the flag now, restore whatever it is on return.
+            table.dirty[slot] = False
+            self._build_requests.put((slot, order, int(resolution),
+                                      float(table.world[slot, 0]),
+                                      float(table.world[slot, 1]),
+                                      float(table.size[slot])))
+        if self._building and (self._builder is None or not self._builder.is_alive()):
+            self._builder_stop = False
+            self._builder = threading.Thread(
+                target=self._builder_loop, name='TerrainBuilder', daemon=True)
+            self._builder.start()
+
+    def _builder_loop(self):
+        requests, results = self._build_requests, self._build_results
+        while not self._builder_stop:
+            try:
+                job = requests.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if job is None:                     # stop_builder's wake-up
+                break
+            slot, order, resolution, world_x, world_z, size = job
+            try:
+                heights = self._grid_heights(world_x, world_z, size, resolution)
+            except Exception:
+                # The editor changed what the heights are read from mid-build
+                # (a sculpt array resized): the row stays unbuilt or is
+                # dirtied again by that edit, and is asked for next frame.
+                # A real bug would fail the same way every frame with nothing
+                # shown, so each distinct error is printed once.
+                heights = None
+                import traceback
+                trace = traceback.format_exc()
+                key = trace.strip().splitlines()[-1]
+                if key != getattr(self, '_last_build_error', None):
+                    self._last_build_error = key
+                    sys.stderr.write("TerrainBuilder: building a height grid failed:\n" + trace)
+            results.put((slot, order, resolution, heights))
+
+    def _collect_built(self):
+        """Store the grids the builder thread has finished (this thread)."""
+        table = self.table
+        while True:
+            try:
+                slot, order, resolution, heights = self._build_results.get_nowait()
+            except queue.Empty:
+                return
+            if self._building.get(slot) == order:
+                del self._building[slot]
+            if (heights is None or slot >= table.capacity or not table.live[slot]
+                    or int(table.order[slot]) != order):
+                if (heights is None and slot < table.capacity and table.live[slot]
+                        and int(table.order[slot]) == order):
+                    table.dirty[slot] = True
+                continue
+            edited = bool(table.dirty[slot])
+            self._store_heights(slot, resolution, heights)
+            table.dirty[slot] = edited
+
+    def stop_builder(self):
+        """Stop the builder thread and forget what it was asked for."""
+        self._builder_stop = True
+        builder, self._builder = self._builder, None
+        if builder is not None and builder.is_alive() \
+                and builder is not threading.current_thread():
+            self._build_requests.put(None)
+            builder.join(2.0)
+        for q in (self._build_requests, self._build_results):
+            while True:
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
+        table = self.table
+        for slot, order in self._building.items():
+            if slot < table.capacity and table.live[slot] and int(table.order[slot]) == order:
+                table.dirty[slot] = True
+        self._building.clear()
+
+    def builds_pending(self) -> int:
+        """Grids asked of the builder thread and not yet stored."""
+        return len(self._building)
+
+
+    def get_2d_contours(self, axis1: str, axis2: str, view_bounds: Tuple[float, float, float, float], resolution: int = 32) -> List[Tuple[List[float], List[float], float]]:
+        if not self.enabled: return []
+        min1, max1, min2, max2 = view_bounds
+        contours = []
+        if axis1 == 'x' and axis2 == 'z':
+            t_bounds = self.get_terrain_bounds()
+            t_min_x, t_max_x = t_bounds[0]
+            t_min_z, t_max_z = t_bounds[1]
+            sample_min_x = max(min1, t_min_x)
+            sample_max_x = min(max1, t_max_x)
+            sample_min_z = max(min2, t_min_z)
+            sample_max_z = min(max2, t_max_z)
+            if sample_max_x <= sample_min_x or sample_max_z <= sample_min_z: return []
+            boundary_x = []
+            boundary_z = []
+            for x in np.linspace(sample_min_x, sample_max_x, resolution):
+                boundary_x.append(x); boundary_z.append(sample_min_z)
+            for z in np.linspace(sample_min_z, sample_max_z, resolution):
+                boundary_x.append(sample_max_x); boundary_z.append(z)
+            for x in np.linspace(sample_max_x, sample_min_x, resolution):
+                boundary_x.append(x); boundary_z.append(sample_max_z)
+            for z in np.linspace(sample_max_z, sample_min_z, resolution):
+                boundary_x.append(sample_min_x); boundary_z.append(z)
+            if boundary_x: contours.append((boundary_x, boundary_z, 0))
+        elif axis1 == 'x' and axis2 == 'y':
+            t_bounds = self.get_terrain_bounds()
+            t_min_x, t_max_x = t_bounds[0]
+            t_min_z, t_max_z = t_bounds[1]
+            center_z = (t_min_z + t_max_z) / 2
+            sample_min_x = max(min1, t_min_x)
+            sample_max_x = min(max1, t_max_x)
+            if sample_max_x > sample_min_x:
+                xs = []
+                ys = []
+                for x in np.linspace(sample_min_x, sample_max_x, resolution * 2):
+                    h = self.get_height_at(x, center_z)
+                    xs.append(x)
+                    ys.append(h)
+                if xs: contours.append((xs, ys, center_z))
+        elif axis1 == 'z' and axis2 == 'y':
+            t_bounds = self.get_terrain_bounds()
+            t_min_x, t_max_x = t_bounds[0]
+            t_min_z, t_max_z = t_bounds[1]
+            center_x = (t_min_x + t_max_x) / 2
+            sample_min_z = max(min1, t_min_z)
+            sample_max_z = min(max1, t_max_z)
+            if sample_max_z > sample_min_z:
+                zs = []
+                ys = []
+                for z in np.linspace(sample_min_z, sample_max_z, resolution * 2):
+                    h = self.get_height_at(center_x, z)
+                    zs.append(z)
+                    ys.append(h)
+                if zs: contours.append((zs, ys, center_x))
+        return contours
+    
+    def generate_trees(self) -> List[Tuple[float, float, float]]:
+        self.tree_positions = []
+        if self.biome.tree_density <= 0: return []
+        data = self.generate_tree_data()
+        self.tree_positions = [tuple(d['pos']) for d in data]
+        return self.tree_positions
+
+    def generate_tree_data(self) -> List[Dict]:
+        if not self.biome.trees_enabled or self.biome.tree_density <= 0: return []
+        trees = []
+        random.seed(self.seed + 12345) 
+        chunk_width_units = self.chunk_size
+        world_min_x = self.min_chunk_x * chunk_width_units + self.offset_x
+        world_max_x = (self.max_chunk_x + 1) * chunk_width_units + self.offset_x
+        world_min_z = self.min_chunk_z * chunk_width_units + self.offset_z
+        world_max_z = (self.max_chunk_z + 1) * chunk_width_units + self.offset_z
+        width = world_max_x - world_min_x
+        depth = world_max_z - world_min_z
+        area = abs(width * depth)
+        if area <= 0: return []
+        count = int(area * 0.01 * self.biome.tree_density)
+        tree_options = [{"path": "assets/models/LowPoly_Tree_v1.obj", "rot": [270, 0, 0]}, {"path": "assets/models/Tree low.obj", "rot": [0, 0, 0]}]
+        for _ in range(count):
+            tx = random.uniform(world_min_x, world_max_x)
+            tz = random.uniform(world_min_z, world_max_z)
+            ty = self.get_height_at(tx, tz)
+            if ty < self.biome.base_height + 2: continue
+            model_def = random.choice(tree_options)
+            s = random.uniform(0.5, 1.0)
+            trees.append({"model_path": model_def["path"], "pos": [tx, ty, tz], "rotation": list(model_def["rot"]), "scale": [s, s, s]})
+        return trees
+    
+    # =========================================================================
+    # SCULPT DEFORMATION
+    # =========================================================================
+
+    def _sample_sculpt_scalar(self, world_x: float, world_z: float) -> float:
+        """Get interpolated sculpt offset at a world position."""
+        if not self.sculpt_offsets:
+            return 0.0
+        res = self.sculpt_grid_resolution
+        gx_f = world_x / res
+        gz_f = world_z / res
+        gx0 = int(math.floor(gx_f))
+        gz0 = int(math.floor(gz_f))
+        fx = gx_f - gx0
+        fz = gz_f - gz0
+        h00 = self.sculpt_offsets.get((gx0, gz0), 0.0)
+        h10 = self.sculpt_offsets.get((gx0 + 1, gz0), 0.0)
+        h01 = self.sculpt_offsets.get((gx0, gz0 + 1), 0.0)
+        h11 = self.sculpt_offsets.get((gx0 + 1, gz0 + 1), 0.0)
+        top = h00 + fx * (h10 - h00)
+        bot = h01 + fx * (h11 - h01)
+        return top + fz * (bot - top)
+
+    #: Largest sculpt bounding box (grid cells) packed into a dense array for
+    #: vectorised sampling -- 16M float32 cells is 64 MB. A sparser, wider
+    #: sculpt falls back to per-point dictionary lookups.
+    MAX_DENSE_SCULPT_CELLS = 16 * 1024 * 1024
+
+    def _sculpt_key(self):
+        """What the cached sculpt forms (dense grid, serialised list) are of."""
+        offsets = self.sculpt_offsets
+        return (id(offsets), len(offsets), getattr(self, '_sculpt_version', 0))
+
+    def _touch_sculpt(self):
+        """Invalidate the dense sculpt grid and the saved sculpt tiles; call
+        after any sculpt change."""
+        self._sculpt_version = getattr(self, '_sculpt_version', 0) + 1
+        self._sculpt_cache = None
+        self._sculpt_tile_cache = None
+
+    def _touch_sculpt_rect(self, before, gx0, gz0, gx1, gz1):
+        """Like :meth:`_touch_sculpt` for an edit confined to grid cells
+        ``gx0..gx1`` x ``gz0..gz1`` (inclusive); ``before`` is
+        :meth:`_sculpt_key` taken just before the edit.
+
+        A brush dab changes a few hundred cells, and rebuilding the dense grid
+        for it re-read the whole sculpt dict -- 150 ms at a million cells, on
+        the first sample after every dab of a drag. Instead the dab's
+        rectangle is copied from the dict into the grid in place. A dab past
+        the grid's edge grows it with a margin, so a drag along the edge does
+        not regrow it every dab. The padding is zeros, which sample exactly as
+        "not sculpted" does, so heights match a full rebuild bit for bit.
+
+        A chunk the builder thread is sampling meanwhile may see some of the
+        rectangle's cells old and some new; the dab has dirtied that chunk
+        (:meth:`_mark_sculpt_region_dirty`), so it is built again.
+
+        The saved form is kept the same way: only the tiles under the
+        rectangle are encoded again, by the next :meth:`to_dict`.
+        """
+        cache = getattr(self, '_sculpt_cache', None)
+        self._sculpt_version = getattr(self, '_sculpt_version', 0) + 1
+        tiles = getattr(self, '_sculpt_tile_cache', None)
+        if tiles is not None and tiles[0] == before:
+            shift = self.SCULPT_TILE_SHIFT
+            tiles[2].update((tx, tz)
+                            for tx in range(gx0 >> shift, (gx1 >> shift) + 1)
+                            for tz in range(gz0 >> shift, (gz1 >> shift) + 1))
+            self._sculpt_tile_cache = (self._sculpt_key(), tiles[1], tiles[2], None)
+        else:
+            self._sculpt_tile_cache = None
+        if cache is None or cache[0] != before or cache[1] is None:
+            # Not built, already stale, or too wide for a dense grid: left
+            # to the next sample's full rebuild, which decides afresh.
+            self._sculpt_cache = None
+            return
+        min_gx, min_gz, grid = cache[1]
+        w, h = grid.shape
+        if (gx0 < min_gx or gz0 < min_gz
+                or gx1 >= min_gx + w or gz1 >= min_gz + h):
+            grown = self._grow_dense_sculpt(min_gx, min_gz, grid, gx0, gz0, gx1, gz1)
+            if grown is None:
+                self._sculpt_cache = None
+                return
+            min_gx, min_gz, grid = grown
+        get = self.sculpt_offsets.get
+        rw, rh = gx1 - gx0 + 1, gz1 - gz0 + 1
+        block = np.fromiter(
+            (get((gx, gz), 0.0) for gx in range(gx0, gx1 + 1)
+             for gz in range(gz0, gz1 + 1)),
+            dtype=np.float32, count=rw * rh).reshape(rw, rh)
+        grid[gx0 - min_gx:gx1 - min_gx + 1, gz0 - min_gz:gz1 - min_gz + 1] = block
+        self._sculpt_cache = (self._sculpt_key(), (min_gx, min_gz, grid))
+
+    def _grow_dense_sculpt(self, min_gx, min_gz, grid, gx0, gz0, gx1, gz1):
+        """``(min_gx, min_gz, grid)`` widened to hold cells ``gx0..gx1`` x
+        ``gz0..gz1``, or None when that would not fit a dense grid.
+
+        Each side that has to move moves half the grid's span again past the
+        cells, so growth is geometric; without the margin if that is what
+        fits. None when even the bare union is too big: the old grid can be
+        wider than what is sculpted now (margin, flattened-away cells), so
+        the full rebuild measures the true bounding box and decides.
+        """
+        w, h = grid.shape
+        max_gx, max_gz = min_gx + w - 1, min_gz + h - 1
+        lo_x, hi_x = min(min_gx, gx0), max(max_gx, gx1)
+        lo_z, hi_z = min(min_gz, gz0), max(max_gz, gz1)
+        pad_x, pad_z = (hi_x - lo_x + 1) // 2, (hi_z - lo_z + 1) // 2
+        padded = (lo_x - (pad_x if gx0 < min_gx else 0),
+                  lo_z - (pad_z if gz0 < min_gz else 0),
+                  hi_x + (pad_x if gx1 > max_gx else 0),
+                  hi_z + (pad_z if gz1 > max_gz else 0))
+        for nx0, nz0, nx1, nz1 in (padded, (lo_x, lo_z, hi_x, hi_z)):
+            nw, nh = nx1 - nx0 + 1, nz1 - nz0 + 1
+            if nw * nh <= self.MAX_DENSE_SCULPT_CELLS:
+                grown = np.zeros((nw, nh), dtype=np.float32)
+                grown[min_gx - nx0:min_gx - nx0 + w, min_gz - nz0:min_gz - nz0 + h] = grid
+                return nx0, nz0, grown
+        return None
+
+    #: Saved sculpt is cut into square tiles of ``1 << SCULPT_TILE_SHIFT``
+    #: cells a side, one record each, as texture paint is cut into chunks: a
+    #: save after a dab encodes only the tiles the dab touched.
+    SCULPT_TILE_SHIFT = 5
+    #: A sculpt cell index a map may name: beyond it the int64 arithmetic of
+    #: the dense grid and the tile codec would overflow. Far past any cell a
+    #: brush can reach.
+    MAX_SCULPT_CELL = 1 << 46
+
+    def _encode_sculpt_tile(self, tx, tz, local, values):
+        """The saved record of sculpt tile (*tx*, *tz*).
+
+        ``data`` is base64 of zlib of the tile's cells: their ``uint16``
+        indices within the tile (``lx << SCULPT_TILE_SHIFT | lz``, ascending),
+        then their ``float64`` offsets byte plane by byte plane -- all first
+        bytes, then all second bytes... -- which compresses where the plain
+        doubles would not. Little-endian; exact, so a round trip gives back
+        the very same heights.
+        """
+        import base64, zlib
+        n = len(local)
+        raw = (np.asarray(local, dtype='<u2').tobytes()
+               + np.asarray(values, dtype='<f8').view(np.uint8)
+               .reshape(n, 8).T.tobytes())
+        # Run-length matching only: the low bytes of a double are noise that
+        # a full match search spends twice the time on for ~2% of the size.
+        packer = zlib.compressobj(1, zlib.DEFLATED, 15, 9, zlib.Z_RLE)
+        packed = packer.compress(raw) + packer.flush()
+        return {'tile': [int(tx), int(tz)],
+                'data': base64.b64encode(packed).decode('ascii')}
+
+    def _decode_sculpt_tile(self, entry):
+        """``((tx, tz), gx, gz, values)`` of a saved sculpt tile record, or
+        None if it is damaged. Inflates at most one tile's worth of bytes, so
+        a small record cannot decompress to gigabytes."""
+        import base64, zlib
+        if not isinstance(entry, dict):
+            return None
+        tile, payload = entry.get('tile'), entry.get('data')
+        limit = self.MAX_SCULPT_CELL >> self.SCULPT_TILE_SHIFT
+        if (not isinstance(tile, (list, tuple)) or len(tile) != 2
+                or not all(isinstance(t, int) and not isinstance(t, bool)
+                           and abs(t) < limit for t in tile)
+                or not isinstance(payload, str) or not payload):
+            return None
+        shift = self.SCULPT_TILE_SHIFT
+        cells = 1 << (2 * shift)
+        try:
+            inflater = zlib.decompressobj()
+            raw = inflater.decompress(base64.b64decode(payload), 10 * cells + 1)
+        except (TypeError, ValueError, zlib.error, MemoryError):
+            return None
+        n = len(raw) // 10
+        if inflater.unconsumed_tail or len(raw) != 10 * n or n > cells:
+            return None
+        local = np.frombuffer(raw, dtype='<u2', count=n).astype(np.int64)
+        values = (np.frombuffer(raw, dtype=np.uint8, offset=2 * n)
+                  .reshape(8, n).T.copy().view('<f8').ravel())
+        if n and int(local.max()) >= cells:
+            return None
+        tx, tz = int(tile[0]), int(tile[1])
+        return ((tx, tz), (tx << shift) + (local >> shift),
+                (tz << shift) + (local & ((1 << shift) - 1)), values)
+
+    def _sculpt_tile_entries(self):
+        """The saved sculpt records, one per tile, in tile order.
+
+        Encoded in full once per sculpt change other than a dab -- one NumPy
+        sort of the cells, not a list of a million ``[gx, gz, offset]``
+        triples -- and after a dab only for the tiles it touched (see
+        :meth:`_touch_sculpt_rect`).
+        """
+        key = self._sculpt_key()
+        cache = self._sculpt_tile_cache
+        if cache is None or cache[0] != key:
+            cache = (key, self._encode_sculpt_tiles(), set(), None)
+        tiles, dirty, entries = cache[1], cache[2], cache[3]
+        if dirty:
+            shift = self.SCULPT_TILE_SHIFT
+            side = 1 << shift
+            get = self.sculpt_offsets.get
+            for tx, tz in dirty:
+                x0, z0 = tx << shift, tz << shift
+                found = [(lx << shift | lz, v)
+                         for lx in range(side) for lz in range(side)
+                         for v in (get((x0 + lx, z0 + lz)),) if v is not None]
+                if found:
+                    local, values = zip(*found)
+                    tiles[(tx, tz)] = self._encode_sculpt_tile(tx, tz, local, values)
+                else:
+                    tiles.pop((tx, tz), None)
+            dirty.clear()
+            entries = None
+        if entries is None:
+            entries = [tiles[t] for t in sorted(tiles)]
+        self._sculpt_tile_cache = (key, tiles, dirty, entries)
+        return entries
+
+    def _encode_sculpt_tiles(self):
+        """``{tile: record}`` for the whole sculpt."""
+        offsets = self.sculpt_offsets
+        n = len(offsets)
+        if not n:
+            return {}
+        shift = self.SCULPT_TILE_SHIFT
+        mask = (1 << shift) - 1
+        keys = np.fromiter(itertools.chain.from_iterable(offsets),
+                           dtype=np.int64, count=2 * n).reshape(n, 2)
+        values = np.fromiter(offsets.values(), dtype=np.float64, count=n)
+        tx, tz = keys[:, 0] >> shift, keys[:, 1] >> shift
+        local = (keys[:, 0] & mask) << shift | (keys[:, 1] & mask)
+        # Tile order, then cell order: one sort of a single int64 key (a
+        # third the time of a three-key lexsort) whenever the tiles' span
+        # lets it fit, as any brush-made sculpt's does.
+        rows, cols = tx - tx.min(), tz - tz.min()
+        span = int(cols.max()) + 1
+        if (int(rows.max()) + 1) * span < 1 << (62 - 2 * shift):
+            order = np.argsort((rows * span + cols) << (2 * shift) | local)
+        else:
+            order = np.lexsort((local, tz, tx))
+        tx, tz, local, values = tx[order], tz[order], local[order], values[order]
+        starts = np.flatnonzero(np.r_[True, (np.diff(tx) != 0) | (np.diff(tz) != 0)])
+        ends = np.r_[starts[1:], n]
+        return {(int(tx[a]), int(tz[a])):
+                self._encode_sculpt_tile(tx[a], tz[a], local[a:b], values[a:b])
+                for a, b in zip(starts.tolist(), ends.tolist())}
+
+    def _dense_sculpt(self):
+        """``(min_gx, min_gz, grid)`` for the sculpt offsets, or None.
+
+        The offsets are a sparse dict keyed by grid cell, and sampling them one
+        vertex at a time in Python cost ~6 ms per call -- twice per chunk, for
+        every chunk streamed in anywhere in the world, sculpted or not. Packed
+        once into a dense array over their bounding box, sampling a chunk is a
+        handful of NumPy operations. Rebuilt only when the offsets change other
+        than by a brush dab (see :meth:`_touch_sculpt_rect`), so the grid may
+        extend past the bounding box; sampling it is the same either way.
+        """
+        offsets = self.sculpt_offsets
+        key = self._sculpt_key()
+        cache = getattr(self, '_sculpt_cache', None)
+        if cache is not None and cache[0] == key:
+            return cache[1]
+        n = len(offsets)
+        keys = np.fromiter((c for k in offsets for c in k),
+                           dtype=np.int64, count=2 * n).reshape(n, 2)
+        vals = np.fromiter(offsets.values(), dtype=np.float32, count=n)
+        min_gx, min_gz = (int(v) for v in keys.min(axis=0))
+        max_gx, max_gz = (int(v) for v in keys.max(axis=0))
+        w, h = max_gx - min_gx + 1, max_gz - min_gz + 1
+        dense = None
+        if w * h <= self.MAX_DENSE_SCULPT_CELLS:
+            grid = np.zeros((w, h), dtype=np.float32)
+            grid[keys[:, 0] - min_gx, keys[:, 1] - min_gz] = vals
+            dense = (min_gx, min_gz, grid)
+        self._sculpt_cache = (key, dense)
+        return dense
+
+    def _sample_sculpt_batch(self, world_x: np.ndarray, world_z: np.ndarray) -> np.ndarray:
+        """Get interpolated sculpt offsets for arrays of world positions."""
+        if not self.sculpt_offsets:
+            return np.zeros(len(world_x), dtype=np.float32)
+        res = self.sculpt_grid_resolution
+        gx_f = world_x / res
+        gz_f = world_z / res
+        gx0 = np.floor(gx_f).astype(np.int32)
+        gz0 = np.floor(gz_f).astype(np.int32)
+        fx = gx_f - gx0
+        fz = gz_f - gz0
+        dense = self._dense_sculpt()
+        if dense is not None:
+            min_gx, min_gz, grid = dense
+            w, h = grid.shape
+            ix = gx0.astype(np.int64) - min_gx
+            iz = gz0.astype(np.int64) - min_gz
+            # Nothing sculpted within reach of these points: the common case
+            # for a streamed chunk away from the sculpted area.
+            if (ix.max() < -1 or ix.min() >= w
+                    or iz.max() < -1 or iz.min() >= h):
+                return np.zeros(len(world_x), dtype=np.float32)
+
+            def at(ax, az):
+                inside = (ax >= 0) & (ax < w) & (az >= 0) & (az < h)
+                out = np.zeros(len(ax), dtype=np.float32)
+                out[inside] = grid[ax[inside], az[inside]]
+                return out
+
+            h00 = at(ix, iz)
+            h10 = at(ix + 1, iz)
+            h01 = at(ix, iz + 1)
+            h11 = at(ix + 1, iz + 1)
+            top = h00 + fx * (h10 - h00)
+            bot = h01 + fx * (h11 - h01)
+            return (top + fz * (bot - top)).astype(np.float32)
+        result = np.zeros(len(world_x), dtype=np.float32)
+        for i in range(len(world_x)):
+            h00 = self.sculpt_offsets.get((int(gx0[i]), int(gz0[i])), 0.0)
+            h10 = self.sculpt_offsets.get((int(gx0[i]) + 1, int(gz0[i])), 0.0)
+            h01 = self.sculpt_offsets.get((int(gx0[i]), int(gz0[i]) + 1), 0.0)
+            h11 = self.sculpt_offsets.get((int(gx0[i]) + 1, int(gz0[i]) + 1), 0.0)
+            top = h00 + fx[i] * (h10 - h00)
+            bot = h01 + fx[i] * (h11 - h01)
+            result[i] = top + fz[i] * (bot - top)
+        return result
+
+    def apply_sculpt_at(self, world_x: float, world_z: float, radius: float, strength: float):
+        """Raise/lower terrain in a circular area. Negative strength lowers."""
+        before = self._sculpt_key()
+        res = self.sculpt_grid_resolution
+        grid_radius = int(math.ceil(radius / res)) + 1
+        center_gx = world_x / res
+        center_gz = world_z / res
+        for dx in range(-grid_radius, grid_radius + 1):
+            for dz in range(-grid_radius, grid_radius + 1):
+                gx = int(math.floor(center_gx)) + dx
+                gz = int(math.floor(center_gz)) + dz
+                wx = gx * res
+                wz = gz * res
+                dist = math.sqrt((wx - world_x) ** 2 + (wz - world_z) ** 2)
+                if dist > radius:
+                    continue
+                # Smooth falloff
+                falloff = 1.0 - (dist / radius)
+                falloff = falloff * falloff  # quadratic
+                key = (gx, gz)
+                current = self.sculpt_offsets.get(key, 0.0)
+                self.sculpt_offsets[key] = current + strength * falloff
+        self._mark_sculpt_region_dirty(world_x, world_z, radius, before)
+
+    def smooth_sculpt_at(self, world_x: float, world_z: float, radius: float, strength: float):
+        """Smooth sculpt offsets by averaging neighbours."""
+        before = self._sculpt_key()
+        res = self.sculpt_grid_resolution
+        grid_radius = int(math.ceil(radius / res)) + 1
+        center_gx = int(math.floor(world_x / res))
+        center_gz = int(math.floor(world_z / res))
+        new_offsets = {}
+        for dx in range(-grid_radius, grid_radius + 1):
+            for dz in range(-grid_radius, grid_radius + 1):
+                gx = center_gx + dx
+                gz = center_gz + dz
+                wx = gx * res
+                wz = gz * res
+                dist = math.sqrt((wx - world_x) ** 2 + (wz - world_z) ** 2)
+                if dist > radius:
+                    continue
+                falloff = 1.0 - (dist / radius)
+                # Average with neighbours
+                avg = 0.0
+                count = 0
+                for nx, nz in [(gx-1, gz), (gx+1, gz), (gx, gz-1), (gx, gz+1), (gx, gz)]:
+                    avg += self.sculpt_offsets.get((nx, nz), 0.0)
+                    count += 1
+                avg /= count
+                current = self.sculpt_offsets.get((gx, gz), 0.0)
+                new_offsets[(gx, gz)] = current + (avg - current) * strength * falloff
+        self.sculpt_offsets.update(new_offsets)
+        self._mark_sculpt_region_dirty(world_x, world_z, radius, before)
+
+    def flatten_sculpt_at(self, world_x: float, world_z: float, radius: float, strength: float):
+        """Push sculpt offsets toward zero (flattening the deformation)."""
+        before = self._sculpt_key()
+        res = self.sculpt_grid_resolution
+        grid_radius = int(math.ceil(radius / res)) + 1
+        center_gx = int(math.floor(world_x / res))
+        center_gz = int(math.floor(world_z / res))
+        for dx in range(-grid_radius, grid_radius + 1):
+            for dz in range(-grid_radius, grid_radius + 1):
+                gx = center_gx + dx
+                gz = center_gz + dz
+                key = (gx, gz)
+                if key not in self.sculpt_offsets:
+                    continue
+                wx = gx * res
+                wz = gz * res
+                dist = math.sqrt((wx - world_x) ** 2 + (wz - world_z) ** 2)
+                if dist > radius:
+                    continue
+                falloff = 1.0 - (dist / radius)
+                current = self.sculpt_offsets[key]
+                self.sculpt_offsets[key] = current * (1.0 - strength * falloff)
+                # Clean up near-zero entries
+                if abs(self.sculpt_offsets[key]) < 0.01:
+                    del self.sculpt_offsets[key]
+        self._mark_sculpt_region_dirty(world_x, world_z, radius, before)
+
+    def clear_sculpt(self):
+        """Remove all sculpt deformations."""
+        self.sculpt_offsets.clear()
+        self._touch_sculpt()
+        self.mark_all_dirty()
+
+    def _mark_sculpt_region_dirty(self, world_x: float, world_z: float, radius: float,
+                                  before=None):
+        """Mark chunks overlapping a sculpted region as dirty.
+
+        ``before`` is :meth:`_sculpt_key` from before the edit: given it, the
+        dense grid is patched over the brush's cells (the same square the
+        brush tools loop over) instead of rebuilt.
+        """
+        if before is None:
+            self._touch_sculpt()
+        else:
+            res = self.sculpt_grid_resolution
+            grid_radius = int(math.ceil(radius / res)) + 1
+            center_gx = int(math.floor(world_x / res))
+            center_gz = int(math.floor(world_z / res))
+            self._touch_sculpt_rect(before,
+                                    center_gx - grid_radius, center_gz - grid_radius,
+                                    center_gx + grid_radius, center_gz + grid_radius)
+        self.table.mark_dirty_region(world_x, world_z, radius)
+
+    def _apply_csg_subtractions_scalar(self, world_x: float, world_z: float, height: float) -> float:
+        """Apply authored AABB cutters to one world-space terrain sample.
+
+        Terrain is a heightfield, so CSG can only remove material that intersects
+        the visible surface. A cutter therefore lowers a sample to its bottom
+        plane when the sample lies inside the cutter's XZ footprint and its
+        current surface height is between the cutter's Y bounds.
+        """
+        result = float(height)
+        for min_x, min_y, min_z, max_x, max_y, max_z in self.csg_subtractions:
+            if min_x <= world_x <= max_x and min_z <= world_z <= max_z:
+                if min_y < result < max_y:
+                    result = min(result, min_y)
+        return result
+
+    def _apply_csg_subtractions_batch(
+        self,
+        world_x: np.ndarray,
+        world_z: np.ndarray,
+        heights: np.ndarray,
+    ) -> np.ndarray:
+        """Apply AABB cutters to a batch of world-space height samples."""
+        result = np.asarray(heights, dtype=np.float32).copy()
+        if not self.csg_subtractions:
+            return result
+
+        for min_x, min_y, min_z, max_x, max_y, max_z in self.csg_subtractions:
+            hit = (
+                (world_x >= min_x) & (world_x <= max_x)
+                & (world_z >= min_z) & (world_z <= max_z)
+                & (result > min_y) & (result < max_y)
+            )
+            if np.any(hit):
+                result[hit] = np.minimum(result[hit], np.float32(min_y))
+        return result
+
+    def subtract_aabb(self, min_corner, max_corner) -> bool:
+        """Author a rectangular CSG subtraction against the terrain heightfield.
+
+        Only an axis-aligned box is accepted. The volume is stored as an
+        editable terrain modifier rather than converted into dense sculpt data,
+        so its exact X/Y/Z bounds survive save/load and the chunk heightfield
+        can rebuild from the same source of truth.
+        """
+        lo = np.asarray(min_corner, dtype=np.float64).reshape(3)
+        hi = np.asarray(max_corner, dtype=np.float64).reshape(3)
+        lo, hi = np.minimum(lo, hi), np.maximum(lo, hi)
+
+        if np.any((hi - lo) <= 1e-6):
+            return False
+
+        (terrain_min_x, terrain_max_x), (terrain_min_z, terrain_max_z) = self.get_terrain_bounds()
+        if (
+            hi[0] <= terrain_min_x or lo[0] >= terrain_max_x
+            or hi[2] <= terrain_min_z or lo[2] >= terrain_max_z
+        ):
+            return False
+
+        cut = [float(lo[0]), float(lo[1]), float(lo[2]),
+               float(hi[0]), float(hi[1]), float(hi[2])]
+        if cut in self.csg_subtractions:
+            return False
+
+        self.csg_subtractions.append(cut)
+        self.invalidate_height_range()
+
+        centre_x = float((lo[0] + hi[0]) * 0.5)
+        centre_z = float((lo[2] + hi[2]) * 0.5)
+        radius = 0.5 * math.sqrt(
+            float((hi[0] - lo[0]) ** 2 + (hi[2] - lo[2]) ** 2)
+        )
+        self.table.mark_dirty_region(centre_x, centre_z, radius)
+        return True
+
+    # =========================================================================
+    # HEIGHTMAP OVERLAY
+    # =========================================================================
+
+    def load_heightmap(self, image_path: str):
+        """Load a grayscale image as a heightmap overlay.
+        Bright pixels = high, dark pixels = low. Values are normalised to 0..1."""
+        try:
+            from PIL import Image
+        except ImportError:
+            # Fallback to Qt
+            from PyQt5.QtGui import QImage
+            from engine.asset_qt import load_image
+            img = load_image(image_path)
+            if img.isNull():
+                raise ValueError(f"Could not load image: {image_path}")
+            img = img.convertToFormat(QImage.Format_Grayscale8)
+            w, h = img.width(), img.height()
+            stride = img.bytesPerLine()
+            ptr = img.bits()
+            ptr.setsize(stride * h)
+            # Qt pads grayscale rows to four bytes; padding is not a pixel.
+            arr = np.frombuffer(ptr, dtype=np.uint8).reshape((h, stride))[:, :w]
+            arr = arr.astype(np.float32)
+        else:
+            from engine.asset_archives import asset_source
+            with Image.open(asset_source(image_path) or image_path) as source:
+                arr = np.array(source.convert('L'), dtype=np.float32)
+        # This array is owned here. Normalize without a second full float copy.
+        arr /= 255.0
+        self.heightmap_data = arr
+        self.mark_all_dirty()
+
+    def clear_heightmap(self):
+        """Remove the heightmap overlay."""
+        self.heightmap_data = None
+        self.mark_all_dirty()
+
+    def _sample_heightmap_scalar(self, world_x: float, world_z: float, proc_height: float) -> float:
+        """Sample the heightmap at a world position. Returns height offset."""
+        if self.heightmap_data is None:
+            return 0.0
+        u, v = self._world_to_heightmap_uv(world_x, world_z)
+        if u < 0 or u > 1 or v < 0 or v > 1:
+            return 0.0
+        h = self._bilinear_sample(u, v)
+        if self.heightmap_blend == 'replace':
+            # Replace: heightmap value replaces procedural, return delta
+            target = self.biome.base_height + h * self.heightmap_strength + self.offset_y
+            return target - proc_height
+        else:
+            # Additive (default)
+            return (h - 0.5) * self.heightmap_strength
+
+    def _sample_heightmap_batch(self, world_x: np.ndarray, world_z: np.ndarray, proc_heights: np.ndarray) -> np.ndarray:
+        """Sample the heightmap for arrays of world positions."""
+        if self.heightmap_data is None:
+            return np.zeros(len(world_x), dtype=np.float32)
+        u, v = self._world_to_heightmap_uv_batch(world_x, world_z)
+        mask = (u >= 0) & (u <= 1) & (v >= 0) & (v <= 1)
+        result = np.zeros(len(world_x), dtype=np.float32)
+        if not np.any(mask):
+            return result
+        h_vals = self._bilinear_sample_batch(u[mask], v[mask])
+        if self.heightmap_blend == 'replace':
+            target = self.biome.base_height + h_vals * self.heightmap_strength + self.offset_y
+            result[mask] = target - proc_heights[mask]
+        else:
+            result[mask] = (h_vals - 0.5) * self.heightmap_strength
+        return result
+
+    def _world_to_heightmap_uv(self, world_x: float, world_z: float) -> Tuple[float, float]:
+        """Map world XZ to heightmap UV (0..1) based on terrain bounds."""
+        bounds = self.get_terrain_bounds()
+        min_x, max_x = bounds[0]
+        min_z, max_z = bounds[1]
+        range_x = max_x - min_x
+        range_z = max_z - min_z
+        if range_x == 0 or range_z == 0:
+            return (0.5, 0.5)
+        u = (world_x - min_x) / range_x
+        v = (world_z - min_z) / range_z
+        return (u, v)
+
+    def _world_to_heightmap_uv_batch(self, world_x: np.ndarray, world_z: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        bounds = self.get_terrain_bounds()
+        min_x, max_x = bounds[0]
+        min_z, max_z = bounds[1]
+        range_x = max_x - min_x
+        range_z = max_z - min_z
+        if range_x == 0 or range_z == 0:
+            return (np.full_like(world_x, 0.5), np.full_like(world_z, 0.5))
+        u = (world_x - min_x) / range_x
+        v = (world_z - min_z) / range_z
+        return (u, v)
+
+    def _bilinear_sample(self, u: float, v: float) -> float:
+        """Bilinear sample from heightmap_data at normalised UV."""
+        h, w = self.heightmap_data.shape
+        px = u * (w - 1)
+        py = v * (h - 1)
+        x0 = int(math.floor(px))
+        y0 = int(math.floor(py))
+        x1 = min(x0 + 1, w - 1)
+        y1 = min(y0 + 1, h - 1)
+        x0 = max(0, x0)
+        y0 = max(0, y0)
+        fx = px - x0
+        fy = py - y0
+        top = self.heightmap_data[y0, x0] * (1 - fx) + self.heightmap_data[y0, x1] * fx
+        bot = self.heightmap_data[y1, x0] * (1 - fx) + self.heightmap_data[y1, x1] * fx
+        return top * (1 - fy) + bot * fy
+
+    def _bilinear_sample_batch(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
+        """Bilinear sample from heightmap_data for arrays of UV coords."""
+        h, w = self.heightmap_data.shape
+        px = np.clip(u * (w - 1), 0, w - 1)
+        py = np.clip(v * (h - 1), 0, h - 1)
+        x0 = np.floor(px).astype(np.int32)
+        y0 = np.floor(py).astype(np.int32)
+        x1 = np.minimum(x0 + 1, w - 1)
+        y1 = np.minimum(y0 + 1, h - 1)
+        fx = px - x0
+        fy = py - y0
+        top = self.heightmap_data[y0, x0] * (1 - fx) + self.heightmap_data[y0, x1] * fx
+        bot = self.heightmap_data[y1, x0] * (1 - fx) + self.heightmap_data[y1, x1] * fx
+        return top * (1 - fy) + bot * fy
+
+    def _touch_texture_paint(self, coord):
+        """Bump the version for one baked terrain paint chunk."""
+        self._paint_version_counter += 1
+        self._paint_map_versions[tuple(coord)] = self._paint_version_counter
+
+    @staticmethod
+    def _load_texture_rgba(path):
+        """Load a paint source into a compact RGBA8 NumPy image."""
+        try:
+            from PyQt5.QtGui import QImage
+            from engine.asset_qt import load_image
+            from engine.animated_texture import _source, check_texture_size
+            from PIL import Image
+            # The size in the header is checked before Qt decodes anything:
+            # QImage has no allocation limit, and a tiny PNG can declare a
+            # picture of gigabytes.
+            with Image.open(_source(path)) as header:
+                check_texture_size(header.width, header.height, path)
+            image = load_image(path)
+            if image.isNull():
+                return None
+            image = image.convertToFormat(QImage.Format_RGBA8888)
+            width = int(image.width())
+            height = int(image.height())
+            stride = int(image.bytesPerLine())
+            bits = image.bits()
+            bits.setsize(stride * height)
+            raw = np.frombuffer(bits, dtype=np.uint8).reshape(height, stride)
+            return raw[:, :width * 4].reshape(height, width, 4).copy()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _sample_paint_image(image, uv_x, uv_z):
+        """Vectorized bilinear RGBA sample for a normalized stamp footprint."""
+        h, w = image.shape[:2]
+        px = np.clip(uv_x, 0.0, 1.0) * max(w - 1, 0)
+        py = (1.0 - np.clip(uv_z, 0.0, 1.0)) * max(h - 1, 0)
+        x0 = np.floor(px).astype(np.int32)
+        y0 = np.floor(py).astype(np.int32)
+        x1 = np.minimum(x0 + 1, max(w - 1, 0))
+        y1 = np.minimum(y0 + 1, max(h - 1, 0))
+        fx = (px - x0)[..., None]
+        fy = (py - y0)[..., None]
+        c00 = image[y0, x0].astype(np.float32)
+        c10 = image[y0, x1].astype(np.float32)
+        c01 = image[y1, x0].astype(np.float32)
+        c11 = image[y1, x1].astype(np.float32)
+        top = c00 * (1.0 - fx) + c10 * fx
+        bottom = c01 * (1.0 - fx) + c11 * fx
+        return (top * (1.0 - fy) + bottom * fy) / 255.0
+
+    def _paint_image(self, texture):
+        """The RGBA image for *texture*, loaded once per terrain."""
+        if texture not in self._paint_image_cache:
+            if len(self._paint_image_cache) >= 64:
+                self._paint_image_cache.clear()
+            image = None
+            if self._texture_allowed(texture):
+                image = self._load_texture_rgba(texture)
+            self._paint_image_cache[texture] = image
+        return self._paint_image_cache[texture]
+
+    @staticmethod
+    def _texture_allowed(texture):
+        """Whether a stamp's *texture* may be read from disk.
+
+        Stamp textures arrive in map and .paint files, which are data from
+        outside. A UNC or device path (``//host/share/x.png``) is never read:
+        on Windows merely probing one opens an SMB connection to that host,
+        handing it the user's credentials. A local path outside the project
+        stays allowed -- the Terrain Editor stores one when the user picks a
+        texture from elsewhere -- so only those are refused.
+        """
+        text = str(texture).replace('\\', '/').strip()
+        if text[:2] != '//' and '://' not in text and '\0' not in text:
+            return True
+        from engine.asset_paths import warn_refused
+        warn_refused(texture, 'terrain stamp texture')
+        return False
+
+    def _tile_image(self, texture):
+        """*texture* for tiling: (image, pixels a world unit), or None.
+
+        The image is reduced (whole-number box filter) until it has no more
+        pixels a unit than the paint map has texels, so tiling it does not
+        alias; the reduced image is kept with the terrain.
+        """
+        key = ('tile', texture, self.TERRAIN_PAINT_RESOLUTION, self.chunk_size)
+        hit = self._paint_image_cache.get(key)
+        if hit is None:
+            image = self._paint_image(texture)
+            if image is None:
+                return None
+            per_unit = 1.0 / self.STAMP_TILE_UNITS_PER_PIXEL
+            texels = self.TERRAIN_PAINT_RESOLUTION / float(self.chunk_size)
+            factor = max(1, int(round(per_unit / max(texels, 1e-6))))
+            factor = min(factor, image.shape[0], image.shape[1])
+            if factor > 1:
+                h = image.shape[0] // factor * factor
+                w = image.shape[1] // factor * factor
+                image = image[:h, :w].reshape(
+                    h // factor, factor, w // factor, factor, 4
+                ).astype(np.float32).mean(axis=(1, 3))
+                image = np.clip(image + 0.5, 0, 255).astype(np.uint8)
+            hit = (image, per_unit / factor)
+            self._paint_image_cache[key] = hit
+        return hit
+
+    def _tinted_tile(self, texture, image, tint):
+        """*image* (a :meth:`_tile_image` of *texture*) with *tint* mixed in."""
+        rgb, mix = tint
+        key = ('tint', texture, image.shape, tuple(float(c) for c in rgb), float(mix))
+        hit = self._paint_image_cache.get(key)
+        if hit is None or hit[0] is not image:
+            mixed = image.astype(np.float32)
+            mixed[..., :3] *= np.float32(1.0 - mix)
+            mixed[..., :3] += np.asarray(rgb, np.float32) * np.float32(255.0 * mix)
+            mixed += np.float32(0.5)
+            hit = (image, np.clip(mixed, 0, 255, out=mixed).astype(np.uint8))
+            self._paint_image_cache[key] = hit
+        return hit[1]
+
+    @staticmethod
+    def _sample_tiled_image(image, px, py):
+        """Bilinear RGBA sample at pixel coordinates, the image repeating."""
+        h, w = image.shape[:2]
+        px = px - 0.5
+        py = py - 0.5
+        fx0 = np.floor(px)
+        fy0 = np.floor(py)
+        fx = (px - fx0)[..., None]
+        fy = (py - fy0)[..., None]
+        x0 = np.mod(fx0.astype(np.int64), w)
+        y0 = np.mod(fy0.astype(np.int64), h)
+        x1 = np.mod(x0 + 1, w)
+        y1 = np.mod(y0 + 1, h)
+        c00 = image[y0, x0].astype(np.float32)
+        c10 = image[y0, x1].astype(np.float32)
+        c01 = image[y1, x0].astype(np.float32)
+        c11 = image[y1, x1].astype(np.float32)
+        top = c00 * (1.0 - fx) + c10 * fx
+        bottom = c01 * (1.0 - fx) + c11 * fx
+        return (top * (1.0 - fy) + bottom * fy) / 255.0
+
+    @staticmethod
+    def _sample_tiled_grid(image, px, py):
+        """As :meth:`_sample_tiled_image` over the grid of 1-D *px* x *py*.
+
+        An unturned stamp samples the image on a grid of its own rows and
+        columns, so each tap is a row-and-column pick rather than a pick a
+        texel -- and where the paint's texels sit on the image's pixels (the
+        usual case: the image is reduced to exactly that) one pick is all,
+        and it is returned as the image's own bytes. Returns (len(px),
+        len(py), 4) in 0..255: uint8 for the one pick, float32 otherwise.
+        """
+        h, w = image.shape[:2]
+        px = px.astype(np.float64) - 0.5
+        py = py.astype(np.float64) - 0.5
+        fx0 = np.floor(px + 1e-4)
+        fy0 = np.floor(py + 1e-4)
+        fx = (px - fx0).astype(np.float32)
+        fy = (py - fy0).astype(np.float32)
+        x0 = np.mod(fx0.astype(np.int64), w)
+        y0 = np.mod(fy0.astype(np.int64), h)
+        if np.all(np.abs(fx) < 1e-3) and np.all(np.abs(fy) < 1e-3):
+            return image[np.ix_(y0, x0)].transpose(1, 0, 2)
+        else:
+            x1 = np.mod(x0 + 1, w)
+            y1 = np.mod(y0 + 1, h)
+            wx = fx[None, :, None]
+            wy = fy[:, None, None]
+            top = (image[np.ix_(y0, x0)].astype(np.float32) * (1.0 - wx)
+                   + image[np.ix_(y0, x1)].astype(np.float32) * wx)
+            bottom = (image[np.ix_(y1, x0)].astype(np.float32) * (1.0 - wx)
+                      + image[np.ix_(y1, x1)].astype(np.float32) * wx)
+            picked = top * (1.0 - wy) + bottom * wy
+        return picked.transpose(1, 0, 2)
+
+    def _bake_texture_rect(self, bounds, texture, angle=0.0,
+                           feather=0.0, opacity=1.0, target=None,
+                           only=None, tint=None, tiled=False, clip=None):
+        """Bake one source image directly into terrain's per-chunk albedo.
+
+        *target* is the chunk dict written (default: texture_paint_maps,
+        whose arrays are replaced rather than written in place, since
+        texture_paint_base may share them). *only* limits the bake to a set of
+        chunk keys; *tint* is ``(rgb, amount)`` mixed into the source colour.
+        *clip* limits it further to texels (ix0, ix1, iz0, iz1), inclusive,
+        of each chunk written: a texel's result does not depend on its
+        neighbours, so a clipped bake is the whole bake inside the clip.
+        """
+        try:
+            min_x, min_z, max_x, max_z = [float(v) for v in bounds]
+        except (TypeError, ValueError):
+            return False
+        if max_x <= min_x or max_z <= min_z:
+            return False
+        image = self._paint_image(texture)
+        if image is None:
+            return False
+        tile = self._tile_image(texture) if tiled else None
+        # The stored paint dicts may share arrays (texture_paint_base starts
+        # as a copy of the map's paint) and their serialisation is cached by
+        # array, so their arrays are replaced, never written in place.
+        copy_on_write = target is None or target is self.texture_paint_base
+        if target is None:
+            target = self.texture_paint_maps
+
+        min_cx = int(math.floor((min_x - self.offset_x) / self.chunk_size))
+        max_cx = int(math.floor((max_x - self.offset_x) / self.chunk_size))
+        min_cz = int(math.floor((min_z - self.offset_z) / self.chunk_size))
+        max_cz = int(math.floor((max_z - self.offset_z) / self.chunk_size))
+        feather_world = max(0.0, float(feather))
+        opacity = float(np.clip(opacity, 0.0, 1.0))
+        angle = float(angle)
+        ca, sa = math.cos(angle), math.sin(angle)
+        stamp_cx = (min_x + max_x) * 0.5
+        stamp_cz = (min_z + max_z) * 0.5
+        half_x = max((max_x - min_x) * 0.5, 1e-6)
+        half_z = max((max_z - min_z) * 0.5, 1e-6)
+        min_radius = max(min(half_x, half_z), 1e-6)
+        edge_inner = float(np.clip(
+            1.0 - feather_world / min_radius, 0.0, 1.0))
+
+        res = self.TERRAIN_PAINT_RESOLUTION
+        cell = self.chunk_size / float(res)
+        changed = False
+        for cx in range(min_cx, max_cx + 1):
+            chunk_min_x = self.offset_x + cx * self.chunk_size
+            ix0 = max(0, int(math.floor((min_x - chunk_min_x) / cell)) - 1)
+            ix1 = min(res - 1, int(math.floor((max_x - chunk_min_x) / cell)) + 1)
+            if ix1 < ix0:
+                continue
+            for cz in range(min_cz, max_cz + 1):
+                if only is not None and (cx, cz) not in only:
+                    continue
+                chunk_min_z = self.offset_z + cz * self.chunk_size
+                iz0 = max(0, int(math.floor((min_z - chunk_min_z) / cell)) - 1)
+                iz1 = min(res - 1, int(math.floor((max_z - chunk_min_z) / cell)) + 1)
+                if iz1 < iz0:
+                    continue
+                kx0, kx1 = ix0, ix1
+                if clip is not None:
+                    kx0, kx1 = max(ix0, clip[0]), min(ix1, clip[1])
+                    iz0, iz1 = max(iz0, clip[2]), min(iz1, clip[3])
+                    if kx1 < kx0 or iz1 < iz0:
+                        continue
+
+                xs = chunk_min_x + (np.arange(kx0, kx1 + 1, dtype=np.float32) + 0.5) * cell
+                zs = chunk_min_z + (np.arange(iz0, iz1 + 1, dtype=np.float32) + 0.5) * cell
+                turned = abs(angle) > 1e-6
+                if turned:
+                    wx, wz = np.meshgrid(xs, zs, indexing='ij')
+                    dx = (wx - stamp_cx) / half_x
+                    dz = (wz - stamp_cz) / half_z
+                    qx = dx * ca + dz * sa
+                    qz = -dx * sa + dz * ca
+                    radial_sq = qx * qx + qz * qz
+                else:
+                    # Unturned (the usual stamp): the footprint's two axes
+                    # are the grid's, so the distance is an outer sum of two
+                    # short rows rather than arithmetic on whole grids.
+                    qx_row = ((xs - np.float32(stamp_cx)) / np.float32(half_x))
+                    qz_row = ((zs - np.float32(stamp_cz)) / np.float32(half_z))
+                    radial_sq = np.add.outer(qx_row * qx_row, qz_row * qz_row)
+                inside = radial_sq <= 1.0
+                if not np.any(inside):
+                    continue
+
+                if feather_world > 0.0:
+                    radial = np.sqrt(radial_sq, out=radial_sq)
+                    radial -= np.float32(edge_inner)
+                    radial *= np.float32(1.0 / max(1.0 - edge_inner, 1e-6))
+                    edge = np.clip(radial, 0.0, 1.0, out=radial)
+                    np.subtract(1.0, edge, out=edge)
+                    amount = edge * edge * (3.0 - 2.0 * edge)
+                    amount *= inside
+                    if opacity != 1.0:
+                        amount *= np.float32(opacity)
+                else:
+                    amount = inside.astype(np.float32)
+                    if opacity != 1.0:
+                        amount *= np.float32(opacity)
+                if not np.any(amount > 1e-6):
+                    continue
+
+                # *source*: the texture over the box, 0..255 -- the image's
+                # own bytes where the paint's texels sit on its pixels.
+                if tile is not None:
+                    # The texture lies on the world, turned by the stamp's
+                    # angle about the world's origin: stamps of one texture
+                    # and angle continue each other.
+                    tile_image, per_unit = tile
+                    if turned:
+                        tx = wx * ca + wz * sa
+                        tz = -wx * sa + wz * ca
+                        source = self._sample_tiled_image(
+                            tile_image, tx * per_unit, -tz * per_unit)
+                        source *= np.float32(255.0)
+                    else:
+                        if tint is not None:
+                            # The selection's tint, mixed into the image once
+                            # rather than into every texel of every step.
+                            tile_image = self._tinted_tile(texture, tile_image, tint)
+                        source = self._sample_tiled_grid(
+                            tile_image, xs * per_unit, -zs * per_unit)
+                else:
+                    if not turned:
+                        qx, qz = np.meshgrid(qx_row, qz_row, indexing='ij')
+                    uv_x = 0.5 + qx * 0.5
+                    uv_z = 0.5 + qz * 0.5
+                    source = self._sample_paint_image(image, uv_x, uv_z)
+                    source *= np.float32(255.0)
+                if tint is not None and not (tile is not None and not turned):
+                    rgb, mix = tint
+                    source = source.astype(np.float32)
+                    source[..., :3] *= np.float32(1.0 - mix)
+                    source[..., :3] += np.asarray(rgb, np.float32) * np.float32(255.0 * mix)
+                src_a = source[..., 3] * amount
+                src_a *= np.float32(1.0 / 255.0)
+                covered = src_a > 1e-6
+                if not np.any(covered):
+                    continue
+
+                key = (int(cx), int(cz))
+                paint = target.get(key)
+                if paint is None:
+                    paint = np.zeros((res, res, 4), dtype=np.uint8)
+                elif copy_on_write:
+                    paint = paint.copy()
+                target[key] = paint
+                region = paint[kx0:kx1 + 1, iz0:iz1 + 1]
+                # Most of a stamp is solid -- inside the feather, the texture
+                # opaque -- and there the result is the texture: bytes moved,
+                # no arithmetic. Only the feathered ring (and a translucent
+                # texture) is blended, source over destination.
+                solid = src_a >= 0.9999
+                if np.any(solid):
+                    if source.dtype == np.uint8:
+                        np.copyto(region, source, where=solid[..., None])
+                    else:
+                        rows = source[solid]
+                        rows += np.float32(0.5)
+                        np.clip(rows, 0, 255, out=rows)
+                        rows[:, 3] = 255.0
+                        region[solid] = rows.astype(np.uint8)
+                    covered &= ~solid
+                if np.any(covered):
+                    src = source[covered].astype(np.float32)
+                    alpha = src_a[covered]
+                    dst = region[covered].astype(np.float32)
+                    under = dst[:, 3] * np.float32(1.0 / 255.0) * (1.0 - alpha)
+                    out_a = alpha + under
+                    dst[:, :3] *= under[:, None]
+                    dst[:, :3] += src[:, :3] * alpha[:, None]
+                    dst[:, :3] /= np.maximum(out_a, np.float32(1e-6))[:, None]
+                    dst[:, 3] = out_a * np.float32(255.0)
+                    dst += np.float32(0.5)
+                    out = np.clip(dst, 0, 255, out=dst).astype(np.uint8)
+                    # A texel whose alpha rounds to 0 carries no colour: chunks
+                    # with no alpha are not saved, so colour there would not
+                    # survive a reload and a rebake after it would differ.
+                    out[out[:, 3] == 0, :3] = 0
+                    region[covered] = out
+                if target is self.texture_paint_maps:
+                    self._paint_changed_grass((key,))
+                self._touch_texture_paint(key)
+                changed = True
+        return changed
+
+    def paint_texture_at(self, world_x, world_z, radius, texture,
+                         feather=0.25, opacity=1.0, angle=0.0):
+        """Bake the selected texture into the terrain under the sculpt brush."""
+        radius = float(radius)
+        if radius <= 0.0 or not str(texture).strip():
+            return False
+        radius = abs(radius)
+        bounds = (float(world_x) - radius, float(world_z) - radius,
+                  float(world_x) + radius, float(world_z) + radius)
+        if not self.paint_stamps:
+            changed = self._bake_texture_rect(
+                bounds, str(texture), angle=float(angle),
+                feather=radius * float(np.clip(feather, 0.0, 1.0)),
+                opacity=opacity, tiled=True)
+            if changed:
+                self.texture_paint_base = dict(self.texture_paint_maps)
+            return changed
+        # Free paint lives in the base layer, under the placed stamps.
+        changed = self._bake_texture_rect(
+            bounds, str(texture), angle=float(angle),
+            feather=radius * float(np.clip(feather, 0.0, 1.0)),
+            opacity=opacity, target=self.texture_paint_base, tiled=True)
+        if changed:
+            self._drop_drag_cache()
+            self._recompose_paint(self._chunks_in_bounds(bounds))
+        return changed
+
+    # -- Placed stamps -------------------------------------------------------
+
+    #: Colour mixed into selected stamps, and how strongly.
+    STAMP_SELECT_TINT = ((1.0, 0.5, 0.0), 0.45)
+
+    @staticmethod
+    def make_paint_stamp(world_x, world_z, radius, texture, feather=0.25,
+                         opacity=1.0, angle=0.0, stamp_id=None, tiled=True):
+        """A stamp record, or None if it cannot be placed.
+
+        *tiled* (the default, and what a record saved without the key
+        becomes): the texture repeats at its own scale in the world
+        (STAMP_TILE_UNITS_PER_PIXEL) and the stamp is the window onto it, so
+        a big stamp shows more of the texture rather than a bigger copy, and
+        stamps of one texture join. False stretches one copy of the image
+        over the stamp, for a picture rather than a material.
+        """
+        import uuid
+        try:
+            record = {
+                'id': str(stamp_id) if stamp_id else uuid.uuid4().hex,
+                'texture': str(texture).replace('\\', '/').strip(),
+                'x': float(world_x),
+                'z': float(world_z),
+                'radius': abs(float(radius)),
+                'angle': float(angle),
+                'feather': float(np.clip(float(feather), 0.0, 1.0)),
+                'opacity': float(np.clip(float(opacity), 0.0, 1.0)),
+                'tiled': bool(tiled),
+            }
+        except (TypeError, ValueError):
+            return None
+        numbers = (record['x'], record['z'], record['radius'], record['angle'],
+                   record['feather'], record['opacity'])
+        if (not record['texture'] or record['radius'] <= 0.0
+                or not all(math.isfinite(v) for v in numbers)):
+            return None
+        return record
+
+    @staticmethod
+    def _stamp_bounds(stamp):
+        r = stamp['radius']
+        return (stamp['x'] - r, stamp['z'] - r, stamp['x'] + r, stamp['z'] + r)
+
+    def _chunks_in_bounds(self, bounds):
+        min_x, min_z, max_x, max_z = bounds
+        cs = self.chunk_size
+        return {(cx, cz)
+                for cx in range(int(math.floor((min_x - self.offset_x) / cs)),
+                                int(math.floor((max_x - self.offset_x) / cs)) + 1)
+                for cz in range(int(math.floor((min_z - self.offset_z) / cs)),
+                                int(math.floor((max_z - self.offset_z) / cs)) + 1)}
+
+    def _stamp_chunks(self, stamp):
+        return self._chunks_in_bounds(self._stamp_bounds(stamp))
+
+    #: From this many stamps a NumPy mask beats a Python scan for finding the
+    #: stamps over a chunk (measured crossover ~150; ~7 us fixed NumPy cost).
+    STAMP_VECTOR_MIN = 128
+
+    def _stamp_range(self, stamp):
+        """Inclusive chunk range (cx0, cx1, cz0, cz1) a stamp covers."""
+        r, cs = stamp['radius'], self.chunk_size
+        return (int(math.floor((stamp['x'] - r - self.offset_x) / cs)),
+                int(math.floor((stamp['x'] + r - self.offset_x) / cs)),
+                int(math.floor((stamp['z'] - r - self.offset_z) / cs)),
+                int(math.floor((stamp['z'] + r - self.offset_z) / cs)))
+
+    def _stamp_index(self):
+        """Id -> row map, kept with each stamp's chunk range.
+
+        Rebuilt after stamps are added, replaced or reloaded, or the chunk
+        grid changes; moves update their rows in place.
+        """
+        key = (self.chunk_size, self.offset_x, self.offset_z)
+        if self._stamp_rows is None or self._stamp_index_key != key:
+            stamps = self.paint_stamps
+            self._stamp_rows = {s['id']: i for i, s in enumerate(stamps)}
+            self._stamp_ranges = [self._stamp_range(s) for s in stamps]
+            self._stamp_range_arr = (
+                np.array(self._stamp_ranges, dtype=np.int64)
+                if len(stamps) >= self.STAMP_VECTOR_MIN else None)
+            self._stamp_index_key = key
+        return self._stamp_rows
+
+    def _invalidate_stamp_index(self):
+        self._stamp_rows = None
+        self._drop_drag_cache()
+
+    def _stamps_over(self, key):
+        """Rows of the stamps over chunk *key*, in placement order."""
+        self._stamp_index()
+        cx, cz = key
+        arr = self._stamp_range_arr
+        if arr is not None:
+            return np.flatnonzero((arr[:, 0] <= cx) & (arr[:, 1] >= cx)
+                                  & (arr[:, 2] <= cz) & (arr[:, 3] >= cz)).tolist()
+        return [i for i, (x0, x1, z0, z1) in enumerate(self._stamp_ranges)
+                if x0 <= cx <= x1 and z0 <= cz <= z1]
+
+    @staticmethod
+    def _range_keys(rng):
+        x0, x1, z0, z1 = rng
+        return {(cx, cz) for cx in range(x0, x1 + 1) for cz in range(z0, z1 + 1)}
+
+    def _selected_stamp_keys(self, ids):
+        rows = self._stamp_index()
+        keys = set()
+        for stamp_id in ids:
+            row = rows.get(stamp_id)
+            if row is not None:
+                keys |= self._range_keys(self._stamp_ranges[row])
+        return keys
+
+    def _bake_stamp(self, stamp, target, only, tint=None, clip=None):
+        return self._bake_texture_rect(
+            self._stamp_bounds(stamp), stamp['texture'],
+            angle=stamp['angle'], feather=stamp['radius'] * stamp['feather'],
+            opacity=stamp['opacity'], target=target, only=only, tint=tint,
+            tiled=stamp.get('tiled', True), clip=clip)
+
+    #: Chunks the drag cache holds (two paint maps each) before it is emptied.
+    DRAG_CACHE_CHUNKS = 96
+
+    def _drop_drag_cache(self):
+        self._drag_cache = {}
+        self._stored_with_selection = None
+
+    def _drag_layers(self, key):
+        """What does not move while the selected stamps do, for chunk *key*.
+
+        ``(under, above, above_rows, rest)``: the base paint with every
+        unselected stamp below the selection baked on it; the unselected
+        stamps above the selection composed into one layer (None if there
+        are none); those stamps' rows; and the chunk without the selection
+        at all, composed exactly (*under* itself when nothing is above). Kept while the selection, the stamp list and the
+        chunk's base paint stay as they are, so a drag step bakes only the
+        stamps being dragged. None when the selection is interleaved with
+        unselected stamps over this chunk -- then the chunk is composed whole.
+        """
+        selected = self.selected_stamp_ids
+        if not selected:
+            return None
+        rows_of = self._stamp_index()
+        chosen = [rows_of[i] for i in selected if i in rows_of]
+        if not chosen:
+            return None
+        low, high = min(chosen), max(chosen)
+        base = self.texture_paint_base.get(key)
+        hit = self._drag_cache.get(key)
+        if hit is not None and hit[0] is base and hit[1] == (low, high):
+            return hit[2]
+        stamps = self.paint_stamps
+        below, above_rows = [], []
+        for row in self._stamps_over(key):
+            if stamps[row]['id'] in selected:
+                continue
+            if row < low:
+                below.append(row)
+            elif row > high:
+                above_rows.append(row)
+            else:
+                return None
+        res = self.TERRAIN_PAINT_RESOLUTION
+        only = {key}
+        # A chunk the selection was not on when the stored paint was last
+        # written -- one a drag has just entered -- is stored as exactly
+        # what it is without the selection.
+        held = self._stored_with_selection
+        rest = None
+        if held is not None and key not in held:
+            rest = self.texture_paint_maps.get(key)
+            if rest is None:
+                rest = np.zeros((res, res, 4), dtype=np.uint8)
+        if rest is not None and not above_rows:
+            under = rest
+        else:
+            out = {key: (base.copy() if base is not None
+                         else np.zeros((res, res, 4), dtype=np.uint8))}
+            for row in below:
+                self._bake_stamp(stamps[row], out, only)
+            under = out[key]
+        above = None
+        if above_rows:
+            layer = {key: np.zeros((res, res, 4), dtype=np.uint8)}
+            for row in above_rows:
+                self._bake_stamp(stamps[row], layer, only)
+            above = layer[key]
+        if rest is None:
+            rest = under
+            if above_rows:
+                exact = {key: rest.copy()}
+                for row in above_rows:
+                    self._bake_stamp(stamps[row], exact, only)
+                rest = exact[key]
+        layers = (under, above, above_rows, rest)
+        if len(self._drag_cache) >= self.DRAG_CACHE_CHUNKS:
+            self._drag_cache = {}
+        self._drag_cache[key] = (base, (low, high), layers)
+        return layers
+
+    @staticmethod
+    def _paint_over(region, layer):
+        """*layer* composited over *region* (both RGBA8, straight alpha), in
+        place. Where the layer is opaque it is copied; only its translucent
+        texels are blended."""
+        alpha = layer[..., 3]
+        solid = alpha == 255
+        if np.any(solid):
+            np.copyto(region, layer, where=solid[..., None])
+        partial = alpha != 0
+        partial &= ~solid
+        if not np.any(partial):
+            return
+        src = layer[partial].astype(np.float32)
+        dst = region[partial].astype(np.float32)
+        src_a = src[:, 3] * np.float32(1.0 / 255.0)
+        under = dst[:, 3] * (1.0 - src_a)
+        out_a = src[:, 3] + under
+        dst[:, :3] *= under[:, None]
+        dst[:, :3] += src[:, :3] * src[:, 3:4]
+        dst[:, :3] /= np.maximum(out_a, np.float32(1e-4))[:, None]
+        dst[:, 3] = out_a
+        dst += np.float32(0.5)
+        out = np.clip(dst, 0, 255, out=dst).astype(np.uint8)
+        out[out[:, 3] == 0, :3] = 0
+        region[partial] = out
+
+    def _compose_paint_chunk(self, key, tint_ids=(), preview=False):
+        """Base paint plus every stamp over chunk *key*, in placement order.
+
+        While stamps are selected the chunk is taken from the drag cache as
+        it is without them, and only the box of texels they cover is
+        composed: what lies under them (kept), the selected stamps, and what
+        lies over them. For the stored paint those are the stamps above,
+        baked in order inside the box -- the exact composition. With
+        *preview* (the editor's display during a drag) they are one kept
+        layer, which can differ from the exact result by a rounding step.
+        """
+        res = self.TERRAIN_PAINT_RESOLUTION
+        only = {key}
+        stamps = self.paint_stamps
+        layers = self._drag_layers(key)
+        if layers is None:
+            base = self.texture_paint_base.get(key)
+            out = {key: (base.copy() if base is not None
+                         else np.zeros((res, res, 4), dtype=np.uint8))}
+            for row in self._stamps_over(key):
+                stamp = stamps[row]
+                tint = self.STAMP_SELECT_TINT if stamp['id'] in tint_ids else None
+                self._bake_stamp(stamp, out, only, tint)
+            paint = out[key]
+            return paint if np.any(paint[..., 3]) else None
+
+        under, above, above_rows, rest = layers
+        selected = self.selected_stamp_ids
+        box = None          # (ix0, ix1, iz0, iz1) round every selected stamp here
+        rows = []
+        for row in self._stamps_over(key):
+            if stamps[row]['id'] not in selected:
+                continue
+            reach = self._stamp_texel_box(stamps[row], key)
+            if reach is None:
+                continue
+            rows.append(row)
+            box = reach if box is None else (
+                min(box[0], reach[0]), max(box[1], reach[1]),
+                min(box[2], reach[2]), max(box[3], reach[3]))
+        paint = rest.copy()
+        if box is not None:
+            work = {key: under.copy()}
+            for row in rows:
+                stamp = stamps[row]
+                tint = self.STAMP_SELECT_TINT if stamp['id'] in tint_ids else None
+                self._bake_stamp(stamp, work, only, tint)
+            cut = (slice(box[0], box[1] + 1), slice(box[2], box[3] + 1))
+            if preview:
+                if above is not None:
+                    self._paint_over(work[key][cut], above[cut])
+            else:
+                for row in above_rows:
+                    reach = self._stamp_texel_box(stamps[row], key)
+                    if (reach is None or reach[0] > box[1] or reach[1] < box[0]
+                            or reach[2] > box[3] or reach[3] < box[2]):
+                        continue
+                    self._bake_stamp(stamps[row], work, only, clip=box)
+            paint[cut] = work[key][cut]
+        return paint if np.any(paint[..., 3]) else None
+
+    def _stamp_texel_box(self, stamp, key):
+        """The texels of chunk *key* whose centres lie in the stamp's
+        bounding square, as inclusive (ix0, ix1, iz0, iz1); None if none."""
+        res = self.TERRAIN_PAINT_RESOLUTION
+        cell = self.chunk_size / float(res)
+        min_x, min_z, max_x, max_z = self._stamp_bounds(stamp)
+        x0 = self.offset_x + key[0] * self.chunk_size
+        z0 = self.offset_z + key[1] * self.chunk_size
+        ix0 = max(0, int(math.ceil((min_x - x0) / cell - 0.5)))
+        ix1 = min(res - 1, int(math.floor((max_x - x0) / cell - 0.5)))
+        iz0 = max(0, int(math.ceil((min_z - z0) / cell - 0.5)))
+        iz1 = min(res - 1, int(math.floor((max_z - z0) / cell - 0.5)))
+        if ix1 < ix0 or iz1 < iz0:
+            return None
+        return (ix0, ix1, iz0, iz1)
+
+    def _refresh_paint_display(self, keys):
+        """Rebuild the tinted overrides for *keys* and mark them for upload."""
+        selected = self.selected_stamp_ids
+        tinted = self._selected_stamp_keys(selected) if selected else set()
+        res = self.TERRAIN_PAINT_RESOLUTION
+        for key in keys:
+            if key in tinted or key in self._stamp_dirty_chunks:
+                paint = self._compose_paint_chunk(key, selected, preview=True)
+                if paint is None:
+                    paint = np.zeros((res, res, 4), dtype=np.uint8)
+                self._paint_display[key] = paint
+            else:
+                self._paint_display.pop(key, None)
+            if key in self._paint_display or key in self.texture_paint_maps:
+                self._touch_texture_paint(key)
+            else:
+                # No paint left: version 0 turns paint off for the chunk.
+                self._paint_map_versions.pop(key, None)
+
+    def _recompose_paint(self, keys, defer=False):
+        """Rebake chunks *keys* from the base paint and the placed stamps.
+
+        With *defer* only the editor display is updated (for live drags);
+        :meth:`finish_stamp_edit` then rebakes the stored paint once.
+        """
+        keys = set(keys)
+        if defer:
+            self._stamp_dirty_chunks |= keys
+        else:
+            for key in keys:
+                paint = self._compose_paint_chunk(key)
+                if paint is None:
+                    self.texture_paint_maps.pop(key, None)
+                else:
+                    self.texture_paint_maps[key] = paint
+                self._stamp_dirty_chunks.discard(key)
+            self._paint_changed_grass(keys)
+            held = self._stored_with_selection
+            if held is not None:
+                # These chunks' stored paint is current again.
+                now = self._selected_stamp_keys(self.selected_stamp_ids)
+                held -= keys
+                held |= keys & now
+        self._refresh_paint_display(keys)
+
+    def finish_stamp_edit(self):
+        """Rebake the stored paint for chunks changed by deferred edits."""
+        if self._stamp_dirty_chunks:
+            self._recompose_paint(set(self._stamp_dirty_chunks))
+
+    def add_paint_stamp(self, world_x, world_z, radius, texture,
+                        feather=0.25, opacity=1.0, angle=0.0):
+        """Place a stamp and bake it; returns the record or None."""
+        stamp = self.make_paint_stamp(world_x, world_z, radius, texture,
+                                      feather, opacity, angle)
+        if stamp is None or self._paint_image(stamp['texture']) is None:
+            return None
+        self.finish_stamp_edit()
+        self._drop_drag_cache()
+        self.paint_stamps.append(stamp)
+        rows = self._stamp_rows
+        if rows is not None and self._stamp_index_key == (
+                self.chunk_size, self.offset_x, self.offset_z):
+            # Extend the index instead of rebuilding it.
+            rng = self._stamp_range(stamp)
+            rows[stamp['id']] = len(self.paint_stamps) - 1
+            self._stamp_ranges.append(rng)
+            arr = self._stamp_range_arr
+            if arr is not None:
+                self._stamp_range_arr = np.vstack(
+                    (arr, np.array(rng, dtype=np.int64)))
+            elif len(self.paint_stamps) >= self.STAMP_VECTOR_MIN:
+                self._invalidate_stamp_index()
+        else:
+            self._invalidate_stamp_index()
+        # A new stamp goes on top of everything already baked, so it is baked
+        # straight onto the current paint rather than recomposing its chunks
+        # -- and the grass under it is thinned, not grown again.
+        self._paint_added_only = True
+        try:
+            self._bake_stamp(stamp, None, None)
+        finally:
+            self._paint_added_only = False
+        display = self._stamp_chunks(stamp) & self._paint_display.keys()
+        if display:
+            self._bake_stamp(stamp, self._paint_display, display)
+        return stamp
+
+    def paint_stamp_at(self, world_x, world_z):
+        """Id of the topmost stamp covering (world_x, world_z), or None."""
+        for stamp in reversed(self.paint_stamps):
+            if math.hypot(world_x - stamp['x'], world_z - stamp['z']) <= stamp['radius']:
+                return stamp['id']
+        return None
+
+    def set_selected_stamps(self, ids):
+        """Select stamps by id; selected stamps draw tinted in the editor."""
+        rows = self._stamp_index()
+        ids = {i for i in ids if i in rows}
+        if ids == self.selected_stamp_ids:
+            return
+        changed = ids ^ self.selected_stamp_ids
+        self.selected_stamp_ids = ids
+        self._drop_drag_cache()
+        self._refresh_paint_display(self._selected_stamp_keys(changed))
+
+    def move_paint_stamps(self, ids, dx, dz, defer=False):
+        """Move stamps by (dx, dz) and rebake the chunks they leave and enter."""
+        rows = self._stamp_index()
+        ranges, arr = self._stamp_ranges, self._stamp_range_arr
+        keys = set()
+        if not set(ids) <= self.selected_stamp_ids:
+            # The cache holds the stamps that are not selected, as they lie.
+            self._drop_drag_cache()
+        elif self._stored_with_selection is None and not self._stamp_dirty_chunks:
+            self._stored_with_selection = self._selected_stamp_keys(
+                self.selected_stamp_ids)
+        for stamp_id in ids:
+            row = rows.get(stamp_id)
+            if row is None:
+                continue
+            stamp = self.paint_stamps[row]
+            stamp['x'] += float(dx)
+            stamp['z'] += float(dz)
+            new_range = self._stamp_range(stamp)
+            if new_range != ranges[row]:
+                keys |= self._range_keys(ranges[row])
+                ranges[row] = new_range
+                if arr is not None:
+                    arr[row] = new_range
+            keys |= self._range_keys(new_range)
+        if keys:
+            self._recompose_paint(keys, defer=defer)
+        return bool(keys)
+
+    def merge_paint_stamps(self, records):
+        """Add or update stamps by id; returns how many changed.
+
+        Idempotent: a record identical to the stamp already placed under its
+        id changes nothing, so merging the same records twice never
+        duplicates a stamp.
+        """
+        by_id = {s['id']: i for i, s in enumerate(self.paint_stamps)}
+        keys = set()
+        changed = 0
+        for raw in records or []:
+            if not isinstance(raw, dict):
+                continue
+            stamp = self.make_paint_stamp(
+                raw.get('x'), raw.get('z'), raw.get('radius'),
+                raw.get('texture', ''), raw.get('feather', 0.25),
+                raw.get('opacity', 1.0), raw.get('angle', 0.0),
+                stamp_id=raw.get('id'), tiled=raw.get('tiled', True))
+            if stamp is None:
+                continue
+            index = by_id.get(stamp['id'])
+            if index is None:
+                by_id[stamp['id']] = len(self.paint_stamps)
+                self.paint_stamps.append(stamp)
+            elif self.paint_stamps[index] == stamp:
+                continue
+            else:
+                keys |= self._stamp_chunks(self.paint_stamps[index])
+                self.paint_stamps[index] = stamp
+            keys |= self._stamp_chunks(stamp)
+            changed += 1
+        if keys:
+            self._invalidate_stamp_index()
+            self._recompose_paint(keys)
+        return changed
+
+    def stamp_texture_at(self, world_x, world_z, radius, texture,
+                         feather=0.25, opacity=1.0, angle=0.0):
+        """Compatibility name: this now bakes paint into the terrain itself."""
+        return self.paint_texture_at(
+            world_x, world_z, radius, texture,
+            feather=feather, opacity=opacity, angle=angle)
+
+    def clear_texture_paint(self):
+        """Erase all baked terrain texture paint and placed stamps."""
+        if self.texture_paint_maps:
+            self.table.mark_grass_dirty()
+        self.texture_paint_maps = {}
+        self._paint_epoch += 1
+        self.texture_paint_base = {}
+        self.paint_stamps = []
+        self.selected_stamp_ids = set()
+        self._paint_display = {}
+        self._paint_epoch += 1
+        self._stamp_dirty_chunks = set()
+        self._invalidate_stamp_index()
+        self._paint_map_versions = {}
+        self._paint_version_counter += 1
+        self._paint_epoch += 1
+
+    def clear_texture_stamps(self):
+        """Compatibility alias for the old stamp tool name."""
+        self.clear_texture_paint()
+
+
+
+    def _serialize_texture_paint(self, maps=None):
+        """Paint chunks as compressed entries, reusing unchanged chunks.
+
+        A chunk is compressed once and its entry reused until its array is
+        replaced, so a stamp click re-compresses only the chunks it touched.
+        """
+        import base64, zlib
+        if maps is None:
+            maps = self.texture_paint_maps
+        is_base = maps is self.texture_paint_base and maps is not self.texture_paint_maps
+        cache = self._base_serial_cache if is_base else self._paint_serial_cache
+        res = self.TERRAIN_PAINT_RESOLUTION
+        fresh = {}
+        entries = []
+        ordered = sorted(maps.items())
+        # The chunks whose arrays were replaced since the last call are
+        # compressed together on a few threads (zlib works without the GIL):
+        # a stamp click replaces four to nine, and their compression was
+        # most of the click.
+        stale = [paint for (cx, cz), paint in ordered
+                 if not ((cache.get((cx, cz)) or (None,))[0] is paint)
+                 and paint is not None and paint.shape == (res, res, 4)
+                 and np.any(paint[..., 3])]
+        packed = dict(zip(map(id, stale), _compress_paint(stale)))
+        for (cx, cz), paint in ordered:
+            hit = cache.get((cx, cz))
+            if hit is not None and hit[0] is paint:
+                entry = hit[1]
+            elif id(paint) not in packed:
+                entry = None
+            else:
+                entry = {
+                    'coord': [int(cx), int(cz)],
+                    'data': packed[id(paint)],
+                }
+            fresh[(cx, cz)] = (paint, entry)
+            if entry is not None:
+                entries.append({'coord': list(entry['coord']), 'data': entry['data']})
+        if is_base:
+            self._base_serial_cache = fresh
+        else:
+            self._paint_serial_cache = fresh
+        return entries
+
+    def _restore_texture_paint(self, entries, saved_res=None):
+        self._paint_map_versions = {}
+        self._paint_epoch += 1
+        self._paint_version_counter = 0
+        had_paint = bool(self.texture_paint_maps)
+        self.texture_paint_maps = self._decode_texture_paint(entries, saved_res)
+        if had_paint or self.texture_paint_maps:
+            self.table.mark_grass_dirty()
+        self._paint_epoch += 1
+        for key in self.texture_paint_maps:
+            self._touch_texture_paint(key)
+
+    #: The paint resolution of maps saved before it was written to them.
+    LEGACY_PAINT_RESOLUTION = 128
+
+    @staticmethod
+    def _resample_paint(paint, res):
+        """*paint* (n, n, 4 uint8) at *res* a side, bilinear.
+
+        Colour is weighted by alpha, so the edge of a painted area keeps
+        its colour rather than fading towards the black of unpainted texels.
+        """
+        n = paint.shape[0]
+        if n == res:
+            return paint
+        at = (np.arange(res, dtype=np.float32) + 0.5) * (n / float(res)) - 0.5
+        i0 = np.clip(np.floor(at).astype(np.int64), 0, n - 1)
+        i1 = np.clip(i0 + 1, 0, n - 1)
+        f = np.clip(at - np.floor(at), 0.0, 1.0).astype(np.float32)
+        src = paint.astype(np.float32)
+        src[..., :3] *= src[..., 3:4] / 255.0
+        rows = src[i0] * (1.0 - f)[:, None, None] + src[i1] * f[:, None, None]
+        out = rows[:, i0] * (1.0 - f)[None, :, None] + rows[:, i1] * f[None, :, None]
+        alpha = out[..., 3:4]
+        np.divide(out[..., :3] * 255.0, alpha, out=out[..., :3], where=alpha > 1e-3)
+        out = np.clip(out + 0.5, 0, 255).astype(np.uint8)
+        out[out[..., 3] == 0, :3] = 0
+        return out
+
+    def _decode_texture_paint(self, entries, saved_res=None):
+        """Paint chunks from their saved entries, at this terrain's resolution.
+
+        *saved_res* is the side they were saved at (default: the current
+        one); a chunk saved at another is resampled.
+        """
+        import base64, zlib
+        maps = {}
+        res = int(saved_res or self.TERRAIN_PAINT_RESOLUTION)
+        target = self.TERRAIN_PAINT_RESOLUTION
+        expected = res * res * 4
+        for entry in entries or []:
+            if not isinstance(entry, dict):
+                continue
+            coord = entry.get('coord', [])
+            payload = entry.get('data', '')
+            if (not isinstance(coord, (list, tuple)) or len(coord) != 2
+                    or not isinstance(payload, str) or not payload):
+                continue
+            try:
+                # Bounded: never inflate past the one chunk expected, so a
+                # small payload cannot decompress to gigabytes.
+                inflater = zlib.decompressobj()
+                raw = inflater.decompress(base64.b64decode(payload), expected + 1)
+                if len(raw) != expected or inflater.unconsumed_tail:
+                    continue
+                paint = np.frombuffer(raw, dtype=np.uint8).copy().reshape(
+                    res, res, 4)
+                if res != target:
+                    paint = self._resample_paint(paint, target)
+                maps[(int(coord[0]), int(coord[1]))] = paint
+            except (TypeError, ValueError, OSError, zlib.error, MemoryError):
+                continue
+        return maps
+
+
+
+    
+    #: The editor's lock: a locked terrain is not picked in the 3D view and
+    #: its editor does not open, as a locked brush's does not. Saved with it.
+    locked = False
+
+    def to_dict(self) -> dict:
+        # While the editor is previewing a Big World fill the live bounds are
+        # widened to the whole world; persist the *authored* bounds instead so a
+        # save never bakes the preview expansion into the map file.
+        if self._authored_bounds is not None:
+            min_cx, max_cx, min_cz, max_cz = self._authored_bounds
+            enabled_out = self.enabled if self._authored_enabled is None else self._authored_enabled
+        else:
+            min_cx, max_cx = self.min_chunk_x, self.max_chunk_x
+            min_cz, max_cz = self.min_chunk_z, self.max_chunk_z
+            enabled_out = self.enabled
+        data = {
+            'enabled': enabled_out,
+            'solid': self.solid,
+            'seed': self.seed,
+            'biome': self.biome.name,
+            'chunk_size': self.chunk_size,
+            'mesh_scale': self.mesh_scale,
+            'base_resolution': self.base_resolution,
+            'offset_x': self.offset_x,
+            'offset_z': self.offset_z,
+            'offset_y': self.offset_y,
+            'min_chunk_x': min_cx,
+            'max_chunk_x': max_cx,
+            'min_chunk_z': min_cz,
+            'max_chunk_z': max_cz,
+            'use_textures': self.use_textures,
+            'flat_mode': self.flat_mode,
+            'grass_enabled': self.grass_enabled,
+            'grass_density': self.grass_density,
+            'grass_height': self.grass_height,
+            'grass_color': list(self.grass_color),
+            'grass_color_custom': self.grass_color_custom,
+            'grass_tip_color': (list(self.grass_tip_color)
+                                if self.grass_tip_color is not None else None),
+            'grass_height_range': (list(self.grass_height_range)
+                                   if self.grass_height_range is not None else None),
+            'appearance': self.appearance.to_dict(),
+            'custom_biome': self.biome.to_dict()
+        }
+        if self.locked:
+            # The editor's lock ("Prevent selection/editing"), as a brush's.
+            # Written only when set, so an unlocked terrain's record is
+            # exactly what it was.
+            data['lock'] = True
+        # Sculpt offsets, as compressed tiles (see _encode_sculpt_tile). Maps
+        # saved before them hold 'sculpt_offsets', [gx, gz, offset] triples:
+        # ~70 bytes of indented JSON a cell, where a tile spends ~13.
+        if self.sculpt_offsets:
+            data['sculpt_tiles'] = list(self._sculpt_tile_entries())
+            data['sculpt_grid_resolution'] = self.sculpt_grid_resolution
+        if self.csg_subtractions:
+            data['csg_subtractions'] = [list(cut) for cut in self.csg_subtractions]
+        self.finish_stamp_edit()
+        texture_paint = self._serialize_texture_paint()
+        if texture_paint:
+            data['texture_paint_resolution'] = self.TERRAIN_PAINT_RESOLUTION
+            data['texture_paint'] = texture_paint
+        if self.paint_stamps:
+            data['paint_stamps'] = [dict(stamp) for stamp in self.paint_stamps]
+            base = self._serialize_texture_paint(self.texture_paint_base)
+            if base:
+                data['texture_paint_base'] = base
+
+        # Heightmap settings (image data is NOT saved — only the path is
+        # stored by the editor so the user can re-load it)
+        if self.heightmap_data is not None:
+            # The heightmap is replaced, never edited in place, so its blob
+            # is encoded once per array.
+            if self._heightmap_blob_cache[0] is not self.heightmap_data:
+                import base64, io
+                buf = io.BytesIO()
+                np.save(buf, self.heightmap_data)
+                self._heightmap_blob_cache = (
+                    self.heightmap_data,
+                    base64.b64encode(buf.getvalue()).decode('ascii'))
+            data['heightmap_blob'] = self._heightmap_blob_cache[1]
+            data['heightmap_strength'] = self.heightmap_strength
+            data['heightmap_blend'] = self.heightmap_blend
+        return data
+    
+    @staticmethod
+    def _decode_heightmap_blob(blob) -> Optional[np.ndarray]:
+        """The saved heightmap as a 2-D float array, or None if unusable.
+
+        The blob comes from the map file, which may come from a package. It
+        is a plain ``.npy`` (never unpickled); anything else -- corrupt
+        base64, a header promising more data than it holds, an ``.npz``, a
+        non-numeric or non-2-D array -- drops the heightmap rather than the
+        whole map load.
+        """
+        import base64, binascii, io
+        try:
+            arr = np.load(io.BytesIO(base64.b64decode(blob)), allow_pickle=False)
+        except (TypeError, ValueError, EOFError, OSError, MemoryError,
+                binascii.Error) as exc:
+            print(f"[Terrain] Ignoring unreadable heightmap: {exc}")
+            return None
+        if (not isinstance(arr, np.ndarray) or arr.ndim != 2 or arr.size == 0
+                or arr.dtype.kind not in 'fiu'):
+            print("[Terrain] Ignoring heightmap that is not a 2-D numeric array")
+            return None
+        return arr
+
+    #: Largest terrain seed: the noise seeds NumPy's generator with ``seed``
+    #: and ``seed + 2000`` (TerrainFeatures), which must fit 32 bits.
+    MAX_SEED = 2 ** 32 - 1 - 2000
+
+    def from_dict(self, data: dict):
+        # The map file is untrusted: every field is checked or converted
+        # here, so a damaged or hostile terrain_data -- a string seed, a list
+        # biome, a list where the record should be -- falls back to defaults
+        # instead of raising half-way through a load, raising every frame, or
+        # allocating the whole grid of a billion-chunk bounding box.
+        if not isinstance(data, dict):
+            data = {}
+        self.enabled = _flag(data.get('enabled'), True)
+        self.locked = bool(data.get('lock', False))
+        self.solid = _flag(data.get('solid'), True)
+        seed = _finite_number(data.get('seed'), 42, 0, self.MAX_SEED)
+        self.seed = int(seed) if seed == int(seed) else 42
+        self.noise = PerlinNoise(self.seed)
+        self.features = TerrainFeatures(self.noise, self.seed)
+        biome_name = data.get('biome')
+        if not isinstance(biome_name, str):
+            biome_name = 'grassy_hills'
+        if biome_name in BIOMES: self.biome = BIOMES[biome_name]
+        self.chunk_size = _finite_number(
+            data.get('chunk_size'), self.DEFAULT_CHUNK_SIZE, 1.0, 65536.0)
+        self.mesh_scale = _finite_number(
+            data.get('mesh_scale'), self.chunk_size / self.DEFAULT_CHUNK_SIZE,
+            1e-3, 1e3)
+        self.base_resolution = int(_finite_number(
+            data.get('base_resolution'), 48, 2, 512))
+        self.offset_x = _finite_number(data.get('offset_x'), 0.0, -1e7, 1e7)
+        self.offset_z = _finite_number(data.get('offset_z'), 0.0, -1e7, 1e7)
+        self.offset_y = _finite_number(data.get('offset_y'), 0.0, -1e7, 1e7)
+        bounds = [_chunk_index(data.get(key), default) for key, default in (
+            ('min_chunk_x', -2), ('max_chunk_x', 2),
+            ('min_chunk_z', -2), ('max_chunk_z', 2))]
+        span_x = bounds[1] - bounds[0] + 1
+        span_z = bounds[3] - bounds[2] + 1
+        if span_x < 1 or span_z < 1 or span_x * span_z > self.MAX_BOUNDED_CHUNKS:
+            print(f"[Terrain] Ignoring chunk bounds {bounds}: not a range of at "
+                  f"most {self.MAX_BOUNDED_CHUNKS} chunks")
+            bounds = [-2, 2, -2, 2]
+        (self.min_chunk_x, self.max_chunk_x,
+         self.min_chunk_z, self.max_chunk_z) = bounds
+        # Chunks resident from before the load may lie outside the new bounds;
+        # free them on the GL thread's next frame.
+        self._pending_prune = True
+        # Texture blending is opt-in for terrain, including older maps that
+        # do not contain an explicit use_textures field.
+        self.use_textures = _flag(data.get('use_textures'), False)
+        self.flat_mode = _flag(data.get('flat_mode'), False)
+        self.grass_enabled = _flag(data.get('grass_enabled'), False)
+        self.grass_density = float(np.clip(_finite_number(
+            data.get('grass_density'), 0.02, -math.inf, math.inf), 0.0, MAX_GRASS_DENSITY))
+        self.set_grass(self.grass_enabled, height=_finite_number(
+            data.get('grass_height'), DEFAULT_GRASS_HEIGHT, -math.inf, math.inf))
+        saved_grass_color = _number_list(data.get('grass_color'), 3)
+        if saved_grass_color is not None:
+            self.grass_color = tuple(float(np.clip(c, 0.0, 1.0)) for c in saved_grass_color[:3])
+        else:
+            self.grass_color = tuple(self.biome.color_gradient[0][1])
+        self.grass_color_custom = _flag(data.get('grass_color_custom'), saved_grass_color is not None)
+        saved_tip = _number_list(data.get('grass_tip_color'), 3)
+        if saved_tip is not None:
+            self.grass_tip_color = tuple(float(np.clip(c, 0.0, 1.0)) for c in saved_tip[:3])
+        else:
+            self.grass_tip_color = None
+        saved_range = _number_list(data.get('grass_height_range'), 2)
+        self.grass_height_range = None
+        if saved_range is not None:
+            lo, hi = (float(np.clip(v, 0.0, 1.0)) for v in saved_range[:2])
+            self.grass_height_range = (min(lo, hi), max(lo, hi))
+        # Maps saved before appearance options existed load with the
+        # original look.
+        self.appearance = terrain_style.TerrainAppearance.from_dict(data.get('appearance'))
+        if isinstance(data.get('custom_biome'), dict):
+            self.biome = BiomeConfig.from_dict(data['custom_biome'])
+            self.biome.name = biome_display_name(self.biome.name)
+        # Baked terrain texture paint.
+        try:
+            saved_res = int(data.get('texture_paint_resolution',
+                                     self.LEGACY_PAINT_RESOLUTION))
+        except (TypeError, ValueError, OverflowError):
+            saved_res = self.LEGACY_PAINT_RESOLUTION
+        if saved_res <= 0 or saved_res > 4096:
+            saved_res = self.LEGACY_PAINT_RESOLUTION
+        self._restore_texture_paint(_as_list(data.get('texture_paint')), saved_res)
+        # Migrate old render-time stamps once. The source asset is sampled now
+        # and then discarded; the saved terrain owns the resulting pixels.
+        for stamp in _as_list(data.get('texture_stamps')):
+            if not isinstance(stamp, dict):
+                continue
+            texture = str(stamp.get('texture', '')).replace('\\', '/').strip()
+            bounds = _number_list(stamp.get('bounds'), 4)
+            if bounds is None or not texture:
+                continue
+            cx0, cz0, cx1, cz1 = (math.floor((v - o) / self.chunk_size) for v, o in zip(
+                bounds, (self.offset_x, self.offset_z) * 2))
+            if (cx1 - cx0 + 1) * (cz1 - cz0 + 1) > self.MAX_BOUNDED_CHUNKS:
+                continue
+            try:
+                self._bake_texture_rect(
+                    bounds,
+                    texture,
+                    angle=float(stamp.get('angle', 0.0)),
+                    feather=float(stamp.get('feather', 0.0)),
+                    opacity=float(stamp.get('opacity', 1.0)))
+            except (TypeError, ValueError):
+                continue
+
+        # Placed stamps. Their baked result is already in texture_paint; the
+        # records only make them editable. A map without records keeps all
+        # of its paint as the base layer.
+        self.paint_stamps = []
+        # A map from before this resolution, or whose stamps were stretched
+        # (no 'tiled' key), is converted: its stamps are baked again from
+        # their records, sharp and tiled. Paint with no record behind it can
+        # only be resampled.
+        convert = saved_res != self.TERRAIN_PAINT_RESOLUTION
+        for raw in _as_list(data.get('paint_stamps')):
+            if isinstance(raw, dict):
+                convert = convert or 'tiled' not in raw
+                stamp = self.make_paint_stamp(
+                    raw.get('x'), raw.get('z'), raw.get('radius'),
+                    raw.get('texture', ''), raw.get('feather', 0.25),
+                    raw.get('opacity', 1.0), raw.get('angle', 0.0),
+                    stamp_id=raw.get('id'), tiled=raw.get('tiled', True))
+                if stamp is None:
+                    continue
+                # Baked into every chunk it covers: a radius of 1e30 is a set
+                # of 1e57 chunks.
+                cx0, cx1, cz0, cz1 = self._stamp_range(stamp)
+                if (cx1 - cx0 + 1) * (cz1 - cz0 + 1) <= self.MAX_BOUNDED_CHUNKS:
+                    self.paint_stamps.append(stamp)
+        if self.paint_stamps:
+            self.texture_paint_base = self._decode_texture_paint(
+                _as_list(data.get('texture_paint_base')), saved_res)
+        else:
+            self.texture_paint_base = dict(self.texture_paint_maps)
+        self.selected_stamp_ids = set()
+        self._paint_display = {}
+        self._paint_epoch += 1
+        self._stamp_dirty_chunks = set()
+        self._invalidate_stamp_index()
+        if convert and self.paint_stamps:
+            keys = set()
+            for stamp in self.paint_stamps:
+                keys |= self._stamp_chunks(stamp)
+            self._recompose_paint(keys)
+
+        # Sculpt offsets
+        self.sculpt_offsets = {}
+        self._touch_sculpt()
+        self.sculpt_grid_resolution = _finite_number(
+            data.get('sculpt_grid_resolution'), 4.0, 0.05, 4096.0)
+        limit = self.MAX_SCULPT_CELL
+        legacy = _as_list(data.get('sculpt_offsets'))
+        for entry in legacy:
+            try:
+                gx, gz, val = entry
+                key, val = (int(gx), int(gz)), float(val)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            # Python's json reads NaN and Infinity; either would reach the
+            # heights, and from there collision.
+            if math.isfinite(val) and abs(key[0]) < limit and abs(key[1]) < limit:
+                self.sculpt_offsets[key] = val
+        # The records just read are the saved form of what they decode to, so
+        # the next save reuses them -- unless anything was dropped or merged.
+        tiles, reusable = {}, not legacy
+        for entry in _as_list(data.get('sculpt_tiles')):
+            decoded = self._decode_sculpt_tile(entry)
+            if decoded is None:
+                reusable = False
+                continue
+            tile, gx, gz, values = decoded
+            finite = np.isfinite(values)
+            if not finite.all():
+                reusable = False
+                gx, gz, values = gx[finite], gz[finite], values[finite]
+            if tile in tiles:
+                reusable = False
+            tiles[tile] = {'tile': list(tile), 'data': entry['data']}
+            self.sculpt_offsets.update(
+                zip(zip(gx.tolist(), gz.tolist()), values.tolist()))
+        if reusable and tiles:
+            self._sculpt_tile_cache = (self._sculpt_key(), tiles, set(), None)
+
+        # Terrain CSG cutters
+        self.csg_subtractions = []
+        for cut in _as_list(data.get('csg_subtractions')):
+            try:
+                values = [float(v) for v in cut]
+            except (TypeError, ValueError, OverflowError):
+                continue
+            # An infinite face would lower the surface to -inf.
+            if len(values) != 6 or not all(math.isfinite(v) for v in values):
+                continue
+            lo = np.minimum(values[:3], values[3:])
+            hi = np.maximum(values[:3], values[3:])
+            if np.all((hi - lo) > 1e-6):
+                self.csg_subtractions.append([
+                    float(lo[0]), float(lo[1]), float(lo[2]),
+                    float(hi[0]), float(hi[1]), float(hi[2]),
+                ])
+
+        # Heightmap
+        if 'heightmap_blob' in data:
+            self.heightmap_data = self._decode_heightmap_blob(data['heightmap_blob'])
+            self.heightmap_strength = _finite_number(
+                data.get('heightmap_strength'), 100.0, -1e7, 1e7)
+            blend = data.get('heightmap_blend')
+            self.heightmap_blend = blend if blend in ('additive', 'replace') else 'additive'
+        else:
+            self.heightmap_data = None
+        self.mark_all_dirty()

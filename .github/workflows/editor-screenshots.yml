@@ -1,0 +1,332 @@
+name: Native editor screenshots
+
+# Release verification: the desktop editor, with a map loaded, captured by
+# each platform's own screen capture so the real window and its native frame
+# can be compared: Windows, macOS, Linux X11 and Linux Wayland, each at
+# 1920x1080, 2560x1440 and 2048x1080 (DCI 2K). Runs on demand, and when this
+# file changes.
+#
+# The editor is started through the unmodified main.py; the map is then
+# opened with MainWindow.load_level_file, exactly as File > Open does.
+# Each screenshot is named with the size actually captured: a runner whose
+# virtual display refuses a mode is reported, never silently substituted.
+#
+# After its screenshot each job also records every visible control of the
+# window (rectangle, text, font, tabs) and every dock at one fixed client
+# size, 1600x900. The Layout parity job fails unless Windows, macOS, Linux
+# X11 and Linux Wayland match (tools/compare_editor_layout.py): docks and
+# every control's text and font exactly, control rectangles to within the
+# 1px each OS's font engine rounds text differently.
+
+on:
+  workflow_dispatch:
+    inputs:
+      map:
+        description: Map to open, relative to the repository root
+        default: maps/_SHOWCASE.json
+  push:
+    paths:
+      - '.github/workflows/editor-screenshots.yml'
+      - 'tools/compare_editor_layout.py'
+      - 'editor/hierarchy_dock.py'
+      - 'editor/desktop_style.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: editor-screenshots-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FIO_MAP: ${{ inputs.map || 'maps/_SHOWCASE.json' }}
+  SDL_AUDIODRIVER: dummy
+  PYTHONUNBUFFERED: '1'
+
+jobs:
+  capture:
+    name: ${{ matrix.platform.name }} ${{ matrix.size.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { name: Windows, os: windows-latest, id: windows }
+          - { name: macOS, os: macos-latest, id: macos }
+          - { name: Linux X11, os: ubuntu-24.04, id: linux-x11 }
+          - { name: Linux Wayland, os: ubuntu-24.04, id: linux-wayland }
+        size:
+          - { name: 1080p, width: 1920, height: 1080 }
+          - { name: 1440p, width: 2560, height: 1440 }
+          - { name: 2K, width: 2048, height: 1080 }
+    runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 30
+    env:
+      SHOT: ${{ matrix.platform.id }}-${{ matrix.size.name }}
+      PLATFORM_ID: ${{ matrix.platform.id }}
+      WIDTH: ${{ matrix.size.width }}
+      HEIGHT: ${{ matrix.size.height }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+          cache: pip
+      - name: Install Fio's desktop dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Write the map launcher
+        run: |
+          mkdir -p "$RUNNER_TEMP/shots"
+          cat > "$RUNNER_TEMP/launch_with_map.py" <<'PY'
+          import json, os, runpy, sys
+          root = os.environ['GITHUB_WORKSPACE']
+          shots = os.path.join(os.environ['RUNNER_TEMP'], 'shots')
+          os.chdir(root)
+          sys.path.insert(0, root)
+          from PyQt5.QtCore import QTimer
+          from PyQt5.QtGui import QGuiApplication
+          from PyQt5.QtWidgets import QApplication, QDockWidget, QWidget
+          import editor.main_window as main_window
+          shown = main_window.MainWindow.showMaximized
+          LAYOUT_SIZE = (1600, 900)
+
+          def record_layout(self):
+              # One client size on every platform, so every control can be compared.
+              sys.path.insert(0, os.path.join(root, 'tools'))
+              from editor_ui_audit import Audit
+              audit = Audit(QApplication.instance(), shots, {})
+              docks = {dock.objectName(): [dock.x(), dock.y(), dock.width(), dock.height()]
+                       for dock in self.findChildren(QDockWidget) if dock.isVisible()}
+              grids = [{'columns': grid.current_cols, 'viewport_width': grid.scroll_area.viewport().width()}
+                       for grid in self.asset_browser.findChildren(QWidget)
+                       if hasattr(grid, 'current_cols') and grid.isVisible()]
+              record = {'platform': os.environ['PLATFORM_ID'], 'qt_platform': QGuiApplication.platformName(),
+                        'size': [self.width(), self.height()], 'docks': docks, 'asset_grid': grids,
+                        'widgets': audit.widgets(self)}
+              path = os.path.join(shots, os.environ['SHOT'] + '-layout.json')
+              with open(path, 'w', encoding='utf-8') as stream:
+                  json.dump(record, stream, indent=1, ensure_ascii=False)
+              print('LAYOUT_RECORDED', self.width(), 'x', self.height(), 'scene_hierarchy', docks.get('SceneDock'),
+                    'asset_grid', record['asset_grid'], flush=True)
+
+          def report_lights(self):
+              # Release check for the 3D view: the lights each lit shader received,
+              # every Effect's light and the context's uniform limits.
+              import numpy as np
+              view = self.view_3d
+              table = (getattr(view, '_render_config', None) or {}).get('entity_table')
+              renderer = getattr(view, 'renderer', None)
+              try:
+                  from OpenGL import GL as gl
+                  view.makeCurrent()
+                  limits = {name: int(gl.glGetIntegerv(getattr(gl, name))) for name in (
+                      'GL_MAX_FRAGMENT_UNIFORM_COMPONENTS', 'GL_MAX_UNIFORM_BLOCK_SIZE',
+                      'GL_MAX_FRAGMENT_UNIFORM_BLOCKS', 'GL_MAX_TEXTURE_IMAGE_UNITS')}
+                  print('LIGHT_DIAG GL', gl.glGetString(gl.GL_RENDERER).decode(), '|',
+                        gl.glGetString(gl.GL_VERSION).decode(), limits, flush=True)
+                  view.doneCurrent()
+              except Exception as error:
+                  print('LIGHT_DIAG GL query failed:', error, flush=True)
+              if renderer is not None:
+                  print('LIGHT_DIAG lowpower', getattr(renderer, 'lowpower_mode', None),
+                        'shadows', getattr(renderer, 'shadows_enabled', None), flush=True)
+                  for shader, value in sorted((getattr(renderer, '_frame_lights_uploaded', {}) or {}).items()):
+                      print('LIGHT_DIAG uploaded', shader, 'lights', len(value[2]), list(value[2]), flush=True)
+              if table is None:
+                  print('LIGHT_DIAG no entity table', flush=True)
+                  return
+              for slot in np.asarray(table.effect_slots).tolist():
+                  thing = table.things[slot]
+                  print('LIGHT_DIAG effect', getattr(thing, 'name', '?'), 'slot', slot,
+                        'enabled', bool(table.light_enabled[slot]),
+                        'colour', np.round(table.light_color[slot], 3).tolist(),
+                        'params', np.round(table.light_params[slot], 3).tolist(),
+                        'type', int(table.effect_type[slot]), 'active', bool(table.effect_active[slot]), flush=True)
+              enabled = [s for s in np.asarray(table.light_slots).tolist() if table.light_enabled[s]]
+              print('LIGHT_DIAG enabled light slots', enabled, flush=True)
+
+          def show(self):
+              shown(self)
+              def load():
+                  self.load_level_file(os.path.join(root, os.environ['FIO_MAP']))
+                  self.unsaved_changes = False
+                  screen = QGuiApplication.primaryScreen()
+                  print('MAP_LOADED', os.environ['FIO_MAP'], 'platform', QGuiApplication.platformName(),
+                        'screen', screen.size().width(), 'x', screen.size().height(),
+                        'dpr', screen.devicePixelRatio(),
+                        'scene_hierarchy', self.scene_hierarchy_dock.width(), flush=True)
+              def wait_for_layout_request():
+                  # The Capture step asks for the layout record after its screenshot.
+                  if not os.path.exists(os.path.join(shots, 'layout.go')):
+                      QTimer.singleShot(250, wait_for_layout_request)
+                      return
+                  report_lights(self)
+                  if os.environ.get('LAYOUT_RESIZE', '1') == '1':
+                      self.showNormal()
+                      self.resize(*LAYOUT_SIZE)
+                  # Software OpenGL draws a frame every second or so on macOS:
+                  # give debounced relayouts (the asset grid) time to run.
+                  QTimer.singleShot(15000, lambda: record_layout(self))
+              QTimer.singleShot(3000, load)
+              QTimer.singleShot(3000, wait_for_layout_request)
+
+          main_window.MainWindow.showMaximized = show
+          sys.argv = [os.path.join(root, 'main.py')]
+          runpy.run_path(sys.argv[0], run_name='__main__')
+          PY
+
+      # -- platform setup ---------------------------------------------------
+      - name: Windows - software OpenGL and display mode
+        if: matrix.platform.id == 'windows'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Hosted runners have no GPU and only OpenGL 1.1; Fio needs 3.3.
+          # Mesa's llvmpipe for Windows, placed beside python.exe, provides it
+          # to PyOpenGL. Qt 5 loads opengl32.dll only from System32, so the
+          # Capture step points Qt at the same file (QT_OPENGL_DLL).
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          # Recent mesa-dist-win releases no longer ship the OpenGL (WGL)
+          # driver; use the newest release whose archive still has it.
+          $archive = $null
+          $tags = gh release list --repo pal1000/mesa-dist-win --limit 40 --json tagName --jq '.[].tagName'
+          foreach ($tag in $tags) {
+            Remove-Item -Recurse -Force "$env:RUNNER_TEMP\mesa" -ErrorAction SilentlyContinue
+            try {
+              gh release download $tag --repo pal1000/mesa-dist-win --pattern '*-release-msvc.7z' --dir "$env:RUNNER_TEMP\mesa"
+            } catch { continue }
+            $candidate = (Get-ChildItem "$env:RUNNER_TEMP\mesa\*.7z" | Select-Object -First 1).FullName
+            if ($candidate -and ((7z l $candidate) -match 'x64\\opengl32\.dll')) {
+              $archive = $candidate
+              Write-Host "Using mesa-dist-win $tag for OpenGL"
+              break
+            }
+            Write-Host "mesa-dist-win $tag has no x64 opengl32.dll; trying an older release"
+          }
+          if (-not $archive) { throw 'No mesa-dist-win release with a 64-bit OpenGL driver was found' }
+          7z x -y -o"$env:RUNNER_TEMP\mesa\x" $archive | Out-Null
+          $gl = Get-ChildItem "$env:RUNNER_TEMP\mesa\x" -Recurse -Filter opengl32.dll |
+                Where-Object { $_.DirectoryName -match '(^|\\)x64$' } | Select-Object -First 1
+          if (-not $gl) { throw 'The selected Mesa archive has no 64-bit opengl32.dll' }
+          $python = Split-Path (Get-Command python).Source
+          Copy-Item "$($gl.DirectoryName)\*.dll" $python -Force
+          Get-ChildItem "$python\*.dll" | Format-Table Name, Length
+          try { Set-DisplayResolution -Width $env:WIDTH -Height $env:HEIGHT -Force }
+          catch { Write-Host "Display mode not changed: $_" }
+      - name: macOS - display mode
+        if: matrix.platform.id == 'macos'
+        run: |
+          brew install displayplacer
+          displayplacer list | tee "$RUNNER_TEMP/shots/$SHOT-displays.txt"
+          id=$(displayplacer list | awk '/^Persistent screen id:/ {print $4; exit}')
+          # Only switch to a mode the virtual display lists. Forcing another
+          # leaves a fractional backing scale that corrupts the capture.
+          if displayplacer list | grep -q "res:${WIDTH}x${HEIGHT} "; then
+            displayplacer "id:$id res:${WIDTH}x${HEIGHT} scaling:off origin:(0,0) degree:0"
+            sleep 3
+          else
+            echo "::warning title=macOS::${WIDTH}x${HEIGHT} is not a mode of this runner's display; capturing at its native size"
+          fi
+      - name: Linux - window system tools
+        if: startsWith(matrix.platform.id, 'linux')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb openbox imagemagick sway grim \
+            libgl1-mesa-dri libglx-mesa0 libegl1 libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 \
+            libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 \
+            libxcb-xkb1 libxcb-cursor0 libwayland-client0 libwayland-egl1 fonts-dejavu-core
+
+      # -- launch, wait for the map, capture natively -----------------------
+      - name: Capture
+        run: |
+          shots="$RUNNER_TEMP/shots"; log="$shots/$SHOT.log"; raw="$shots/$SHOT-raw.png"
+          launch() { python "$RUNNER_TEMP/launch_with_map.py" > "$log" 2>&1 & app=$!; }
+          wait_for_map() {
+            for i in $(seq 1 120); do grep -q MAP_LOADED "$log" && break; sleep 1; done
+            grep MAP_LOADED "$log" || { cat "$log"; exit 1; }
+            # Software OpenGL on GPU-less runners is slow (seconds per frame
+            # on macOS): let layout, textures and the 3D view settle.
+            sleep 45
+          }
+          record_layout() {
+            touch "$shots/layout.go"
+            for i in $(seq 1 120); do grep -q LAYOUT_RECORDED "$log" && break; sleep 1; done
+            grep LAYOUT_RECORDED "$log" || { echo "::error::No layout record"; cat "$log"; exit 1; }
+          }
+          case "${{ matrix.platform.id }}" in
+            windows)
+              pydir=$(python -c "import os, sys; print(os.path.dirname(sys.executable))")
+              export GALLIUM_DRIVER=llvmpipe QT_OPENGL=software QT_OPENGL_DLL="$pydir\\opengl32.dll"
+              snap() { python -c "import ctypes; ctypes.windll.user32.SetProcessDPIAware(); from PIL import ImageGrab; ImageGrab.grab(all_screens=True).save(r'$1')"; }
+              launch; wait_for_map
+              snap "$raw"
+              record_layout ;;
+            macos)
+              snap() { screencapture -x "$1"; }
+              launch; wait_for_map
+              snap "$raw"
+              record_layout ;;
+            linux-x11)
+              export DISPLAY=:91 QT_QPA_PLATFORM=xcb LIBGL_ALWAYS_SOFTWARE=1
+              Xvfb :91 -screen 0 ${WIDTH}x${HEIGHT}x24 -nolisten tcp & sleep 2
+              openbox & sleep 1
+              snap() { import -window root "$1"; }
+              launch; wait_for_map
+              snap "$raw"
+              record_layout ;;
+            linux-wayland)
+              export XDG_RUNTIME_DIR="$RUNNER_TEMP/xdg"; mkdir -p -m 700 "$XDG_RUNTIME_DIR"
+              unset DISPLAY
+              printf 'output HEADLESS-1 resolution %sx%s bg #2b2b2b solid_color\ndefault_border normal 2\nfont pango:DejaVu Sans 10\nxwayland disable\n' "$WIDTH" "$HEIGHT" > "$RUNNER_TEMP/sway.conf"
+              WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman sway -c "$RUNNER_TEMP/sway.conf" &
+              for i in $(seq 1 30); do ls "$XDG_RUNTIME_DIR"/wayland-* >/dev/null 2>&1 && break; sleep 0.5; done
+              export WAYLAND_DISPLAY=$(basename "$(ls "$XDG_RUNTIME_DIR"/wayland-* | grep -v lock | head -1)")
+              export QT_QPA_PLATFORM=wayland LIBGL_ALWAYS_SOFTWARE=1 LAYOUT_RESIZE=0
+              export SWAYSOCK=$(ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock | head -1)
+              snap() { grim "$1"; }
+              launch; wait_for_map
+              snap "$raw"
+              # Sway tiles windows: float the editor at the layout size instead.
+              swaymsg 'border none, floating enable, resize set width 1600 px height 900 px'
+              record_layout ;;
+          esac
+          kill $app 2>/dev/null || true
+          # Name the image by the size actually captured.
+          size=$(python -c "from PIL import Image; w, h = Image.open(r'$raw').size; print(f'{w}x{h}')")
+          final="$shots/$SHOT-captured-$size.png"
+          mv "$raw" "$final"
+          if [ "$size" != "${WIDTH}x${HEIGHT}" ]; then
+            echo "::warning title=${{ matrix.platform.name }} ${{ matrix.size.name }}::Requested ${WIDTH}x${HEIGHT}; the runner captured $size"
+          fi
+          ls -la "$shots"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: editor-screenshot-${{ matrix.platform.id }}-${{ matrix.size.name }}
+          path: ${{ runner.temp }}/shots/
+          retention-days: 30
+          if-no-files-found: error
+
+  layout-parity:
+    name: Layout parity (1080p, every OS)
+    needs: capture
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: editor-screenshot-*-1080p
+          path: captures
+      - name: Every control and dock identical on Windows, macOS, X11 and Wayland
+        run: >-
+          python tools/compare_editor_layout.py captures --tolerance 1
+          --expect windows macos linux-x11 linux-wayland

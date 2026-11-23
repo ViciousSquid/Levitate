@@ -1,0 +1,460 @@
+"""The one and only Prop entity class.
+
+A Prop is the sole generic world-object primitive. It exists identically in the
+editor, editor play mode and the standalone player / Android build.
+
+A Prop may independently carry, collect, use physics, and render as either a
+billboard or a model. Collection is an optional gameplay behaviour on the Prop;
+it is not a separate entity type -- and neither is a model. Every 3D model in a
+Fio world is a Prop with ``render_mode='model'``; the old ``Model`` entity type
+is read from maps as one (see :data:`LEGACY_MODEL_DEFAULTS`).
+"""
+
+from __future__ import annotations
+
+from engine.change_journal import TrackedAttribute
+from engine.items import DEFAULT_DEFINITIONS, ITEM_IDS
+
+try:
+    from editor.things import Thing as _ThingBase
+    EDITOR_TIER = True
+except ImportError:  # standalone player / Android: no PyQt5
+    from plugins.entitybase import Thing as _ThingBase
+    EDITOR_TIER = False
+
+
+DEFAULT_MODEL_PATH = 'assets/models/Oil_Drum.obj'
+BALL_MODEL_PATH = 'assets/models/ball.obj'
+#: The same ball with a number on every face, like a large die.
+BALL_NUMBERS_MODEL_PATH = 'assets/models/ball_numbers.obj'
+
+KEY_SPRITES = {
+    'blue_key': 'assets/sprites/bluekey.png',
+    'red_key': 'assets/sprites/redkey.png',
+    'yellow_key': 'assets/sprites/yellowkey.png',
+}
+KEY_NAMES = tuple(KEY_SPRITES)
+DEFAULT_KEY_NAME = 'blue_key'
+
+#: ``collect_type`` values. ``item`` gives the item ``collect_item`` names --
+#: one of the item slots of :mod:`engine.items`, weapon or pickup.
+COLLECT_TYPES = ('health', 'ammo', 'item', 'key')
+
+AMMO_SPRITE = 'assets/sprites/ammo.png'
+HEALTH_SPRITE = 'assets/sprites/health.png'
+
+
+def normalise_collect_type(properties):
+    """Make ``collect_type`` one of :data:`COLLECT_TYPES`, in place.
+
+    Maps written before items were data name a weapon pickup
+    ``collect_type='weapon'`` with ``collect_weapon``; that is the item of the
+    same id, ``collect_type='item'`` with ``collect_item``.
+
+    There used to be a fifth type, ``custom``: a pickup that was consumed and
+    gave the player nothing. Maps still carry it -- the sample map's shotgun was
+    migrated from the old Pickup entity as ``custom`` with the gun's sprite, so
+    walking over it made it vanish and handed over no gun. A pickup's sprite
+    says what it is meant to be, so an unrecognised type is read from it: an
+    item's shipped sprite collects that item, a key's that key, the ammo box
+    ammo, and anything else health.
+    """
+    if 'collect_weapon' in properties:
+        # Such a map predates collect_item, so any collect_item here is only
+        # the default filled in beside it.
+        properties['collect_item'] = properties.pop('collect_weapon')
+    kind = str(properties.get('collect_type', 'health') or 'health').lower()
+    if kind == 'weapon':
+        kind = 'item'
+    if kind in COLLECT_TYPES:
+        properties['collect_type'] = kind
+        return kind
+    sprite = str(properties.get('collect_custom_sprite')
+                 or properties.get('sprite_path') or '').replace('\\', '/')
+    for item_id in ITEM_IDS:
+        if sprite == DEFAULT_DEFINITIONS[item_id]['world_sprite']:
+            properties['collect_item'] = item_id
+            kind = 'item'
+            break
+    else:
+        for key_name, path in KEY_SPRITES.items():
+            if sprite == path:
+                properties['collect_key_name'] = key_name
+                kind = 'key'
+                break
+        else:
+            kind = 'ammo' if sprite == AMMO_SPRITE else 'health'
+    if kind != 'health':
+        # Only health pickups take a custom sprite; the rest look like what
+        # they give.
+        properties['collect_custom_sprite'] = ''
+    properties['collect_type'] = kind
+    return kind
+
+# Authored defaults. Mutable values are copied per Prop instance.
+PROP_DEFAULTS = {
+    'render_mode': 'billboard',
+    'sprite_path': 'assets/sprites/pickup.png',
+    'sprite_size': [32.0, 32.0],
+
+    # Carry behaviour. Off unless the author turns it on: a Prop is scenery by
+    # default -- neither carryable nor solid (see no_collision below).
+    'carry_enabled': False,
+    'carry_reach': 110.0,
+    'carry_distance': 55.0,
+    'carry_offset': [0.0, -6.0, 0.0],
+    'drop_velocity': 0.0,
+    'drop_angular_velocity': [0.0, 0.0, 0.0],
+
+    # Collection behaviour.
+    'collect_enabled': False,
+    'collect_type': 'item',
+    'collect_value': 25,
+    'collect_activation': 'walk_over',
+    'collect_collected': False,
+    'collect_respawns': False,
+    'collect_respawn_time': 20.0,
+    'collect_key_name': DEFAULT_KEY_NAME,
+    'collect_item': 'gun1',
+    'collect_custom_sprite': '',
+
+    # Physics.
+    'mass': 1.0,
+    'collision_size': [0.0, 0.0, 0.0],
+    'physics_enabled': False,
+    'no_collision': True,
+    'collision_shape': 'aabb',
+    'gravity': True,
+    'friction': 0.55,
+    'linear_damping': 0.08,
+    'angular_damping': 0.12,
+
+    'disabled': False,
+    'io_enabled': True,
+
+    # Model representation. model_path is deliberately not a default mesh: a
+    # billboard Prop must not collide as one (see __init__).
+    'rotation': [0, 0, 0],
+    'scale': [1, 1, 1],
+}
+
+#: What a newly placed, generic model starts as: solid scenery -- Solid on
+#: (colliding with its actual triangles), Physics off and Gravity off, so it
+#: stays exactly where it is put and the player cannot walk through it. Not
+#: carryable. Model-specific presets below override this: the Ball is a
+#: physics Prop with gravity, and the Ball and Oil Barrel deliberately use
+#: their cheaper AABB. Existing map records do not pass through
+#: for_model(), so what they saved is unchanged.
+MODEL_PROP_DEFAULTS = {
+    'render_mode': 'model',
+    'collision_shape': 'mesh',
+    'no_collision': False,
+    'physics_enabled': False,
+    'gravity': False,
+}
+
+#: What a map saved with the old ``Model`` entity meant by one: solid, and not
+#: something the player picks up. Applied under whatever the record authors,
+#: so a saved map keeps playing as it was saved.
+LEGACY_MODEL_DEFAULTS = {
+    'render_mode': 'model',
+    'no_collision': False,
+    'carry_enabled': False,
+}
+
+
+#: The settings a model brings with it. Choosing one of these models for a
+#: Prop -- from the Presets list, by Browse..., or from the Asset Browser --
+#: applies its settings too; any other model changes only the model path.
+#:
+#: The Oil Barrel is the default model. It takes back what a Ball sets that
+#: only makes sense for a ball, and leaves physics, solidity and carrying as
+#: the author has them. As a physics Prop it falls over when knocked hard
+#: enough and rolls on its side (``topples``), and stands up again in the
+#: player's hands.
+OIL_BARREL_SETTINGS = {
+    'model_path': DEFAULT_MODEL_PATH,
+    'collision_shape': 'aabb',
+    'rolls': False,
+    'topples': True,
+    'bounciness': 0.0,
+    'scale': [1.0, 1.0, 1.0],
+    'carry_distance': PROP_DEFAULTS['carry_distance'],
+}
+#: A Ball: a solid physics Prop showing a low-poly golf ball 50 units across
+#: (half the player's height) that rolls and bounces (engine.physics). Its
+#: collision is the model's AABB. ``tint`` colours the white ball.
+BALL_SETTINGS = {
+    'model_path': BALL_MODEL_PATH,
+    'physics_enabled': True,
+    'gravity': True,
+    'no_collision': False,
+    'collision_shape': 'aabb',
+    'carry_enabled': True,
+    'rolls': True,
+    'topples': False,
+    'bounciness': 0.5,
+    'scale': [1.0, 1.0, 1.0],
+    'carry_distance': PROP_DEFAULTS['carry_distance'],
+}
+#: The numbered Ball is a Ball at twice the size.
+BALL_NUMBERS_SETTINGS = {
+    **BALL_SETTINGS,
+    'model_path': BALL_NUMBERS_MODEL_PATH,
+    'scale': [2.0, 2.0, 2.0],
+}
+#: The Presets list of the Prop panel, in order.
+MODEL_PRESETS = {
+    'Oil Barrel': OIL_BARREL_SETTINGS,
+    'Ball': BALL_SETTINGS,
+}
+#: The Oil Barrel's variants: its Variant list in the Prop panel, each a
+#: model file. Every variant is the Oil Barrel (its preset, its settings);
+#: only the look differs.
+OIL_BARREL_VARIANTS = {
+    'None': DEFAULT_MODEL_PATH,
+    'Grey': 'assets/models/Oil_Drum_Grey.obj',
+}
+_MODEL_SETTINGS = {settings['model_path']: settings for settings in (
+    OIL_BARREL_SETTINGS, BALL_SETTINGS, BALL_NUMBERS_SETTINGS)}
+for _path in OIL_BARREL_VARIANTS.values():
+    _MODEL_SETTINGS.setdefault(_path, {**OIL_BARREL_SETTINGS, 'model_path': _path})
+
+#: The models that fall over unless a Prop says otherwise: the oil barrels.
+#: A map saved before barrels could fall over has no ``topples`` in it; its
+#: barrels take this.
+TOPPLING_MODELS = frozenset(OIL_BARREL_VARIANTS.values())
+
+
+def topples_by_default(model_path):
+    """Whether a Prop showing *model_path* falls over when nothing says."""
+    return _model_key(model_path) in TOPPLING_MODELS
+
+
+def _model_key(model_path):
+    """*model_path* as the settings are keyed: forward slashes, from assets/."""
+    path = str(model_path or '').replace('\\', '/')
+    marker = path.rfind('assets/models/')
+    return path[marker:] if marker >= 0 else path
+
+
+def model_settings(model_path):
+    """A copy of the settings *model_path* brings with it, or None."""
+    settings = _MODEL_SETTINGS.get(_model_key(model_path))
+    if settings is None:
+        return None
+    return {key: list(value) if isinstance(value, list) else value
+            for key, value in settings.items()}
+
+
+def model_preset_name(model_path):
+    """The Presets entry showing *model_path*, or None for another model.
+    Every Oil Barrel variant is the Oil Barrel."""
+    key = _model_key(model_path)
+    if oil_barrel_variant(key) is not None:
+        return 'Oil Barrel'
+    for name, settings in MODEL_PRESETS.items():
+        if settings['model_path'] == key:
+            return name
+    return None
+
+
+def oil_barrel_variant(model_path):
+    """The Oil Barrel variant *model_path* is ('None', 'Grey'), or None when
+    it is not an Oil Barrel."""
+    key = _model_key(model_path)
+    for name, path in OIL_BARREL_VARIANTS.items():
+        if path == key:
+            return name
+    return None
+
+
+def is_preset_only_model(model_path):
+    """Whether *model_path* is reached only through a preset (the Oil Barrel
+    and its variants): the asset browser does not list it."""
+    return oil_barrel_variant(model_path) is not None
+
+
+def legacy_model_properties(properties):
+    """A pre-Prop ``Model`` record's properties, read as a Prop's.
+
+    Every loader that meets the old ``model`` type token -- the editor's, the
+    plugin fallback base's, the standalone player's -- reads it through this,
+    so a model is the same Prop wherever the map is opened.
+    """
+    return {**LEGACY_MODEL_DEFAULTS, **dict(properties or {}), 'type': 'prop'}
+
+
+
+class Prop(_ThingBase):
+    """A generic world object with optional carry and collect behaviour."""
+
+    DEFAULT_MODEL_PATH = DEFAULT_MODEL_PATH
+    KEY_SPRITES = KEY_SPRITES
+    KEY_NAMES = KEY_NAMES
+    DEFAULT_KEY_NAME = DEFAULT_KEY_NAME
+    COLLECT_TYPES = COLLECT_TYPES
+
+    pixmap_path = "assets/sprites/pickup.png"
+    # These are serialized implementation fields, not an inspector checklist.
+    # The Prop editor presents them as Representation / Interaction /
+    # Collection / Carry settings and only reveals type-relevant controls.
+    EDITOR_PRIMARY_PROPERTIES = (
+        'disabled',
+    )
+    EDITOR_ADVANCED_PROPERTIES = (
+        'carry_reach',
+        'carry_distance',
+        'carry_offset',
+        'drop_velocity',
+        'drop_angular_velocity',
+    )
+
+    #: Runtime render state the projection resolves; assignment journals it.
+    _respawn_fade_alpha = TrackedAttribute(1.0)
+    _carry_sprite_yaw = TrackedAttribute(None)
+
+    def __init__(self, pos=None, properties=None):
+        super().__init__(pos, properties)
+        self.properties['type'] = 'prop'
+        # Runtime-only render state; never serialized into the map.
+        self._respawn_fade_alpha = 1.0
+
+        authored_render_mode = 'render_mode' in self.properties
+        authored_sprite_path = 'sprite_path' in self.properties
+        authored_collect_value = 'collect_value' in self.properties
+        # Present on every Prop, empty unless it shows a model.
+        self.properties.setdefault('model_path', '')
+        for key, value in PROP_DEFAULTS.items():
+            self.properties.setdefault(
+                key, list(value) if isinstance(value, list) else value)
+        normalise_collect_type(self.properties)
+
+        if not authored_render_mode:
+            self.properties['render_mode'] = self._implied_render_mode()
+
+        # Model representation must always have a usable mesh, even for a map
+        # authored with render_mode="model" but no model_path. This keeps the
+        # representation switch a complete editor operation rather than a blank
+        # entity waiting for an implementation detail to be filled in.
+        if (
+            self.properties.get('render_mode') == 'model'
+            and not self.properties.get('model_path')
+        ):
+            self.properties['model_path'] = self.DEFAULT_MODEL_PATH
+
+        # A barrel falls over; anything else does not, unless it is told to.
+        if 'topples' not in self.properties:
+            self.properties['topples'] = (
+                self.properties.get('render_mode') == 'model'
+                and topples_by_default(self.properties.get('model_path')))
+
+        # Ammo boxes have a stock amount just like the stock health/weapon/key
+        # pickups have a stock appearance. An explicitly authored amount wins.
+        if (self.properties.get('collect_type') == 'ammo'
+                and not authored_collect_value):
+            self.properties['collect_value'] = 8
+
+        # A collectible Prop with no explicit appearance follows its collection
+        # payload. An authored sprite_path always wins.
+        if (self.properties.get('collect_enabled', False)
+                and not authored_sprite_path):
+            self.properties['sprite_path'] = self.get_collect_sprite_path()
+
+        # Collected Props are not useful as carry targets. What the author set
+        # is kept, so resetting the collection restores it rather than forcing
+        # every Prop carryable.
+        self._carry_before_collect = bool(
+            self.properties.get('carry_enabled', False))
+        if self.properties.get('collect_collected'):
+            self.properties['carry_enabled'] = False
+
+    def reset_collection(self):
+        """Un-collect this Prop, restoring the carry setting it was authored with."""
+        if self.properties.get('collect_collected'):
+            self.properties['carry_enabled'] = self._carry_before_collect
+        self.properties['collect_collected'] = False
+
+    @classmethod
+    def for_model(cls, model_path, pos=None, properties=None):
+        """A Prop showing the model at *model_path*, with the Prop defaults.
+
+        The one way a model enters a world from the editor -- the Asset
+        Browser and the 2D view's Add Model both come here -- so a model is
+        always a Prop, never a separate kind of entity. It starts as solid
+        scenery (:data:`MODEL_PROP_DEFAULTS`: Solid on, Physics and Gravity
+        off), not carryable -- unless the model brings settings with it
+        (:func:`model_settings`): a Ball is a rolling physics Prop wherever
+        it is placed from.
+        """
+        props = dict(MODEL_PROP_DEFAULTS)
+        props.update(model_settings(model_path) or {})
+        props.update(properties or {})
+        props['model_path'] = str(model_path).replace('\\', '/')
+        return cls(pos=list(pos) if pos is not None else [0, 0, 0],
+                   properties=props)
+
+    def _implied_render_mode(self):
+        """Resolve representation from authored assets when no mode was saved."""
+        if self.properties.get('model_path'):
+            return 'model'
+        if self.properties.get('sprite_path'):
+            return 'billboard'
+        return PROP_DEFAULTS['render_mode']
+
+    def get_sprite_path(self):
+        """Return the authored billboard texture path."""
+        return self.properties.get('sprite_path', '')
+
+    def get_collect_sprite_path(self):
+        """Return the conventional sprite for the current collection payload."""
+        collect_type = self.properties.get('collect_type', 'health')
+        if collect_type == 'key':
+            return self.KEY_SPRITES.get(
+                self.properties.get('collect_key_name', self.DEFAULT_KEY_NAME),
+                'assets/sprites/pickup.png')
+        if collect_type == 'item':
+            # The item's shipped sprite; the world's own definition is applied
+            # by EditorState.sync_item_props once the Prop is in a world.
+            definition = DEFAULT_DEFINITIONS.get(self.properties.get('collect_item'))
+            return definition['world_sprite'] if definition else 'assets/sprites/pickup.png'
+        if collect_type == 'ammo':
+            return AMMO_SPRITE
+        return self.properties.get('collect_custom_sprite') or HEALTH_SPRITE
+
+    def get_instance_pixmap(self):
+        """2D editor icon from the authored Prop sprite."""
+        loader = getattr(self, '_pixmap_for_path', None)
+        sprite_path = self.get_sprite_path()
+        if loader is not None and sprite_path:
+            return loader(sprite_path)
+        base = getattr(super(), 'get_instance_pixmap', None)
+        return base() if base is not None else None
+
+    @classmethod
+    def get_key_sprite_path(cls, key_name):
+        return cls.KEY_SPRITES.get(key_name, 'assets/sprites/pickup.png')
+
+    @classmethod
+    def get_key_pixmap(cls, key_name):
+        """Editor-only key icon helper used by the HUD."""
+        if not EDITOR_TIER:
+            return None
+        sprite_path = cls.get_key_sprite_path(key_name)
+        try:
+            import os
+            from engine.asset_qt import load_pixmap
+            project_root = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), os.pardir))
+            absolute_path = os.path.join(project_root, sprite_path)
+            pixmap = load_pixmap(absolute_path)
+            return None if pixmap.isNull() else pixmap
+        except Exception:
+            return None
+
+    @classmethod
+    def clear_sprite_cache(cls):
+        """Keep the old editor invalidation seam for the unified Prop."""
+        cache = getattr(cls, '_pixmap_cache', None)
+        if isinstance(cache, dict):
+            cache.clear()

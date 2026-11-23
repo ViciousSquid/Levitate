@@ -1,0 +1,513 @@
+"""Generic Prop gameplay must not depend on the Tidy plugin."""
+from pathlib import Path
+
+import glm
+import pytest
+
+pytest.importorskip("PyQt5", reason="Prop runtime tests exercise the real LogicThread")
+
+from editor.editor_state import EditorState                    # noqa: E402
+from editor.things import Light                                 # noqa: E402
+from editor.io_system import OutputConnection, add_connection  # noqa: E402
+from engine.logic_thread import LogicThread                     # noqa: E402
+from engine.physics.soma import Soma            # noqa: E402
+from engine.spatial_grid import SpatialGrid              # noqa: E402
+from engine.player import Player                                 # noqa: E402
+from engine.prop_entity import Prop                              # noqa: E402
+from engine.prop_runtime import PropSession                      # noqa: E402
+from engine.threaded_game_state import ThreadedGameState          # noqa: E402
+
+pytestmark = pytest.mark.qt
+
+
+def _event_names(events):
+    return [name for _, name in events]
+
+
+@pytest.fixture
+def real_logic():
+    logics = []
+
+    def make(things=(), brushes=(), grid=None, physics=None):
+        state = EditorState()
+        state.things = list(things)
+        state.brushes = list(brushes)
+
+        logic = LogicThread(ThreadedGameState(), state)
+        logics.append(logic)
+
+        player = Player(0.0, 0.0, angle=0.0)
+        player.pos = glm.vec3(0.0, 0.0, 0.0)
+        player.pitch = 0.0
+        logic.player_runtime.player = player
+        logic.session_runtime.spatial_grid = grid
+        logic.session_runtime.physics_world = physics
+
+        events = []
+        io = logic.io_manager
+        fire = io.fire_output
+
+        def recording_fire(source, output, value=None, activator_entity=None):
+            events.append((source, output))
+            return fire(source, output, value=value, activator_entity=activator_entity)
+
+        io.fire_output = recording_fire
+        session = logic.prop_runtime
+        session.start()
+        return logic, session, events
+
+    yield make
+
+    for logic in reversed(logics):
+        try:
+            logic.prop_runtime.stop()
+        finally:
+            logic.stop()
+
+
+def _floor_grid():
+    grid = SpatialGrid(cell_size=512.0)
+    grid.populate([{'pos': [0.0, -50.0, 0.0], 'size': [2000.0, 100.0, 2000.0]}])
+    return grid
+
+
+def test_core_prop_carry_drop_rest_without_plugins(real_logic):
+    spin = 90.0  # degrees per second about X
+    prop = Prop(pos=[0.0, 40.0, 30.0], properties={
+        'carry_enabled': True,
+        'physics_enabled': True,
+        'no_collision': False,
+        'drop_angular_velocity': [spin, 0.0, 0.0],
+    })
+    grid = _floor_grid()
+    physics = Soma(grid)
+    # Origin at the prop's base; 32-unit box centred half a height above it.
+    physics.rebuild([{
+        'pos': [0.0, 56.0, 30.0],
+        'size': [32.0, 32.0, 32.0],
+        '_physics_body': True,
+        '_physics_entity': prop,
+        '_collision_mode': 'aabb',
+    }])
+    logic, session, events = real_logic([prop], grid=grid, physics=physics)
+
+    # Carry: the prop is directly ahead at eye height.
+    session.tick(1 / 60, use_pressed=True)
+    assert session.held is prop
+    assert physics.get_body(prop).kinematic
+    assert _event_names(events)[-1] == 'OnCarried'
+
+    # Carry: the prop follows the view; physics must not move it.
+    session.tick(1 / 60, use_pressed=False)
+    physics.step(1 / 60)
+    carried = list(prop.pos)
+    assert carried[2] > 30.0
+    assert logic.interaction_runtime.current_hud_message == '[E] Carry / Drop'
+
+    # Drop: physics takes over from the carried position, not the home one.
+    session.tick(1 / 60, use_pressed=True)
+    assert session.held is None
+    body = physics.get_body(prop)
+    assert not body.kinematic and body.awake
+    assert 'OnDropped' in _event_names(events)
+
+    physics.step(1 / 60)
+    assert abs(prop.properties['rotation'][0] - spin / 60) < 1e-3
+    assert abs(prop.pos[2] - carried[2]) < 1e-3
+
+    for _ in range(60):
+        physics.step(1 / 60)
+    assert abs(prop.pos[1]) < 1e-4
+    assert 'OnRest' in _event_names(events)
+    assert not body.awake
+
+    # Stop restores the authored home position and releases callbacks.
+    session.stop()
+    assert prop.pos == [0.0, 40.0, 30.0]
+    assert session.props == []
+
+
+def test_non_physics_prop_still_falls_to_ground_on_drop(real_logic):
+    prop = Prop(pos=[0.0, 40.0, 55.0], properties={
+        'carry_enabled': True,
+        'carry_offset': [0.0, 70.0, 0.0],
+    })
+    grid = _floor_grid()
+    logic, session, events = real_logic([prop], grid=grid)
+
+    # Pick the prop up, then release it. It has no authored physics at all.
+    session.tick(1 / 60, use_pressed=True)
+    assert session.held is prop
+    session.tick(1 / 60, use_pressed=True)
+    assert session.held is None
+    assert id(prop) in session._falling
+
+    for _ in range(60):
+        session.tick(1 / 60, use_pressed=False)
+
+    assert abs(prop.pos[1] - 16.0) < 1e-3
+    assert id(prop) not in session._falling
+    assert 'OnRest' in _event_names(events)
+
+
+def test_a_prop_dropped_over_nothing_is_retired_at_the_kill_height(real_logic):
+    """Nothing under it at all: it used to fall -- and be updated every tick
+    -- for ever. It stops at the level's kill height, without an OnRest."""
+    prop = Prop(pos=[5000.0, 40.0, 5000.0], properties={'carry_enabled': True})
+    logic, session, events = real_logic([prop], grid=_floor_grid())
+    kill_y = logic.player_runtime.kill_height()
+    session._falling[id(prop)] = {'entity': prop, 'velocity': 0.0}
+
+    for _ in range(60 * 60):                      # a minute is plenty
+        session.tick(1 / 60, use_pressed=False)
+        if id(prop) not in session._falling:
+            break
+
+    assert id(prop) not in session._falling
+    assert prop.pos[1] == pytest.approx(kill_y)
+    assert 'OnRest' not in _event_names(events)
+
+
+def test_respawn_fades_in_over_two_seconds(real_logic):
+    prop = Prop(pos=[0.0, 0.0, 0.0], properties={
+        'collect_enabled': True,
+        'collect_respawns': True,
+    })
+    logic, session, events = real_logic([prop])
+
+    assert prop._respawn_fade_alpha == 1.0
+    assert session.collect_prop(prop) is True
+    assert prop.properties['collect_collected'] is True
+
+    assert session.respawn_prop(prop) is True
+    assert prop._respawn_fade_alpha == 0.0
+
+    session._update_respawn_fades(1.0)
+    assert prop._respawn_fade_alpha == 0.5
+
+    session._update_respawn_fades(1.0)
+    assert prop._respawn_fade_alpha == 1.0
+    assert id(prop) not in session.respawn_fades
+
+
+def test_respawn_fade_state_resets_when_session_restarts(real_logic):
+    prop = Prop(pos=[0.0, 0.0, 0.0])
+    logic, session, events = real_logic([prop])
+
+    prop._respawn_fade_alpha = 0.0
+    session.stop()
+    session.start()
+
+    assert prop._respawn_fade_alpha == 1.0
+
+
+def test_carried_billboard_keeps_its_facing_when_player_turns(real_logic):
+    prop = Prop(pos=[0.0, 40.0, 55.0], properties={'carry_enabled': True})
+    logic, session, events = real_logic([prop])
+
+    session.tick(1 / 60, use_pressed=True)
+    assert session.held is prop
+    assert prop._carry_sprite_yaw == 0.0
+
+    logic.player_runtime.player.angle = 1.25
+    session.tick(1 / 60, use_pressed=False)
+    assert prop._carry_sprite_yaw == 0.0
+
+
+def test_the_registry_is_derived_from_the_authoritative_thing_list(real_logic):
+    """PropSession is the Prop registry; the thing list is still the world."""
+    prop = Prop(pos=[0, 0, 0])
+    light = Light(pos=[0, 0, 0])
+    logic, session, events = real_logic([prop, light])
+
+    assert session.props == [prop]
+    assert session.by_id(id(prop)) is prop
+    assert session.by_id(id(light)) is None
+
+
+def test_a_rebuild_adopts_a_new_prop_without_disturbing_the_others(real_logic):
+    """A spawn elsewhere in the map must not reset a Prop already registered."""
+    settled = Prop(pos=[0, 0, 0])
+    logic, session, events = real_logic([settled])
+
+    settled.pos = [10.0, 20.0, 30.0]          # it has moved since it was adopted
+    home = list(settled.properties['_prop_home_pos'])
+
+    spawned = Prop(pos=[100, 0, 0])
+    logic.editor_state.things.append(spawned)
+    session.rebuild()
+
+    assert session.props == [settled, spawned]
+    assert settled.properties['_prop_home_pos'] == home, (
+        "adopting a new Prop re-homed one that was already registered")
+    assert spawned.properties['_prop_home_pos'] == [100.0, 0.0, 0.0]
+
+
+def test_a_rebuild_releases_a_prop_that_left_the_world(real_logic):
+    prop, other = Prop(pos=[0, 0, 0]), Prop(pos=[10, 0, 0])
+    logic, session, events = real_logic([prop, other])
+    session.held = other
+
+    logic.editor_state.things.remove(other)
+    session.rebuild()
+
+    assert session.props == [prop]
+    assert session.by_id(id(other)) is None
+    assert session.held is None, "the session kept hold of a Prop that is gone"
+    assert '_prop_home_pos' not in other.properties, (
+        "a released Prop kept the session's authored state")
+
+
+def test_an_empty_registry_is_a_valid_state(real_logic):
+    """A map with no Props still has a session; it just has nothing in it."""
+    light = Light(pos=[0, 0, 0])
+    logic, session, events = real_logic([light])
+    assert session.props == []
+    session.tick(1 / 60.0, use_pressed=True)      # must not raise
+
+
+def test_is_prop_is_the_one_type_contract():
+    """Every tier decides what a Prop is the same way: the serialised type."""
+    assert PropSession.is_prop(Prop(pos=[0, 0, 0])) is True
+    assert PropSession.is_prop(Light(pos=[0, 0, 0])) is False
+    assert PropSession.is_prop(object()) is False
+
+
+def test_prop_has_a_default_billboard_and_2d_menu_entry():
+    prop = Prop()
+    assert prop.get_sprite_path() == 'assets/sprites/pickup.png'
+    source = Path('editor/view_2d.py').read_text()
+    assert 'add_prop_action = menu.addAction("Prop")' in source
+    assert 'new_thing = Prop(pos=pos_3d)' in source
+
+
+def test_prop_exposes_mass_and_collision_shape_defaults():
+    prop = Prop()
+    assert prop.properties['mass'] == 1.0
+    assert prop.properties['no_collision'] is True
+    assert prop.properties['physics_enabled'] is False
+    assert prop.properties['collision_shape'] == 'aabb'     # the default, and the cheap one
+
+
+def test_aabb_collision_shape_skips_mesh_collision(real_logic):
+    prop = Prop(pos=[10.0, 20.0, 30.0], properties={
+        'model_path': '__missing_model_for_aabb_test__.obj',
+        'scale': [2.0, 2.0, 2.0],
+        'rotation': [0.0, 0.0, 0.0],
+        'collision_shape': 'aabb',
+        'collision_size': [0.0, 0.0, 0.0],
+        'no_collision': False,
+        'physics_enabled': False,
+    })
+    logic, session, events = real_logic([prop])
+    brushes = logic.collision_runtime.build_model_collision_brushes()
+    assert len(brushes) == 1
+    assert brushes[0]['_collision_mode'] == 'aabb'
+    assert brushes[0]['size'] == [128.0, 128.0, 128.0]
+    assert brushes[0]['pos'] == [10.0, 20.0, 30.0]
+
+
+def _model_prop(**props):
+    props = {'carry_enabled': True, 'render_mode': 'model',
+             'model_path': 'assets/models/Oil_Drum_Grey.obj',
+             'rotation': [0.0, 30.0, 0.0], **props}
+    return Prop(pos=[0.0, 40.0, 55.0], properties=props)
+
+
+def test_a_carried_model_keeps_the_same_side_towards_the_player(real_logic):
+    """Turning while holding a model turns the model with you: the side that
+    faced you at pickup keeps facing you, rather than your view swinging
+    round a model that held its world facing."""
+    import math
+    prop = _model_prop()
+    logic, session, events = real_logic([prop])
+    player = logic.player_runtime.player
+
+    session.tick(1 / 60, use_pressed=True)
+    assert session.held is prop
+    for angle in (0.5, -1.0, 2.75):
+        player.angle = angle
+        session.tick(1 / 60, use_pressed=False)
+        yaw = prop.properties['rotation'][1]
+        assert yaw == pytest.approx(30.0 + math.degrees(angle))
+        # The model's facing relative to the direction it is carried in is
+        # the same whichever way the player looks.
+        direction = math.degrees(math.atan2(prop.pos[0] - player.pos.x,
+                                            prop.pos[2] - player.pos.z))
+        assert (yaw - direction) % 360.0 == pytest.approx(30.0)
+    assert prop.properties['rotation'][0] == 0.0 and prop.properties['rotation'][2] == 0.0
+
+    session.tick(1 / 60, use_pressed=True)                 # drop it
+    assert session.held is None
+    dropped = list(prop.properties['rotation'])
+    player.angle = 0.0
+    session.tick(1 / 60, use_pressed=False)
+    assert prop.properties['rotation'] == dropped          # keeps the facing it had
+
+
+def test_a_carried_billboard_is_not_given_a_model_rotation(real_logic):
+    prop = Prop(pos=[0.0, 40.0, 55.0], properties={'carry_enabled': True,
+                                                   'rotation': [0, 0, 0]})
+    logic, session, events = real_logic([prop])
+    session.tick(1 / 60, use_pressed=True)
+    logic.player_runtime.player.angle = 1.0
+    session.tick(1 / 60, use_pressed=False)
+    assert prop.properties['rotation'] == [0, 0, 0]
+
+
+def test_play_start_builds_the_prop_registry_once(real_logic, monkeypatch):
+    """Audit F-09: Play start called ``PropSession.start()`` twice -- an
+    O(props) rebuild the second time that found every Prop already adopted.
+    Once now, and the registry it leaves is the same."""
+    prop = Prop(pos=[0.0, 0.0, 0.0], properties={"carry_enabled": True})
+    logic, session, _events = real_logic([prop])
+    starts = []
+    real_start = session.start
+    monkeypatch.setattr(session, "start",
+                        lambda: (starts.append(1), real_start())[1])
+    logic.session_runtime.apply_play_mode(True)
+    try:
+        assert len(starts) == 1
+        assert session.props == [prop]
+        assert session.by_id(id(prop)) is prop
+        assert session.held is None
+    finally:
+        logic.session_runtime.apply_play_mode(False)
+
+
+# ---------------------------------------------------------------------------
+# What can be carried, and how far out
+# ---------------------------------------------------------------------------
+
+def _carry_world(real_logic, prop, size):
+    grid = _floor_grid()
+    physics = Soma(grid)
+    physics.rebuild([{'pos': list(prop.pos), 'size': [size] * 3,
+                      '_physics_body': True, '_physics_entity': prop,
+                      '_collision_mode': 'aabb'}])
+    return real_logic([prop], grid=grid, physics=physics)
+
+
+def _eye(logic):
+    player = logic.player_runtime.player
+    return glm.vec3(player.pos.x,
+                    player.pos.y + float(getattr(player, 'view_height',
+                                                 getattr(player, 'camera_height', 40.0))),
+                    player.pos.z)
+
+
+def test_repeatable_on_rest_show_keeps_a_sleeping_prop_asleep(real_logic):
+    """An already-visible OnRest target must not be woken by its own Show."""
+    prop = Prop(pos=[0.0, 40.0, 30.0], properties={
+        "name": "resting_prop",
+        "physics_enabled": True,
+        "no_collision": False,
+        "hidden": False,
+    })
+    grid = _floor_grid()
+    physics = Soma(grid)
+    physics.rebuild([{
+        "pos": [0.0, 56.0, 30.0],
+        "size": [32.0, 32.0, 32.0],
+        "_physics_body": True,
+        "_physics_entity": prop,
+        "_collision_mode": "aabb",
+    }])
+    logic, session, events = real_logic([prop], grid=grid, physics=physics)
+    add_connection(prop, OutputConnection(
+        output_name="OnRest",
+        target_name="resting_prop",
+        input_name="Show",
+    ))
+    body = physics.get_body(prop)
+
+    # Let the real body fall, land, and fire its repeatable OnRest output.
+    for _ in range(120):
+        physics.step(1 / 60)
+        if "OnRest" in _event_names(events):
+            break
+
+    assert _event_names(events).count("OnRest") == 1
+    assert prop.properties["hidden"] is False
+    assert not body.awake
+
+    # Show sees an already-visible entity, so it must not restart simulation.
+    for _ in range(10):
+        physics.step(1 / 60)
+    assert _event_names(events).count("OnRest") == 1
+    assert not body.awake
+
+
+def test_on_carried_show_preserves_a_kinematic_props_carry(real_logic):
+    """Show must not hand a carried body's transform back to physics."""
+    prop = Prop(pos=[0.0, 40.0, 60.0], properties={
+        "name": "carried_prop",
+        "carry_enabled": True,
+        "physics_enabled": True,
+        "no_collision": False,
+        "hidden": True,
+    })
+    logic, session, _events = _carry_world(real_logic, prop, 32.0)
+    add_connection(prop, OutputConnection(
+        output_name="OnCarried",
+        target_name="carried_prop",
+        input_name="Show",
+    ))
+
+    # Picking up fires OnCarried, which dispatches Show back to this Prop.
+    session.tick(1 / 60, use_pressed=True)
+    body = logic.session_runtime.physics_world.get_body(prop)
+    assert session.held is prop
+    assert prop.properties["hidden"] is False
+    assert body.kinematic
+
+    # PropSession remains the transform owner; physics must not restore the
+    # body's stale pre-carry position on the next step.
+    session.tick(1 / 60, use_pressed=False)
+    carried_position = list(prop.pos)
+    assert carried_position != [0.0, 40.0, 60.0]
+
+    logic.session_runtime.physics_world.step(1 / 60)
+    assert body.kinematic
+    assert prop.pos == pytest.approx(carried_position)
+
+
+@pytest.mark.parametrize('mass', [Soma.HEAVY_MASS, 1000.0])
+def test_a_prop_at_the_heaviest_mass_cannot_be_picked_up(real_logic, mass):
+    prop = Prop(pos=[0.0, 40.0, 60.0], properties={
+        'carry_enabled': True, 'physics_enabled': True, 'no_collision': False,
+        'mass': mass})
+    logic, session, events = _carry_world(real_logic, prop, 32.0)
+    session.tick(1 / 60, use_pressed=True)
+    assert session.held is None
+    assert 'OnCarried' not in _event_names(events)
+
+
+@pytest.mark.parametrize('scale', [1.0, 2.0, 3.0])
+def test_a_carried_ball_keeps_the_same_gap_at_any_scale(real_logic, scale):
+    """carry_distance is the gap to the near side, so scale cannot bring a
+    held ball into the player's face."""
+    from engine.prop_entity import BALL_NUMBERS_MODEL_PATH
+    ball = Prop.for_model(BALL_NUMBERS_MODEL_PATH, pos=[0.0, 40.0, 70.0],
+                          properties={'scale': [scale] * 3})
+    logic, session, _ = _carry_world(real_logic, ball, 50.0 * scale)
+    session.tick(1 / 60, use_pressed=True)
+    session.tick(1 / 60, use_pressed=False)
+    assert session.held is ball
+    to_centre = glm.length(glm.vec3(*ball.pos) - _eye(logic))
+    # The near side is carry_distance out (the 6-unit drop of carry_offset
+    # aside), whatever the size.
+    assert to_centre - 25.0 * scale == pytest.approx(55.0, abs=0.5)
+
+
+def test_a_scaled_up_carried_body_never_fills_the_view(real_logic):
+    """However small carry_distance is, the near side keeps a gap."""
+    prop = Prop(pos=[0.0, 40.0, 60.0], properties={
+        'carry_enabled': True, 'physics_enabled': True, 'no_collision': False,
+        'carry_distance': 10.0})
+    logic, session, _ = _carry_world(real_logic, prop, 150.0)
+    session.tick(1 / 60, use_pressed=True)
+    session.tick(1 / 60, use_pressed=False)
+    assert session.held is prop
+    near_side = glm.length(glm.vec3(*prop.pos) - _eye(logic)) - 75.0
+    assert near_side >= PropSession.MIN_CARRY_GAP - 7.0   # carry_offset is 6 down

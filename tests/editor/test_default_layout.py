@@ -1,0 +1,467 @@
+"""Tests for the default dock layout and how a saved one is restored.
+
+The layout is written to settings.ini on every close, so ``restoreState()``
+pins an install to the arrangement it first booted with.  These cover the
+50/50 split the editor lays out, and the version gate that lets a changed
+default actually reach an install that has been opened before.
+"""
+
+import configparser
+import os
+import sys
+
+import pytest
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+
+pytest.importorskip("PyQt5", reason="Qt is not available in this environment")
+
+from PyQt5.QtCore import QByteArray, Qt  # noqa: E402
+from PyQt5.QtWidgets import QApplication, QLabel, QWidget  # noqa: E402
+
+from editor.ui import LAYOUT_VERSION  # noqa: E402
+
+# Qt tier: PyQt5 must be importable.  No display and no GPU - the suite runs
+# against the offscreen platform plugin.
+pytestmark = pytest.mark.qt
+
+
+
+# ────────────────────────────
+# The 50/50 split
+# ────────────────────────────
+
+@pytest.mark.parametrize("width", [1280, 1600, 1920, 2560])
+def test_the_3d_and_2d_views_share_the_width_equally(main_window, qt_app, width):
+    """The real MainWindow layout keeps the 3D/2D split at 50/50."""
+    host = main_window
+    host.resize(width, 980)
+    host.show()
+    qt_app.processEvents()
+
+    shared = host.view_3d_dock.width() + host.right_dock.width()
+    assert host.view_3d_dock.width() / shared == pytest.approx(0.50, abs=0.01)
+    assert host.right_dock.width() / shared == pytest.approx(0.50, abs=0.01)
+
+
+def test_the_layout_resize_is_applied_by_the_real_ui_owner(main_window, qt_app):
+    host = main_window
+    host.resizeDocks([host.view_3d_dock, host.right_dock], [50, 50], Qt.Horizontal)
+    qt_app.processEvents()
+    shared = host.view_3d_dock.width() + host.right_dock.width()
+    assert host.view_3d_dock.width() / shared == pytest.approx(0.50, abs=0.01)
+    assert host.right_dock.width() / shared == pytest.approx(0.50, abs=0.01)
+
+
+def test_the_scene_hierarchy_has_a_compact_collapse_arrow(main_window, qt_app):
+    qt_app.processEvents()
+    dock = main_window.scene_hierarchy_dock
+    assert dock.windowTitle() == "Scene Hierarchy"
+    title_bar = dock.titleBarWidget()
+    assert title_bar is not None
+    assert title_bar.height() == 28
+    assert dock.toggle_button.arrowType() == Qt.LeftArrow
+    assert dock.MIN_WIDTH <= dock.width() < 260
+
+def test_the_tool_strip_starts_down_the_right_edge(main_window, qt_app):
+    host = main_window
+    qt_app.processEvents()
+    assert host.toolBarArea(host.tool_toolbar) == Qt.RightToolBarArea
+    assert host.tool_toolbar.orientation() == Qt.Vertical
+    # The global 60px button minimum must not widen the rotated Play button.
+    icon = host._toolbar_icon_size
+    assert host.play_button.size().width() == icon + 16
+    assert host.play_button.height() > host.play_button.width()
+
+
+def test_the_asset_browser_takes_a_third_of_its_column(main_window, qt_app):
+    host = main_window
+    host.resize(1600, 980)
+    qt_app.processEvents()
+    column = host.view_3d_dock.height() + host.asset_browser_dock.height()
+    assert host.asset_browser_dock.height() / column == pytest.approx(1 / 3, abs=0.03)
+    # Level with the Properties/Console dock beside it.
+    assert abs(host.asset_browser_dock.y() - host.properties_dock.y()) <= 8
+
+
+def test_view_menu_sets_the_asset_thumbnail_size(main_window):
+    host = main_window
+    host.thumbnail_size_actions['smallest'].trigger()
+    assert host.asset_browser.thumbnail_size == 'smallest'
+    assert host.asset_browser.tab_textures.thumb_size == 58
+    assert host.config.get('AssetBrowser', 'thumbnail_size') == 'smallest'
+    host.asset_browser.set_thumbnail_size('small')
+    menu = host.thumbnail_size_actions['small'].parent()
+    menu.aboutToShow.emit()
+    assert host.thumbnail_size_actions['small'].isChecked()
+    assert not host.thumbnail_size_actions['smallest'].isChecked()
+
+
+def test_show_whole_world_is_a_checkable_view_menu_action(main_window, monkeypatch):
+    host = main_window
+    action = host.show_whole_world_action
+    view_menu = next(
+        entry.menu() for entry in host.menuBar().actions()
+        if entry.text().replace('&', '') == 'View')
+
+    assert action in view_menu.actions()
+    assert action.text() == 'Show whole world'
+    assert action.isCheckable()
+    assert not hasattr(host, 'show_whole_world_checkbox')
+
+    initial = host.config.getboolean('Display', 'show_whole_world', fallback=True)
+    assert action.isChecked() == initial
+
+    saved = []
+    streamed = []
+    monkeypatch.setattr(host, 'save_config', lambda: saved.append(True))
+    monkeypatch.setattr(
+        host.state, 'set_editor_whole_world',
+        lambda shown, camera_pos: streamed.append(shown) or False)
+
+    action.trigger()
+
+    assert action.isChecked() == (not initial)
+    assert host.config.getboolean('Display', 'show_whole_world') == (not initial)
+    assert streamed == [not initial]
+    assert saved == [True]
+
+
+def test_show_whole_world_menu_action_disabled_during_play(main_window, monkeypatch):
+    host = main_window
+    action = host.show_whole_world_action
+    monkeypatch.setattr(host.view_3d, 'play_mode', True)
+    host.update_play_button_color()
+    assert not action.isEnabled()
+
+    monkeypatch.setattr(host.view_3d, 'play_mode', False)
+    host.update_play_button_color()
+    assert action.isEnabled()
+
+
+# ────────────────────────────
+# The version gate
+# ────────────────────────────
+
+def _saved_layout(window, version=None):
+    config = configparser.ConfigParser()
+    config.add_section('Layout')
+    config['Layout']['geometry'] = window.saveGeometry().toHex().data().decode()
+    config['Layout']['state'] = window.saveState(LAYOUT_VERSION).toHex().data().decode()
+    if version is not None:
+        config['Layout']['version'] = str(version)
+    return config
+
+
+@pytest.fixture(autouse=True)
+def _fresh_toasts():
+    """The console's history is the process's: start each test without the
+    toasts earlier tests left in it."""
+    from editor.debug_console import get_debug_logger
+    get_debug_logger().clear_buffer()
+    yield
+
+
+def _layout_toast(window, needle):
+    """Whether a toast (a Debug Console card) says *needle*."""
+    from editor.debug_console import get_debug_logger
+    return any(needle in text.lower()
+               for _serial, _level, text in get_debug_logger().toasts())
+
+
+def test_a_current_layout_is_restored(main_window, qt_app):
+    host = main_window
+    config = _saved_layout(host, LAYOUT_VERSION)
+    host.addDockWidget(Qt.TopDockWidgetArea, host.view_3d_dock)
+    assert host.dockWidgetArea(host.view_3d_dock) == Qt.TopDockWidgetArea
+    host.config = config
+
+    host.load_layout()
+
+    assert host.dockWidgetArea(host.view_3d_dock) == Qt.RightDockWidgetArea
+
+
+def test_a_layout_from_an_older_default_is_dropped(main_window, qt_app):
+    config = _saved_layout(main_window, LAYOUT_VERSION - 1)
+    main_window.config = config
+    main_window.load_layout()
+    assert not config.has_option('Layout', 'state')
+
+
+def test_a_layout_saved_before_versioning_is_dropped(main_window):
+    config = _saved_layout(main_window)
+    config.remove_option('Layout', 'version')
+    main_window.config = config
+    main_window.load_layout()
+    assert not config.has_option('Layout', 'state')
+
+
+def test_dropping_it_says_so(main_window, qt_app):
+    config = _saved_layout(main_window, LAYOUT_VERSION - 1)
+    main_window.config = config
+    main_window.load_layout()
+    qt_app.processEvents()
+    assert _layout_toast(main_window, 'layout reset')
+
+
+def test_dropping_it_keeps_the_window_geometry(main_window):
+    config = _saved_layout(main_window, LAYOUT_VERSION - 1)
+    main_window.config = config
+    main_window.load_layout()
+    assert config.has_option('Layout', 'geometry')
+
+
+def test_it_only_says_so_when_there_was_something_to_drop(main_window, qt_app):
+    config = configparser.ConfigParser()
+    config.add_section('Layout')
+    config['Layout']['geometry'] = main_window.saveGeometry().toHex().data().decode()
+    main_window.config = config
+    main_window.load_layout()
+    qt_app.processEvents()
+    assert not _layout_toast(main_window, 'layout reset')
+
+
+def test_no_layout_section_is_not_an_error(main_window):
+    main_window.load_layout()
+    assert not main_window.config.has_section('Layout')
+
+
+def test_saving_stamps_the_version(main_window):
+    main_window.save_layout()
+    assert main_window.config.getint('Layout', 'version') == LAYOUT_VERSION
+
+
+def test_a_layout_saved_now_is_restored_next_time(main_window, qt_app):
+    host = main_window
+    host.save_layout()
+    host.addDockWidget(Qt.TopDockWidgetArea, host.view_3d_dock)
+    host.load_layout()
+    assert host.dockWidgetArea(host.view_3d_dock) == Qt.RightDockWidgetArea
+
+
+def test_invalid_saved_state_falls_back_to_the_captured_default(main_window, qt_app):
+    host = main_window
+    config = _saved_layout(host, LAYOUT_VERSION)
+    config['Layout']['state'] = QByteArray(b'invalid-layout-state').toHex().data().decode()
+    host.config = config
+    host.load_layout()
+    qt_app.processEvents()
+    assert not config.has_option('Layout', 'state')
+    assert _layout_toast(host, 'invalid')
+
+
+def test_reset_layout_restores_defaults_without_restarting(main_window, monkeypatch):
+    from editor import main_window as mw
+
+    host = main_window
+    host.save_layout()
+    host.addDockWidget(Qt.TopDockWidgetArea, host.view_3d_dock)
+
+    monkeypatch.setattr(
+        mw.QMessageBox, 'question',
+        lambda *args, **kwargs: mw.QMessageBox.Yes)
+
+    host.reset_layout()
+
+    assert not host.config.has_section('Layout')
+    assert host.dockWidgetArea(host.view_3d_dock) == Qt.RightDockWidgetArea
+
+
+# ────────────────────────────
+# What was really squeezing the 3D view
+# ────────────────────────────
+
+#: Parked so the widgets under test are not collected mid-assertion.  The
+#: module's singletons rebuild themselves when their C++ side goes, so this
+#: no longer has to paper over what ran before it.
+_KEEP_ALIVE = []
+
+
+def _debug_console(qt_app):
+    """A DebugConsole built directly, around the module's two singletons."""
+    import editor.debug_console as dc
+    from editor.editor_state import EditorState
+
+    class Host(QWidget):
+        def __init__(self):
+            super().__init__()
+            self.state = EditorState()
+            self.config = configparser.ConfigParser()
+
+    host = Host()
+    console = dc.DebugConsole(host)
+    _KEEP_ALIVE.extend((host, console))
+    return console
+
+
+def test_the_debug_console_has_no_auto_scroll_checkbox_and_follows_output(qt_app):
+    """Auto-scroll is the fixed console behaviour, not a toolbar option."""
+    from PyQt5.QtWidgets import QMainWindow, QVBoxLayout
+
+    console = _debug_console(qt_app)
+    assert not hasattr(console, 'auto_scroll_cb')
+
+    window = QMainWindow()
+    holder = QWidget()
+    QVBoxLayout(holder).addWidget(console)
+    window.setCentralWidget(holder)
+    window.resize(700, 400)
+    window.show()
+    _KEEP_ALIVE.append(window)
+    qt_app.processEvents()
+
+    console._insert_lines([f'output {i}<br>' for i in range(100)])
+    qt_app.processEvents()
+
+    scrollbar = console.console.verticalScrollBar()
+    assert scrollbar.maximum() > 0
+    assert scrollbar.value() == scrollbar.maximum()
+
+
+def test_the_debug_console_does_not_dictate_the_dock_width(qt_app):
+    """This, not the ratio, is what pinned the 3D view to a slot.
+
+    The console is tabbed into the dock column beneath the 2D views, so its
+    minimum width is the whole column's.  Its toolbar is a dozen controls on
+    one row whose minimums add up past 900px, which no resizeDocks ratio can
+    argue with -- the 3D view got whatever was left, about 215px.
+    """
+    console = _debug_console(qt_app)
+
+    assert console.minimumSizeHint().width() < 200
+
+
+def test_the_console_toolbar_keeps_its_natural_size(qt_app):
+    """It scrolls when there is no room; it does not squash or wrap."""
+    console = _debug_console(qt_app)
+    row = console._toolbar_scroll.widget()
+
+    assert row.sizeHint().width() > 600
+    assert console._toolbar_scroll.minimumWidth() < 200
+
+
+def test_the_console_toolbar_scrolls_sideways_only(qt_app):
+    from PyQt5.QtCore import Qt as _Qt
+
+    console = _debug_console(qt_app)
+    scroll = console._toolbar_scroll
+
+    assert scroll.verticalScrollBarPolicy() == _Qt.ScrollBarAlwaysOff
+    assert scroll.horizontalScrollBarPolicy() == _Qt.ScrollBarAsNeeded
+
+
+def test_the_toolbar_is_not_covered_by_its_own_scroll_bar(qt_app):
+    """The bar sits inside the scroll area, over the row it scrolls.
+
+    Without room made for it, it hid most of the Filter row.
+    """
+    from PyQt5.QtWidgets import QMainWindow as _QMainWindow, QVBoxLayout
+
+    console = _debug_console(qt_app)
+    window = _QMainWindow()
+    holder = QWidget()
+    QVBoxLayout(holder).addWidget(console)
+    window.setCentralWidget(holder)
+    window.show()
+    _KEEP_ALIVE.append(window)
+
+    scroll = console._toolbar_scroll
+    row_height = console._toolbar_row.sizeHint().height()
+
+    window.resize(600, 500)                     # too narrow: the bar appears
+    QApplication.instance().processEvents()
+    QApplication.instance().processEvents()
+    assert scroll.horizontalScrollBar().maximum() > 0
+    assert scroll.height() > row_height
+
+    window.resize(1400, 500)                    # room for it all: no bar
+    QApplication.instance().processEvents()
+    QApplication.instance().processEvents()
+    assert scroll.horizontalScrollBar().maximum() == 0
+    assert scroll.height() - row_height <= 4    # and so no gap either
+
+
+# ────────────────────────────
+# The console's singletons survive their widgets
+# ────────────────────────────
+
+def test_a_destroyed_logger_is_rebuilt(qt_app):
+    """It is a singleton twice over, and used to hand back the corpse.
+
+    Once the C++ object went, every later connect() raised and the Debug
+    Console could never be built again for the life of the process.
+    """
+    from PyQt5 import sip
+
+    import editor.debug_console as dc
+
+    logger = dc.get_debug_logger()
+    logger.deleteLater()
+    sip.delete(logger)
+    assert sip.isdeleted(logger)
+
+    rebuilt = dc.get_debug_logger()
+
+    assert not sip.isdeleted(rebuilt)
+    assert rebuilt is not logger
+
+
+def test_a_destroyed_console_is_rebuilt(qt_app):
+    from PyQt5 import sip
+
+    import editor.debug_console as dc
+    from editor.editor_state import EditorState
+
+    class Host(QWidget):
+        def __init__(self):
+            super().__init__()
+            self.state = EditorState()
+            self.config = configparser.ConfigParser()
+
+    host = Host()
+    _KEEP_ALIVE.append(host)
+    console = dc.DebugConsole.get_instance(host)
+    sip.delete(console)
+
+    rebuilt = dc.DebugConsole.get_instance(host)
+
+    assert not sip.isdeleted(rebuilt)
+    _KEEP_ALIVE.append(rebuilt)
+
+
+def test_a_live_logger_is_not_replaced(qt_app):
+    """The recovery must not hand out a new logger on every call."""
+    import editor.debug_console as dc
+
+    assert dc.get_debug_logger() is dc.get_debug_logger()
+
+
+def test_the_debug_console_preserves_reader_position_on_unrelated_range_changes(qt_app):
+    """A resize/range update must not override a deliberate scroll-up."""
+    from PyQt5.QtWidgets import QMainWindow, QVBoxLayout
+
+    console = _debug_console(qt_app)
+    window = QMainWindow()
+    holder = QWidget()
+    QVBoxLayout(holder).addWidget(console)
+    window.setCentralWidget(holder)
+    window.resize(700, 400)
+    window.show()
+    _KEEP_ALIVE.append(window)
+    qt_app.processEvents()
+
+    console._insert_lines([f'output {i}<br>' for i in range(100)])
+    qt_app.processEvents()
+
+    scrollbar = console.console.verticalScrollBar()
+    original_maximum = scrollbar.maximum()
+    assert original_maximum > 0
+    scrollbar.setValue(original_maximum // 2)
+    reader_position = scrollbar.value()
+
+    # A layout/range change unrelated to output must leave the user's position
+    # alone; only _insert_lines schedules a scroll to the latest output.
+    scrollbar.setRange(scrollbar.minimum(), original_maximum + 10)
+    assert scrollbar.value() == reader_position
+    scrollbar.setRange(scrollbar.minimum(), original_maximum)
+    assert scrollbar.value() == reader_position

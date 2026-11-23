@@ -1,0 +1,414 @@
+import os
+import posixpath
+import json
+import zipfile
+
+from engine import terrain_stamp
+from typing import Dict, List, Optional, Set
+
+from engine.fileio import atomic_output
+
+
+class PackageExporter:
+    """
+    Builds a .fiopak: the current map, every map it reaches through a level
+    change, and the assets those maps reference, zipped with a metadata.json
+    whose ``map_path`` names the entry map inside the archive.
+
+    A package is a world container.  Everything written into it comes from
+    inside the project: a map or asset reference that resolves outside
+    ``<root>/maps`` / ``<root>/assets`` (an absolute path, or one climbing out
+    with ``..``) is reported and skipped, never copied.
+    """
+
+    # Asset path patterns to scan for in map JSON
+    ASSET_KEYS = {
+        'textures': ['textures', 'texture', 'texture_path', 'sprite_2d', 'custom_idle',
+                     'custom_shoot', 'custom_dead'],
+        'models': ['model_path', 'mesh'],
+        'sounds': ['sound_file', 'sound', 'audio']
+    }
+
+    # Property keys that name another map a level can change to.
+    MAP_KEYS = ('target_map', 'map', 'next_map', 'next_level', 'target_level',
+                'level_name', 'map_name')
+
+    # Property naming the cutscene a LogicCamera plays (cutscenes/<name>.json).
+    CUTSCENE_KEY = 'cutscene_file'
+
+    # Where a bare asset filename may live under assets/.
+    ASSET_SUBDIRS = ('textures', 'models', 'sounds', 'music', 'sprites', 'materials')
+
+    def __init__(self, editor_state, root_dir: str):
+        self.editor_state = editor_state
+        self.root_dir = os.path.abspath(root_dir)
+        self.errors: List[str] = []
+        # Each map file read and parsed once an export: every step of it
+        # (dependencies, references, entity types, terrain, the player copy)
+        # used to read it again, five reads a map.
+        self._maps: Dict[str, Optional[dict]] = {}
+        self._minified: Dict[str, bool] = {}
+
+    def export(self, output_path, metadata, current_map_path, parent_widget=None):
+        """Export the current project as a .fiopak zip.
+
+        Returns ``(success, errors)``.  A package written with some assets
+        missing still succeeds; the misses are reported in *errors*.  The
+        archive is assembled beside *output_path* and moved into place only
+        once complete, so a failed export never damages an existing package.
+        """
+        import traceback
+
+        asset_sources = None
+        self._maps.clear()
+        self._minified.clear()
+        try:
+            root = self.root_dir
+            if not os.path.isdir(root):
+                raise FileNotFoundError(f"Project root not found: {root}")
+
+            current_map_abs = os.path.abspath(current_map_path)
+            if not os.path.isfile(current_map_abs):
+                raise FileNotFoundError(f"Current map not found: {current_map_abs}")
+
+            # ---- 1. The maps: the current one and everything it links to ----
+            all_maps = self._collect_map_dependencies(current_map_abs)
+            start_map_rel = metadata.get('map_path')
+            if start_map_rel:
+                start_map_abs = os.path.join(root, start_map_rel)
+                if os.path.isfile(start_map_abs):
+                    self._collect_map_dependencies(start_map_abs, all_maps)
+                else:
+                    self.errors.append(f"Start map not found: {start_map_abs}")
+
+            # ---- 2. Archive names, fixed before anything is written ----
+            # The current map is named first so it keeps its own basename.
+            map_archive_paths: Dict[str, str] = {}
+            used = set()
+            for map_file in [current_map_abs] + sorted(all_maps - {current_map_abs}):
+                name, ext = os.path.splitext(os.path.basename(map_file))
+                # Keep map hierarchy so identically named linked levels
+                # resolve exactly as their authored references do.
+                maps_root = os.path.join(root, 'maps')
+                archive_path = (os.path.relpath(map_file, root).replace('\\', '/')
+                                if self._inside(map_file, maps_root) else f"maps/{name}{ext}")
+                counter = 1
+                while archive_path in used:
+                    archive_path = f"maps/{name}_{counter}{ext}"
+                    counter += 1
+                used.add(archive_path)
+                map_archive_paths[map_file] = archive_path
+
+            manifest = dict(metadata)
+            manifest['map_path'] = map_archive_paths[current_map_abs]
+
+            # ---- 3. Cutscenes and referenced assets from every map ----
+            referenced_assets: Set[str] = set()
+            cutscene_entries: Dict[str, str] = {}   # arcname -> source
+            for map_file in map_archive_paths:
+                data = self._read_map(map_file)
+                if data is None:
+                    continue
+                referenced_assets |= self._asset_references(data)
+                for name in sorted(self._cutscene_references(data)):
+                    src_path = self._resolve_cutscene(name, map_file)
+                    if src_path is None:
+                        continue
+                    arcname = os.path.relpath(src_path, root).replace('\\', '/')
+                    if arcname in cutscene_entries:
+                        continue
+                    cutscene_entries[arcname] = src_path
+                    # Actors a cutscene spawns name their own sprites/models.
+                    cutscene = self._read_map(src_path)
+                    if cutscene is not None:
+                        referenced_assets |= self._cutscene_asset_references(cutscene)
+
+            from engine.package_assets import (COMPANION_SUFFIXES, ProjectAssets,
+                                               companion_assets)
+            sources = asset_sources = ProjectAssets(root)
+            asset_entries = {}
+            # Built-in gameplay sprites/audio are implicit references (monster
+            # states, weapons, water sounds). Carry them with the world too.
+            pending = list(referenced_assets)
+            entity_types = {str(t.get('type', '')).replace('_', '').lower()
+                            for map_file in map_archive_paths
+                            for t in (self._read_map(map_file) or {}).get('things', [])}
+            # Engine defaults and cutscene-spawned entities need these even
+            # when no Monster/Prop is present in the serialized map.
+            prefixes = (['assets/sprites/', 'assets/textures/effects/', 'assets/sounds/']
+                        if entity_types else [])
+            if any((self._read_map(m) or {}).get('terrain_data') for m in map_archive_paths):
+                prefixes += ['assets/textures/']
+            pending.extend(name for name in sources.sources if name.startswith(tuple(prefixes)))
+            while pending:
+                reference = pending.pop()
+                name = sources.resolve(reference)
+                if name is None:
+                    kind = 'Skipped asset outside the project' if (
+                        os.path.isabs(reference) or '..' in reference.replace('\\', '/').split('/')) else 'Missing asset'
+                    self.errors.append(f"{kind}: {reference}")
+                    continue
+                if name in asset_entries:
+                    continue
+                asset_entries[name] = sources.sources[name]
+                # Only a model or material library names other files; a
+                # texture or sound is read once, when it is written.
+                if posixpath.splitext(name)[1].lower() in COMPANION_SUFFIXES:
+                    # One odd model is reported, not the end of the export.
+                    pending.extend(companion_assets(name, sources.read(name),
+                                                    self.errors))
+
+            # ---- 4. Assemble next to the destination, then swap it in ----
+            with atomic_output(output_path, binary=True) as handle:
+                with zipfile.ZipFile(handle, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    zf.writestr('metadata.json', json.dumps(manifest, indent=2))
+                    for map_file, archive_path in map_archive_paths.items():
+                        # The map's terrain paint and placed stamps go in
+                        # beside it, as their own file: the engine lays it
+                        # over the map as a delta when it loads it. A map
+                        # that still carries its paint (an unsaved copy, one
+                        # saved by an earlier build) has it taken out here.
+                        paint = self._stamp_file(map_file)
+                        player_copy = self._player_layout(map_file)
+                        if paint is None:
+                            source = player_copy or self._read_map(map_file) or {}
+                            without, inline = terrain_stamp.split_level(source)
+                            if inline is not None and (inline.get("stamps")
+                                                       or inline.get("paint")):
+                                paint, player_copy = inline, without
+                            elif (source.get(terrain_stamp.TERRAIN_KEY) or {}).get(
+                                    terrain_stamp.MARKER_KEY):
+                                self.errors.append(terrain_stamp.missing_paint_message(
+                                    os.path.basename(
+                                        terrain_stamp.default_stamp_path(map_file))))
+                        if paint is not None:
+                            zf.writestr(terrain_stamp.stamp_member(archive_path),
+                                        terrain_stamp.stamp_file_text(paint))
+                        if player_copy is None:
+                            zf.write(map_file, archive_path)
+                        elif self._is_minified(map_file):
+                            # A map kept minified is packaged minified.
+                            zf.writestr(archive_path, json.dumps(
+                                player_copy, separators=(",", ":")))
+                        else:
+                            zf.writestr(archive_path, json.dumps(player_copy, indent=2))
+                    for arcname, src_path in sorted(cutscene_entries.items()):
+                        zf.write(src_path, arcname)
+                    for arcname, source in sorted(asset_entries.items()):
+                        if isinstance(source, tuple):
+                            zf.writestr(arcname, sources.read(arcname))
+                        else:
+                            zf.write(source, arcname)
+
+            metadata['map_path'] = manifest['map_path']
+            return True, list(self.errors)
+
+        except Exception as e:
+            error_msg = f"Export failed:\n{str(e)}\n\n{traceback.format_exc()}"
+            self.errors.append(error_msg)
+            if parent_widget:
+                from PyQt5.QtWidgets import QMessageBox
+                QMessageBox.critical(parent_widget, "Export Error", error_msg)
+            return False, self.errors
+        finally:
+            if asset_sources is not None:
+                asset_sources.close()
+
+    # ------------------------------------------------------------------
+    # Discovery
+    # ------------------------------------------------------------------
+
+    def _player_layout(self, map_file) -> Optional[dict]:
+        """The copy of a map the packaged player reads, or ``None`` to copy
+        the file as it is.
+
+        Since Stage 2d of the unified brush model the editor saves version 5
+        (an angled brush's planes in its local frame, placed by ``pos``); the
+        Android player reads world-space planes (version 4 and earlier) and
+        is not updated yet, so a version-5 map is packaged as its explicit
+        version-4 export (``engine.brush_placement.export_world_level``:
+        lossless, every face record and placement kept). Older maps are
+        copied byte for byte."""
+        data = self._read_map(map_file)
+        if data is None:
+            return None
+        try:
+            version = int(data.get('version') or 0)
+        except (TypeError, ValueError):
+            return None
+        from engine.brush_placement import MAP_VERSION, export_world_level
+        if version < MAP_VERSION:
+            return None
+        return export_world_level(data)
+
+    def _read_map(self, map_file) -> Optional[dict]:
+        """*map_file* parsed, or None (reported once). Read once an export;
+        callers share the document and do not change it."""
+        key = os.path.abspath(map_file)
+        if key in self._maps:
+            return self._maps[key]
+        data = None
+        try:
+            with open(map_file, 'rb') as f:
+                raw = f.read()
+            self._minified[key] = b"\n" not in raw.strip()
+            data = json.loads(raw.decode('utf-8'))
+        except Exception as e:
+            self.errors.append(f"Could not read {map_file}: {e}")
+        else:
+            if not isinstance(data, dict):
+                self.errors.append(f"Not a map document: {map_file}")
+                data = None
+        self._maps[key] = data
+        return data
+
+    def _is_minified(self, map_file) -> bool:
+        """Whether a map file is minified JSON: all on one line."""
+        key = os.path.abspath(map_file)
+        if key not in self._minified:
+            try:
+                with open(map_file, 'rb') as f:
+                    self._minified[key] = b"\n" not in f.read().strip()
+            except OSError:
+                return False
+        return self._minified[key]
+
+    def _stamp_file(self, map_file) -> Optional[dict]:
+        """The paint file kept beside *map_file*, parsed; None when the map
+        has none (or it cannot be read, which is reported)."""
+        path = terrain_stamp.paint_path(map_file)
+        if path is None:
+            return None
+        try:
+            return terrain_stamp.load_stamp_file(path)
+        except terrain_stamp.StampError as exc:
+            self.errors.append(f"{os.path.basename(path)}: {exc}")
+            return None
+
+    def _asset_references(self, data: dict) -> Set[str]:
+        """Every asset name a map's brushes and things refer to."""
+        from engine.package_assets import map_assets
+        return map_assets(data)
+
+    def _cutscene_references(self, data: dict) -> Set[str]:
+        """Every cutscene file a map's entities name."""
+        refs: Set[str] = set()
+        for entity in (data.get('things', []) or []) + (data.get('brushes', []) or []):
+            if not isinstance(entity, dict):
+                continue
+            props = entity.get('properties')
+            props = props if isinstance(props, dict) else entity
+            val = props.get(self.CUTSCENE_KEY)
+            if val and isinstance(val, str) and val.strip():
+                refs.add(val.strip())
+        return refs
+
+    def _resolve_cutscene(self, name: str, map_file: str) -> Optional[str]:
+        """The project's ``cutscenes/`` file *name* refers to, or None (reported).
+
+        Resolved as the cutscene runtime does: against the project root, and
+        only inside ``cutscenes/``.
+        """
+        cutscenes_dir = os.path.join(self.root_dir, 'cutscenes')
+        rel = name.replace('\\', '/')
+        candidate = os.path.join(self.root_dir, rel)
+        where = os.path.basename(map_file)
+        if os.path.isabs(rel) or not self._inside(candidate, cutscenes_dir):
+            self.errors.append(
+                f"Skipped cutscene outside cutscenes/: '{name}' referenced in {where}")
+            return None
+        if not os.path.isfile(candidate):
+            self.errors.append(f"Missing cutscene: '{name}' referenced in {where}")
+            return None
+        return os.path.normpath(candidate)
+
+    def _cutscene_asset_references(self, cutscene: dict) -> Set[str]:
+        """Assets named by the entities a cutscene spawns as actors."""
+        spawned = [row.get('definition') for row in cutscene.get('actors', []) or []
+                   if isinstance(row, dict) and isinstance(row.get('definition'), dict)]
+        return self._asset_references({'things': spawned})
+
+    def _inside(self, path: str, base: str) -> bool:
+        path = os.path.realpath(path)
+        base = os.path.realpath(base)
+        return path == base or path.startswith(base + os.sep)
+
+    def _resolve_asset(self, asset_name: str) -> Optional[str]:
+        """The project file an asset reference names, or None (reported)."""
+        assets_dir = os.path.join(self.root_dir, 'assets')
+        if os.path.isabs(asset_name):
+            self.errors.append(f"Skipped asset outside the project: {asset_name}")
+            return None
+        rel = asset_name.replace('\\', '/')
+        candidates = [os.path.join(assets_dir, sub, rel) for sub in self.ASSET_SUBDIRS]
+        candidates.append(os.path.join(assets_dir, rel))
+        candidates.append(os.path.join(self.root_dir, rel))
+        # The runtime (sounds by basename from assets/sounds) and the player's
+        # reader both fall back to the bare filename; so does the exporter.
+        base = posixpath.basename(rel)
+        if base and base != rel:
+            candidates += [os.path.join(assets_dir, sub, base)
+                           for sub in self.ASSET_SUBDIRS]
+        escaped = False
+        for src_path in candidates:
+            if not self._inside(src_path, assets_dir):
+                escaped = True
+                continue
+            if os.path.isfile(src_path):
+                return os.path.normpath(src_path)
+        if escaped and '..' in rel.split('/'):
+            self.errors.append(f"Skipped asset outside the project: {asset_name}")
+        else:
+            self.errors.append(f"Missing asset: {asset_name}")
+        return None
+
+    def _collect_map_dependencies(self, map_path, collected=None):
+        """*map_path* plus every project map it reaches by a level change."""
+        if collected is None:
+            collected = set()
+        abs_path = os.path.abspath(map_path)
+        if abs_path in collected or not os.path.isfile(abs_path):
+            return collected
+        collected.add(abs_path)
+        data = self._read_map(abs_path)
+        if data is None:
+            return collected
+
+        all_entities = (data.get('things', []) or []) + (data.get('brushes', []) or [])
+        for entity in all_entities:
+            if not isinstance(entity, dict):
+                continue
+            props = dict(entity)
+            if isinstance(entity.get('properties'), dict):
+                props.update(entity['properties'])
+
+            target_map = None
+            for key in self.MAP_KEYS:
+                val = props.get(key)
+                if val and isinstance(val, str) and val.strip():
+                    target_map = val.strip()
+                    break
+            if not target_map:
+                continue
+
+            # As LevelChanger resolves it at run time: ".json" is optional.
+            if not target_map.lower().endswith('.json'):
+                target_map += '.json'
+            if os.path.isabs(target_map):
+                self.errors.append(
+                    f"Skipped map outside the project: '{target_map}' "
+                    f"referenced in {os.path.basename(abs_path)}")
+                continue
+            base_dir = os.path.dirname(abs_path)
+            candidates = [
+                os.path.join(self.root_dir, 'maps', target_map),
+                os.path.join(self.root_dir, target_map),
+                os.path.join(base_dir, target_map),
+            ]
+            for candidate in candidates:
+                if self._inside(candidate, self.root_dir) and os.path.isfile(candidate):
+                    self._collect_map_dependencies(candidate, collected)
+                    break
+            else:
+                self.errors.append(f"Missing dependency: map '{target_map}' referenced in {os.path.basename(abs_path)}")
+        return collected

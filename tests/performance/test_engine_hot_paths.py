@@ -1,0 +1,616 @@
+"""Work-per-frame guards for the engine's hot paths.
+
+The companion module (``test_hot_path_integrity``) guards the geometry and
+component-editing paths.  This one covers what the *running game* does every
+tick: the cull buffers, the collision-brush concatenation, the I/O reverse
+index, the AI's spatial queries, and the per-frame plugin gate.
+
+Like its companion, every assertion here counts work rather than timing it.  A
+test that pinned a microsecond budget would fail on a slow runner and teach
+nobody anything; a test that says "this rebuilt the array 60 times a second when
+it should have built it once" says exactly what regressed.
+"""
+
+import numpy as np
+import pytest
+
+pytest.importorskip("PyQt5", reason="these drive the real logic thread")
+
+from editor import io_system as io                  # noqa: E402
+from editor.editor_state import EditorState         # noqa: E402
+from editor.io_system import OutputConnection       # noqa: E402
+from editor.things import Light, Monster            # noqa: E402
+from engine.constants import brush_aabb_bounds      # noqa: E402
+from engine.logic_thread import LogicThread         # noqa: E402
+from engine.spatial_grid import SpatialGrid              # noqa: E402
+from engine.threaded_game_state import ThreadedGameState  # noqa: E402
+from tests.helpers.worlds import box_brush, make_thing, pillar_grid, room  # noqa: E402
+
+pytestmark = [pytest.mark.qt, pytest.mark.perf]
+
+
+@pytest.fixture
+def logic():
+    made = []
+
+    def _build(brushes=(), things=()):
+        state = EditorState()
+        state.brushes = list(brushes)
+        state.things = list(things)
+        thread = LogicThread(ThreadedGameState(), state)
+        made.append(thread)
+        return thread
+
+    yield _build
+
+    for thread in made:
+        thread.session_runtime.apply_play_mode(False)
+        thread.stop()
+
+
+# ---------------------------------------------------------------------------
+# The cull buffers
+# ---------------------------------------------------------------------------
+
+def test_the_cull_buffers_are_built_once_per_session_not_per_frame(logic):
+    thread = logic(brushes=pillar_grid(6, 6, spacing=300.0))
+    thread.session_runtime.apply_play_mode(True)
+    try:
+        thread.render_runtime.prepare_render_state()
+        table = thread.game_state.get_write_state().render_table
+        bounds = table.bounds
+        generation = table.generation
+        for _ in range(20):
+            thread.render_runtime.prepare_render_state()
+        assert table.bounds is bounds, (
+            "the projection's centre/half-extent block was reallocated during "
+            "a frame; it is built once and refreshed in place")
+        assert np.shares_memory(table.center, bounds)
+        assert np.shares_memory(table.half, bounds)
+        assert table.generation == generation, (
+            "the projection reconciled during a steady-state frame; the world "
+            "epoch has not moved, so sync should be a couple of comparisons")
+    finally:
+        thread.session_runtime.apply_play_mode(False)
+
+
+def test_only_dynamic_rows_are_refreshed_each_frame(logic):
+    """A static brush's centre must not be rewritten 60 times a second."""
+    static = box_brush("static", (0, 0, -400))
+    mover = box_brush("lift", (100, 0, -400), is_mover=True)
+    thread = logic(brushes=[static, mover])
+    thread.session_runtime.apply_play_mode(True)
+    try:
+        thread.render_runtime.prepare_render_state()
+        table = thread.game_state.get_write_state().render_table
+        static_row = table.center[0].copy()
+
+        # Move both brushes. The static one behind the projection's back: its
+        # row must not follow, because nothing re-reads static rows per frame.
+        # The mover as anything outside the tick must, through the journal:
+        # its row comes from the dense mover table, not a per-frame re-read.
+        from engine.change_journal import moved
+        static["pos"] = [9999.0, 0.0, -400.0]
+        mover["pos"] = [8888.0, 0.0, -400.0]
+        moved(mover)
+        thread.render_runtime.prepare_render_state()
+
+        assert np.array_equal(table.center[0], static_row), (
+            "the static brush's row was refreshed; the per-frame loop is "
+            "walking every brush, not just the movers")
+        assert table.center[1][0] == pytest.approx(8888.0), (
+            "the mover's row was not refreshed, so it would be culled "
+            "against its old position")
+    finally:
+        thread.session_runtime.apply_play_mode(False)
+
+
+def test_classification_is_not_re_resolved_per_frame(logic):
+    """The cold columns are the expensive half; they must not move per frame.
+
+    This is the property the whole projection exists for: ``is_water_brush``
+    and the texture scan used to run per visible brush per frame.  Mutating a
+    classification field behind the projection's back and seeing the column
+    stay put is what proves the work is no longer happening.
+    """
+    brush = box_brush("wall", (0, 0, -400))
+    thread = logic(brushes=[brush])
+    thread.session_runtime.apply_play_mode(True)
+    try:
+        thread.render_runtime.prepare_render_state()
+        table = thread.game_state.get_write_state().render_table
+        before = int(table.class_bits[0])
+
+        brush["shader"] = "Glass"          # no epoch bump: nobody was told
+        for _ in range(10):
+            thread.render_runtime.prepare_render_state()
+        assert int(table.class_bits[0]) == before, (
+            "the classification columns were re-resolved during a frame")
+
+        # ...and the editor's coarse change signal is what picks it up.
+        thread.editor_state.mark_world_changed()
+        thread.render_runtime.prepare_render_state()
+        from engine.render_table import CLASS_GLASS
+        assert int(table.class_bits[0]) & CLASS_GLASS, (
+            "a world-epoch bump did not re-resolve the cold columns")
+    finally:
+        thread.session_runtime.apply_play_mode(False)
+
+
+def test_entity_classification_is_not_re_resolved_per_frame(logic):
+    """The entity projection's cold column, held to the same rule as the brush one.
+
+    ``_sort_objects`` asked every entity what it was on every frame -- four
+    isinstance tests, a ``str().lower()`` and a tuple compare each.  The column
+    answering instead is only worth having if it stays put between edits.
+    """
+    from engine import entity_table as et
+
+    thing = make_thing(Light, "lamp", (0, 100, 0))
+    thread = logic(things=[thing])
+    thread.session_runtime.apply_play_mode(True)
+    try:
+        thread.render_runtime.prepare_render_state()
+        table = thread.game_state.get_write_state().entity_table
+        before = int(table.class_bits[0])
+
+        thing.properties["render_mode"] = "billboard"   # nobody was told
+        thing.properties["sprite_path"] = "s.png"
+        for _ in range(10):
+            thread.render_runtime.prepare_render_state()
+        assert int(table.class_bits[0]) == before, (
+            "the entity classification column was re-resolved during a frame")
+
+        thread.editor_state.mark_world_changed()
+        thread.render_runtime.prepare_render_state()
+        assert int(table.class_bits[0]) & et.ENT_MODE_BILLBOARD, (
+            "a world-epoch bump did not re-resolve the entity column")
+    finally:
+        thread.session_runtime.apply_play_mode(False)
+
+
+def test_no_entity_is_copied_or_re_read_on_an_unchanged_frame(logic, monkeypatch):
+    """Entities are handed over by identity and resolved only when they change.
+
+    Monsters used to be republished as a fresh snapshot dict every frame, with
+    their sprite recipe rebuilt from it; the published table row is now what
+    the renderer reads, and a monster that did not change costs nothing.
+    """
+    from engine import entity_table as et_module
+
+    lamp = make_thing(Light, "lamp", (0, 100, 0))
+    grunt = make_thing(Monster, "grunt", (0, 96, -300))
+    # Editor mode: no AI thread, so nothing can legitimately change a row.
+    thread = logic(things=[lamp, grunt])
+    thread.render_runtime.prepare_render_state()
+    first_state = thread.game_state.get_write_state()
+    first = [first_state.entity_table.refs[int(slot)]
+             for slot in first_state.visible_thing_slots]
+    resolved = []
+    monkeypatch.setattr(et_module, "sprite_candidates",
+                        lambda thing: resolved.append(thing) or ())
+    thread.render_runtime.prepare_render_state()
+    second_state = thread.game_state.get_write_state()
+    second = [second_state.entity_table.refs[int(slot)]
+              for slot in second_state.visible_thing_slots]
+
+    assert first == second == [lamp, grunt]
+    assert resolved == [], "an unchanged entity was re-resolved"
+    assert list(thread.game_state.get_write_state().entity_table.monster_slots) == [1]
+
+
+def test_the_frustum_test_is_one_batched_numpy_pass(logic):
+    """Not a Python loop over brushes, and not one array per plane."""
+    thread = logic()
+    planes = [(0.0, 0.0, 1.0, 1000.0)] * 6
+    centers = np.zeros((500, 3))
+    halves = np.ones((500, 3))
+
+    result = thread.render_runtime.aabb_in_frustum_batch(planes, centers, halves)
+
+    assert isinstance(result, np.ndarray) and result.dtype == bool, (
+        "the batched frustum test returned %r; a NumPy boolean mask is what "
+        "the mask-indexing downstream needs" % type(result).__name__)
+    assert result.shape == (500,)
+
+
+def test_the_collision_brush_list_is_concatenated_once_not_per_tick(logic):
+    """It used to be rebuilt per tick, and once per active projectile."""
+    from engine.player import Player
+
+    thread = logic(brushes=room())
+    thread.session_runtime.apply_play_mode(True)
+    try:
+        thread.player_runtime.player = Player(0.0, 0.0)
+        before = thread.collision_runtime._collision_brushes_cache
+        for _ in range(20):
+            thread._tick(1.0 / 60.0)
+            thread.render_runtime.prepare_render_state()
+        assert thread.collision_runtime._collision_brushes_cache is before, (
+            "the combined collision brush list was rebuilt during 20 ticks; "
+            "it only changes on a model-collision toggle or a play-mode "
+            "transition")
+    finally:
+        thread.session_runtime.apply_play_mode(False)
+
+
+# ---------------------------------------------------------------------------
+# The AABB cache
+# ---------------------------------------------------------------------------
+
+def test_an_unmoved_brushs_aabb_is_computed_once():
+    brush = box_brush("wall", (10, 20, 30), (64, 64, 64))
+    first = brush_aabb_bounds(brush)
+    for _ in range(100):
+        assert brush_aabb_bounds(brush) is first, (
+            "the AABB tuple was rebuilt for an unchanged brush; the physics "
+            "and AI hot paths call this thousands of times a second")
+
+
+def test_a_moved_brushs_aabb_is_recomputed_exactly_once_per_move():
+    brush = box_brush("mover", (0, 0, 0), (64, 64, 64), is_mover=True)
+    brush_aabb_bounds(brush)
+    brush["pos"] = [100.0, 0.0, 0.0]
+    moved = brush_aabb_bounds(brush)
+    for _ in range(50):
+        assert brush_aabb_bounds(brush) is moved
+
+
+# ---------------------------------------------------------------------------
+# The spatial grid
+# ---------------------------------------------------------------------------
+
+def test_a_point_query_touches_only_the_local_cell():
+    """Cost is proportional to what is nearby, not to the size of the world."""
+    brushes = pillar_grid(12, 12, spacing=700.0)     # spread over many cells
+    grid = SpatialGrid()
+    grid.populate(brushes)
+
+    found = grid.get_nearby_brushes(0.0, 0.0)
+
+    assert len(found) < len(brushes) / 4, (
+        "a point query returned %d of %d brushes; it is scanning the world "
+        "rather than the cell" % (len(found), len(brushes)))
+
+
+def test_a_radius_query_visits_only_occupied_cells():
+    grid = SpatialGrid()
+    # Wholly inside cell (0, 0), so exactly one cell is occupied.
+    grid.populate([box_brush("lonely", (256, 0, 256), (64, 64, 64))])
+    # A radius covering millions of cells, only one of which exists.
+    assert grid._index.cells_within(0.0, 0.0, 200000.0) == {(0, 0)}, (
+        "a 200000-unit radius query walked the whole square instead of the "
+        "occupied cells; it visited %s"
+        % (sorted(grid._index.cells_within(0.0, 0.0, 200000.0)),))
+
+
+def test_populating_the_grid_stores_references_not_copies():
+    brushes = pillar_grid(4, 4, spacing=300.0)
+    grid = SpatialGrid()
+    grid.populate(brushes)
+    originals = {id(b) for b in brushes}
+    stored = {id(b) for bucket in grid.cells.values() for b in bucket}
+    assert stored <= originals, (
+        "the grid holds %d objects that are not the scene's brushes; it copied "
+        "them" % len(stored - originals))
+
+
+# ---------------------------------------------------------------------------
+# The I/O reverse index
+# ---------------------------------------------------------------------------
+
+def test_the_reverse_index_is_built_once_while_nothing_changes():
+    brushes = [box_brush("b%d" % i, (i * 100, 0, 0), is_trigger=True)
+               for i in range(20)]
+    things = []
+    for brush in brushes:
+        io.add_connection(brush, OutputConnection(
+            output_name="OnTrigger", target_name="target", input_name="Open"))
+
+    first = io.target_index(brushes, things)
+    for _ in range(50):
+        assert io.target_index(brushes, things) is first, (
+            "the reverse index was rebuilt with no connection change; the "
+            "property panel rebuilds it on every selection")
+
+
+def test_the_reverse_index_is_rebuilt_when_a_connection_changes():
+    brushes = [box_brush("a", is_trigger=True)]
+    first = io.target_index(brushes, [])
+    io.add_connection(brushes[0], OutputConnection(
+        output_name="OnTrigger", target_name="t", input_name="Open"))
+    assert io.target_index(brushes, []) is not first, (
+        "adding a connection did not invalidate the cached index")
+
+
+# ---------------------------------------------------------------------------
+# MonsterAI
+# ---------------------------------------------------------------------------
+
+def test_the_ai_routes_its_queries_through_the_grid_not_the_brush_list(logic):
+    """Its fallback is an O(all brushes) scan, and must never be what runs."""
+    brushes = room(size=4096.0) + pillar_grid(6, 6, spacing=500.0)
+    monster = make_thing(Monster, "grunt", (0, 96, 0), awake=True)
+    thread = logic(brushes=brushes, things=[monster])
+    thread.session_runtime.apply_play_mode(True)
+    try:
+        from engine.player import Player
+        thread.player_runtime.player = Player(0.0, 0.0)
+        grid = thread.session_runtime.spatial_grid
+        calls = {"wall": 0, "ground": 0}
+        real_wall, real_ground = grid.overlaps_wall, grid.raycast_down
+
+        def _wall(*args, **kwargs):
+            calls["wall"] += 1
+            return real_wall(*args, **kwargs)
+
+        def _ground(*args, **kwargs):
+            calls["ground"] += 1
+            return real_ground(*args, **kwargs)
+
+        grid.overlaps_wall = _wall
+        grid.raycast_down = _ground
+
+        thread.monster_ai.update(1.0 / 30.0)
+
+        assert calls["ground"] > 0, (
+            "the AI's ground query did not go through the spatial grid; it "
+            "fell back to scanning all %d brushes" % len(brushes))
+    finally:
+        thread.session_runtime.apply_play_mode(False)
+
+
+def test_the_precomputed_monster_list_is_used_rather_than_a_type_scan(logic):
+    """Scanning every thing for ``isinstance(Monster)`` every tick was the
+    old shape; the list is built once on play-mode enter."""
+    monsters = [make_thing(Monster, "m%d" % i, (i * 100, 96, 0), awake=True)
+                for i in range(5)]
+    thread = logic(brushes=room(), things=monsters)
+    thread.session_runtime.apply_play_mode(True)
+    try:
+        assert len(thread.world_runtime.monster_things) == 5, (
+            "the monster cache holds %d of 5 monsters"
+            % len(thread.world_runtime.monster_things))
+        assert all(m in thread.world_runtime.monster_things for m in monsters)
+    finally:
+        thread.session_runtime.apply_play_mode(False)
+
+
+# ---------------------------------------------------------------------------
+# Plugins
+# ---------------------------------------------------------------------------
+
+def test_a_session_with_no_ticking_plugin_gates_the_per_frame_call(logic):
+    """``wants_tick`` is what makes an idle plugin system free per frame."""
+    thread = logic(brushes=room())
+    if thread.plugins is None:
+        pytest.skip("the plugin system is unavailable in this build")
+    for plugin in thread.plugins.plugins:
+        thread.plugins.set_enabled(plugin, False)
+    assert thread.plugins.wants_tick() is False, (
+        "every plugin is disabled but the engine would still dispatch a "
+        "per-frame tick to them")
+
+
+def test_the_tick_gate_answer_is_cached_across_frames(logic):
+    thread = logic(brushes=room())
+    if thread.plugins is None:
+        pytest.skip("the plugin system is unavailable in this build")
+    manager = thread.plugins
+    first = manager.wants_tick()
+    generation = manager._tick_work_gen
+    for _ in range(100):
+        assert manager.wants_tick() is first
+    assert manager._tick_work_gen == generation, (
+        "the tick gate recomputed itself with nothing changed; it is meant to "
+        "be one integer compare per frame")
+
+
+# ---------------------------------------------------------------------------
+# Portals
+# ---------------------------------------------------------------------------
+
+def test_portal_fades_tick_off_the_cache_not_the_thing_list(logic):
+    """``_update_portals`` runs every frame and used to isinstance-scan every
+    Thing in the map to find the portals — on a map with none at all."""
+    from editor.things import Portal
+    from engine.player import Player
+
+    portals = [Portal(pos=[0, 0, float(i) * 200.0],
+                      properties={'name': 'P%d' % i}) for i in range(3)]
+    filler = [make_thing(Light, "L%d" % i) for i in range(50)]
+    thread = logic(brushes=room(), things=filler + portals)
+    thread.player_runtime.player = Player(0.0, 0.0, 0.0)
+    thread.camera.player = thread.player_runtime.player
+    thread.session_runtime.apply_play_mode(True)
+    try:
+        assert thread.portal_runtime.portal_things == portals
+        assert thread.portal_runtime.portal_slots.tolist() == [50, 51, 52]
+        assert thread.portal_runtime.portal_target_slots.tolist() == [-1, -1, -1]
+
+        # Fades still advance, and they advance for portals the name index
+        # cannot hold (an unnamed portal is still a portal).
+        unnamed = Portal(pos=[500, 0, 0])
+        thread.editor_state.things.append(unnamed)
+        thread.world_runtime.build_entity_caches()
+        assert unnamed in thread.portal_runtime.portal_things
+        assert '' not in [p.properties.get('name', '') for p in thread.portal_runtime.portal_things]
+
+        for p in thread.portal_runtime.portal_things:
+            p._fade_alpha, p._fade_target = 0.0, 1.0
+        thread.portal_runtime.update(1.0 / 60.0)
+        assert all(p._fade_alpha > 0.0 for p in thread.portal_runtime.portal_things)
+
+        # Instrument the authoritative collection itself.  This verifies
+        # the production portal cache is used without recreating the removed
+        # LogicThread.things compatibility property.
+        class TrackingThings(list):
+            def __iter__(self):
+                self.iterations += 1
+                return super().__iter__()
+
+        tracked = TrackingThings(thread.editor_state.things)
+        tracked.iterations = 0
+        thread.editor_state.things = tracked
+        thread.portal_runtime.update(1.0 / 60.0)
+        assert tracked.iterations == 0, (
+            "_update_portals iterated the authoritative thing list %d times "
+            "in one frame" % tracked.iterations)
+    finally:
+        thread.session_runtime.apply_play_mode(False)
+
+
+def test_portal_transit_keeps_player_at_mapped_plane_not_body_clearance(logic):
+    """Walking through a portal must not add a player-sized camera jump."""
+    from editor.things import Portal
+    from engine.player import Player
+    from engine.portal_transform import map_direction, map_point
+    import glm
+
+    portal_a = Portal(pos=[0.0, 0.0, 0.0], properties={
+        'name': 'A', 'portal_target': 'B',
+        'rotation': [0.0, 0.0, 0.0],
+    })
+    portal_b = Portal(pos=[100.0, 0.0, 0.0], properties={
+        'name': 'B', 'portal_target': 'A',
+        'rotation': [180.0, 0.0, 0.0],
+    })
+    thread = logic(brushes=[], things=[portal_a, portal_b])
+    player = Player(0.0, -10.0, 0.0)
+    player.pos = glm.vec3(0.0, 20.0, -4.0)
+    player.velocity = glm.vec3(0.0, 0.0, -120.0)
+    thread.player_runtime.player = player
+    thread.camera.player = thread.player_runtime.player
+    thread.session_runtime.apply_play_mode(True)
+    try:
+        expected = map_point(
+            portal_a.pos, portal_a.get_basis(),
+            portal_b.pos, portal_b.get_basis(),
+            tuple(player.pos),
+        )
+        expected_velocity = map_direction(
+            portal_a.get_basis(), portal_b.get_basis(), tuple(player.velocity))
+
+        thread.portal_runtime._execute_player_transit(portal_a, portal_b)
+
+        actual = tuple(thread.player_runtime.player.pos)
+        displacement = ((actual[0] - expected[0]) * portal_b.get_normal()[0]
+                        + (actual[1] - expected[1]) * portal_b.get_normal()[1]
+                        + (actual[2] - expected[2]) * portal_b.get_normal()[2])
+        assert np.isclose(displacement, 0.05, atol=1e-6)
+        assert np.allclose(tuple(thread.player_runtime.player.velocity), expected_velocity)
+    finally:
+        thread.session_runtime.apply_play_mode(False)
+
+
+def test_a_map_with_no_portals_pays_nothing_for_the_portal_system(logic):
+    from engine.player import Player
+
+    thread = logic(brushes=room(),
+                   things=[make_thing(Light, "L%d" % i) for i in range(20)])
+    thread.player_runtime.player = Player(0.0, 0.0, 0.0)
+    thread.session_runtime.apply_play_mode(True)
+    try:
+        assert thread.portal_runtime.portal_things == []
+        thread.portal_runtime._portal_prev_player_pos = None
+        thread.portal_runtime.update(1.0 / 60.0)
+        assert thread.portal_runtime._portal_prev_player_pos is None, (
+            "the portal system did per-frame work on a map with no portals")
+    finally:
+        thread.session_runtime.apply_play_mode(False)
+
+
+# ---------------------------------------------------------------------------
+# The player's hitscan, and the small-swarm projectile wall test
+# ---------------------------------------------------------------------------
+
+def _counting(monkeypatch, module, name):
+    calls = [0]
+    real = getattr(module, name)
+
+    def counted(*args, **kwargs):
+        calls[0] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(module, name, counted)
+    return calls
+
+
+def _armed(thread, item_id):
+    from engine.player import Player
+    thread.player_runtime.player = Player(0.0, 0.0)
+    player = thread.player_runtime.player
+    player.pos.x, player.pos.y, player.pos.z = 0.0, 40.0, 0.0
+    player.angle, player.pitch = 0.0, 0.0
+    combat = thread.combat_runtime
+    combat.give_weapon(combat.items.resolve(item_id))
+    return combat
+
+
+def test_a_shot_walks_no_brush_the_ray_does_not_meet(logic, monkeypatch):
+    """1,600 brushes and a shotgun's eight pellets: the old walk asked every
+    brush whether it was water and ray-tested every box, per pellet."""
+    from engine import logic_combat
+    brushes = room(size=8192.0) + pillar_grid(40, 40, spacing=180.0, size=(32, 256, 32))
+    thread = logic(brushes=brushes)
+    thread.session_runtime.apply_play_mode(True)
+    try:
+        combat = _armed(thread, "gun2")
+        water = _counting(monkeypatch, logic_combat, "is_water_brush")
+        slab = _counting(monkeypatch, type(combat), "intersect_ray_aabb")
+        combat._handle_shooting()
+        weapon = combat.held_weapon()
+        assert slab[0] == 0, "the hitscan ray-tested brushes one by one"
+        # Each pellet asks only the boxes it meets, nearest first, until one
+        # blocks: here the first pillar (or wall) it reaches.
+        assert water[0] <= weapon.pellets * 4, (
+            "%d brush predicate calls for %d pellets over %d brushes"
+            % (water[0], weapon.pellets, len(brushes)))
+    finally:
+        thread.session_runtime.apply_play_mode(False)
+
+
+def test_the_hitscan_rows_are_built_once_per_session_and_refreshed_once_per_shot(logic, monkeypatch):
+    from engine import logic_collision
+    brushes = room(size=4096.0) + pillar_grid(10, 10, spacing=300.0)
+    brushes[-1]["is_mover"] = True
+    thread = logic(brushes=brushes)
+    thread.session_runtime.apply_play_mode(True)
+    try:
+        combat = _armed(thread, "gun2")
+        built = _counting(monkeypatch, logic_collision.CollisionRows, "__init__")
+        refreshed = _counting(monkeypatch, logic_collision.CollisionRows, "refresh_movers")
+        for _ in range(10):
+            combat._last_player_shot_time = float("-inf")
+            combat.player_ammo = 8
+            combat._handle_shooting()
+        assert built[0] == 1, "the rows were rebuilt %d times in 10 shots" % built[0]
+        assert refreshed[0] == 10, (
+            "movers were re-read %d times in 10 eight-pellet shots; once a "
+            "shot is enough" % refreshed[0])
+    finally:
+        thread.session_runtime.apply_play_mode(False)
+
+
+def test_a_small_swarm_wall_test_walks_no_brush_the_point_is_not_in(logic, monkeypatch):
+    from engine import logic_combat
+    brushes = room(size=8192.0) + pillar_grid(30, 30, spacing=250.0, size=(32, 256, 32))
+    thread = logic(brushes=brushes)
+    thread.session_runtime.apply_play_mode(True)
+    try:
+        from engine.player import Player
+        thread.player_runtime.player = Player(0.0, -3000.0)
+        combat = thread.combat_runtime
+        for i in range(10):
+            combat._add_monster_projectile((40.0 + 250.0 * i, 128.0, 125.0),
+                                           (0.0, 0.0, 1.0), 777, 5.0, 10.0)
+        solid = _counting(monkeypatch, logic_combat, "is_solid_world_brush")
+        combat._update_monster_projectiles(1.0 / 60.0)
+        assert len(combat._monster_projectiles) == 10
+        # In open air between the pillars: no box holds a point, so no brush
+        # is asked whether it is solid.
+        assert solid[0] == 0, (
+            "%d solidity checks for 10 projectiles in open air over %d brushes"
+            % (solid[0], len(brushes)))
+    finally:
+        thread.session_runtime.apply_play_mode(False)

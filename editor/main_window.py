@@ -1,0 +1,6946 @@
+from engine.asset_qt import load_icon, load_pixmap
+from engine import gc_policy
+import sys
+import io
+import json
+import os
+import random
+import numpy as np
+import configparser
+import math
+import contextlib
+import copy
+import uuid
+import glm
+import time
+
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QMessageBox, QFileDialog, QDialog, QWidget, QLabel, QVBoxLayout,
+    QGraphicsOpacityEffect, QInputDialog, QColorDialog, QProgressDialog, QAction, QToolBar, QDockWidget,
+    QPushButton, QDialogButtonBox, QHBoxLayout, QStyle, QStatusBar, QTabWidget
+)
+from PyQt5.QtWidgets import QShortcut
+from PyQt5.QtCore import Qt, QByteArray, QTimer, QPropertyAnimation, QEasingCurve, pyqtSignal, QSize, QPoint
+from PyQt5.QtGui import QKeySequence, QPixmap, QCursor, QColor, QIcon
+
+from editor.things import Light, Prop, update_all_counters_from_entities
+from editor.SettingsWindow import SettingsWindow
+from editor.ui import LAYOUT_VERSION, Ui_MainWindow
+from editor.ui_scale import read_ui_scale_setting
+from editor.console_key import ConsoleShortcutFilter, is_console_key
+from editor.held_keys import HeldKeyInputMethodFilter
+from editor.user_paths import settings_path, writable_dir
+from editor.tooltips import set_tooltips_enabled
+from engine.constants import TILE_SIZE
+from engine.glasses import DEFAULT_GLASSES, normalize_glasses
+from engine import brush_faces, brush_geometry, brush_placement
+from engine import player_starts as start_rules
+from engine.change_journal import moved, touch
+from engine.spatial import set_live_flag
+from engine.fileio import write_json_atomic, write_text_atomic
+from editor.view_2d import View2D, singleton_instance
+from editor.editor_state import EditorState
+from editor import component_edit
+from editor import face_texture
+from editor.component_edit import (
+    ComponentController, COMPONENT_MODES, MODE_LABELS,
+    MODE_OBJECT, MODE_FACE, MODE_EDGE, MODE_VERTEX,
+)
+from editor.terrain_editor import TerrainEditorPanel
+from editor.debug_console import DebugConsole, CommandInput, debug_log
+from editor.console_commands import ConsoleCommandHandler
+
+
+class Toast(QLabel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        # CRITICAL: Remove Qt.SubWindow to use parent coordinates
+        self.setWindowFlags(Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setAlignment(Qt.AlignCenter)
+        self.hide()
+        
+        self.opacity_effect = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(self.opacity_effect)
+        
+        self.anim = QPropertyAnimation(self.opacity_effect, b"opacity")
+        # Toasts fade in and out over exactly 0.5 seconds.  The opacity effect
+        # covers the complete QLabel, so the coloured background fades with
+        # the text rather than popping in/out separately.
+        self.anim.setDuration(500)
+        self.anim.setEasingCurve(QEasingCurve.OutCubic)
+        
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self.fade_out)
+        
+        self.current_toast_id = None
+
+    def update_position(self):
+        if not self.isVisible() or not self.parentWidget():
+            return
+            
+        parent = self.parentWidget()
+        # Calculate horizontal center
+        x = max(0, (parent.width() - self.width()) // 2)
+        
+        # FIX: Remove the -60 offset to align with the bottom status bar area.
+        # parent.height() represents the absolute bottom of the MainWindow.
+        y = parent.height() - self.height()
+        
+        self.move(x, y)
+        self.raise_()  # Ensures it stays above the Status Bar widgets
+
+    def show_message(self, text, parent_widget=None, is_error=False, duration=None, 
+                     is_tooltip=False, toast_id=None):
+        """Show toast notification with STRICT bottom-middle positioning."""
+        if is_tooltip:
+            bg_color = "#2b2b2b"
+        elif is_error:
+            bg_color = "#8B0000"
+        else:
+            bg_color = "#2E6F40"
+        
+        self.setTextFormat(Qt.PlainText)
+        self.setStyleSheet(f"""
+            QLabel {{
+                background-color: {bg_color};
+                color: white;
+                padding: 10px 20px;
+                border-radius: 5px;
+                font-weight: bold;
+                font-size: 14px;
+            }}
+        """)
+        
+        self.setText(text)
+        self.adjustSize()
+        self.update_position()  # Force immediate positioning
+        
+        self.show()
+        self.raise_()
+        
+        self.opacity_effect.setOpacity(0)
+        self.anim.setDirection(QPropertyAnimation.Forward)
+        self.anim.setStartValue(0)
+        self.anim.setEndValue(1)
+        self.anim.start()
+        
+        self.current_toast_id = toast_id
+        
+        if duration == 0:
+            self.timer.stop()
+        else:
+            final_duration = duration if duration is not None else (4000 if is_error else 2500)
+            self.timer.start(final_duration)
+
+    def fade_out(self):
+        self.anim.setDirection(QPropertyAnimation.Backward)
+        self.anim.setEndValue(0)
+        self.anim.start()
+        
+
+def gore_level_from(config) -> int:
+    """The gore level in *config* (Settings/gore): 0 off, 1 normal (the
+    default), up to the last of ``LogicCombat.GORE_LEVELS``. An old on/off
+    value reads as off or normal."""
+    from engine.logic_combat import LogicCombat
+    raw = str(config.get('Settings', 'gore', fallback='1')).strip().lower()
+    if raw in ('true', 'yes', 'on'):
+        return 1
+    if raw in ('false', 'no', 'off'):
+        return 0
+    try:
+        return max(0, min(int(float(raw)), len(LogicCombat.GORE_LEVELS) - 1))
+    except ValueError:
+        return 1
+
+
+def _loading_overlay(window):
+    """*window*'s loading bar (a no-op stand-in where it has none)."""
+    from editor.loading_overlay import overlay_for
+    return overlay_for(window)
+
+
+def _loading_step(window, stage, percent=None):
+    """Name the stage of a long load on *window*'s loading bar, if one is up."""
+    overlay = getattr(window, '_loading_overlay', None)
+    if overlay is not None and overlay.active:
+        overlay.step(stage, percent)
+
+
+def _non_finite_at(value, path=""):
+    """Where in *value* the first NaN or infinite number is (for example
+    ``brushes[3] ('wall').pos[1]``), or None."""
+    if isinstance(value, float):
+        return None if math.isfinite(value) else (path or "a value")
+    if isinstance(value, dict):
+        name = value.get('name')
+        props = value.get('properties')
+        if not name and isinstance(props, dict):
+            name = props.get('name')
+        if isinstance(name, str) and name and path.endswith(']'):
+            path = f"{path} ('{name}')"
+        for key, item in value.items():
+            found = _non_finite_at(item, f"{path}.{key}" if path else str(key))
+            if found:
+                return found
+        return None
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            found = _non_finite_at(item, f"{path}[{index}]")
+            if found:
+                return found
+    return None
+
+
+def _strict_json(data, **layout):
+    """``json.dumps(data)`` refusing NaN and infinity, with a message that
+    says where the bad number is."""
+    try:
+        return json.dumps(data, allow_nan=False, **layout)
+    except ValueError as e:
+        where = _non_finite_at(data)
+        if where is None:
+            raise
+        raise ValueError(_non_finite_message(where)) from e
+
+
+def _non_finite_message(where):
+    return (f"{where} is not a number (NaN or infinity); the map was not "
+            f"written. Fix that value and save again.")
+
+
+class MainWindow(QMainWindow):
+    #: A LevelChanger asks for a map: ``(map path, destination spawn)``, the
+    #: spawn being a PlayerStart name, or '' for the map's primary start.
+    load_level_signal = pyqtSignal(str, str)
+    #: A LevelChanger asks for a newly generated level: the procedural
+    #: generator's settings (untrusted map data; sanitised before use).
+    generate_level_signal = pyqtSignal(object)
+    #: Emitted after set_selected_objects changes the selection (viewport,
+    #: Scene Hierarchy, ...); Debug Tables follows it.
+    selection_changed = pyqtSignal()
+    #: A background autosave finished: ``(path, error)``, error '' on success.
+    #: Emitted on the writer thread; delivered on the GUI thread.
+    _autosave_finished = pyqtSignal(str, str)
+    def __init__(self, root_dir):
+        super().__init__()
+        self.root_dir = root_dir
+        self.root_dir = os.path.abspath(root_dir) 
+        self.assets_root = os.path.join(self.root_dir, 'assets')
+        from engine.asset_archives import prepare_asset_archives
+        prepare_asset_archives(self.root_dir)
+        self.debug_console = None
+        self.key_bindings = {}
+
+        from editor.settings_file import SettingsParser
+        self.config = SettingsParser()
+        self.config.optionxform = str          # preserve case of option names
+        # The working directory's settings.ini (main.py runs from the install
+        # folder), or the per-user copy when that folder is read-only.
+        self.config_path = settings_path(os.getcwd())
+        self.load_config()
+        from editor.desktop_style import install_editor_style
+        install_editor_style(QApplication.instance())
+        self.load_key_bindings()
+
+        self.unsaved_changes = False
+        self.is_kiosk_mode = False
+        #: The world as Play started, when Stop is set to restore it.
+        self._pre_play_world = None
+        #: Set while the open level is the procedural generator's untouched
+        #: output (holds the top undo entry it was loaded with), so a
+        #: regenerate can replace its own preview without asking.
+        self._generated_level_marker = None
+        #: The played game package (editor/package_session.PackageSession,
+        #: read in place), whose levels and cutscenes a level change or a
+        #: LogicCamera finds; or None.
+        self._package = None
+        self._previous_tab_index = None
+        self.file_path = None
+        #: The open map is saved as minified JSON (File > Save As Minified...,
+        #: or a map that was opened minified).
+        self.map_minified = False
+        self.recent_files = []
+        self.load_level_signal.connect(self._on_level_change_requested)
+        self.generate_level_signal.connect(self._on_generate_level_requested)
+
+        self.setWindowTitle("Fio")
+        self.setWindowIcon(load_icon(os.path.join(self.root_dir, 'assets', 'icon.ico')))
+        self.setGeometry(100, 100, 1600, 900)
+        self._minimum_size_screen = None
+        self._cap_minimum_size()
+        self.state = EditorState()
+        # Checkpoints re-journal their objects once the editing event is done.
+        self.state.post_event = lambda fn: QTimer.singleShot(0, fn)
+        self.load_recent_files()
+        
+        self.keys_pressed = set()
+        #: ``(brush, face key)`` last textured, for the rotate-texture keys
+        #: when no face is hovered; rebound across history steps.
+        self.face_texture_target = None
+        self._brush_clipboard = None  # For Ctrl+C / Ctrl+V brush copy-paste
+        self.grid_visible = True
+        self.clip_mode = False  # Radiant-style clip/slice tool (toggled with X)
+        self.rotate_mode = False  # Free-rotate tool: drag in a 2D view to spin
+        # Base 2D interaction tool (Hammer-style): 'select' drags a rubber-band
+        # marquee, 'brush' drags out new box geometry.  Clip/rotate are separate
+        # drag tools layered on top and take precedence while active.
+        self.tool_mode = 'brush'
+        # Shared component-selection model (object / face / edge / vertex).
+        # Both the 2D views and the 3D viewport drive this one controller, so
+        # "click geometry, drag geometry" means the same thing in either view.
+        self.components = ComponentController()
+        # Clone-and-place: after Shift+Space the duplicate follows the cursor
+        # until a click drops it (Radiant-style).  Holds the objects being
+        # placed and the view-plane point they were grabbed at.
+        self.clone_placement = None
+        # Wall thickness the Hollow tool offers next time, so repeated hollows
+        # are a dialog keypress apart rather than a re-typed number.
+        self.last_hollow_thickness = 16
+        self.preview_timer = QTimer(self)  # OPTIMIZATION: Added parent=self for proper cleanup
+        self.preview_timer.timeout.connect(self.update_mover_preview)
+        self.preview_data = {} 
+        self.ui = Ui_MainWindow()
+        self.ui.setupUi(self)
+
+        self.update_recent_files_menu()
+        self.setup_package_actions() 
+        self.update_title()
+        
+        # The object name is the label Help > Keys lists these under; an
+        # unnamed QShortcut cannot describe itself.
+        self.ctrl_tab_shortcut = QShortcut(QKeySequence("Ctrl+Tab"), self)
+        self.ctrl_tab_shortcut.setObjectName("Cycle the 2D view")
+        self.ctrl_tab_shortcut.activated.connect(self.cycle_2d_view)
+
+        # Page Up / Page Down rotate brush-face textures 90 degrees. Window-
+        # level shortcuts so they fire no matter which panel has focus.
+        self.tex_rot_cw_shortcut = QShortcut(QKeySequence(Qt.Key_PageUp), self)
+        self.tex_rot_cw_shortcut.setObjectName("Rotate the face texture 90 clockwise")
+        self.tex_rot_cw_shortcut.activated.connect(lambda: self.rotate_textures(1))
+        self.tex_rot_ccw_shortcut = QShortcut(QKeySequence(Qt.Key_PageDown), self)
+        self.tex_rot_ccw_shortcut.setObjectName(
+            "Rotate the face texture 90 anticlockwise")
+        self.tex_rot_ccw_shortcut.activated.connect(lambda: self.rotate_textures(-1))
+        self.setFocus()
+        self.update_global_font()
+        self.apply_tooltip_settings()
+        self.load_layout()
+        
+        self.terrain = None
+        self.terrain_editor_window = None
+        #: The terrain is selected (Shift+click on it, or its row in the Scene
+        #: Hierarchy) in place of any objects: see editor/terrain_selection.py.
+        self.terrain_selected = False
+        self.surface_inspector = None  # lazily created Face-mode Surface Inspector
+        self._entity_inspectors = {}   # id(entity) -> open EntityInspector (API 1.5.0)
+        self.shortcuts_window = None   # lazily created Help > Keys window
+        from editor.entity_linking import EntityLinkTool
+        self.entity_link_tool = EntityLinkTool(self)
+
+        # debug_console is embedded in the properties tab widget (created in setupUi)
+        self.debug_console = DebugConsole.get_instance(self)
+        # --- Connect the command_issued signal to the command handler ---
+        self.console_handler = ConsoleCommandHandler(self)
+        self.debug_console.command_issued.connect(self.console_handler.handle_command)
+
+        # --- Play-mode console overlay (Quake-style drop-down input) ---
+        self._create_play_console_overlay()
+
+        # Settings that could not be read are said once, where a level
+        # designer will see them, instead of stopping the start.
+        from editor import settings_file
+        for problem in settings_file.problems:
+            debug_log("Warning", f"Settings: {problem}")
+
+        # If configured, switch to the Debug Console tab on startup
+        if self.config.getboolean('Display', 'always_show_io_debug', fallback=False):
+            if hasattr(self, 'properties_tab_widget'):
+                idx = self.properties_tab_widget.indexOf(self.debug_console)
+                self.properties_tab_widget.setCurrentIndex(idx)
+
+        self.ui.action_asset_browser.triggered.connect(self.toggle_asset_browser)
+
+        # Enable sysmon at launch if configured
+        if self.config.getboolean('Display', 'always_show_sysmon', fallback=False):
+            self.view_3d.sysmon.set_active(True)
+            self.view_3d.sysmon.set_expanded(True)
+            if hasattr(self, 'system_monitor_action'):
+                self.system_monitor_action.setChecked(True)
+
+        self.show_logic_links = True
+        
+        # Tooltips
+        self.camera_movement_learned = self.config.getboolean('Tooltips', 'camera_movement_learned', fallback=False)
+        self._apply_audio_volumes()
+        self.startup_tooltip_shown = False
+        self.tooltip_tips = [
+            "Z: Toggle freelook; WASD: Move camera",
+            "Mouse wheel: Zoom in/out",
+            "Ctrl+Tab: Cycle 2D views",
+            "Shift+Space: Clone, then click to place it",
+            "H: Hide selected, Shift+H: Unhide all",
+            "Delete / Backspace: Remove selected brush/object",
+            "Add Player Start before Play Mode",
+            "Shift+Wheel on Light: Adjust radius",
+            "Ctrl+Wheel on Light: Adjust intensity",
+            "Ctrl+Drag from Trigger to Connect",
+            "Triggers activate movers, doors, etc.",
+            "F5: Enter/Exit Play Mode",
+            "F3: Toggle System Monitor",
+            "F4: Toggle sprite visibility",
+            "F1: Toggle connection lines",
+            "Ctrl+Click: Multi-select",
+            "Ctrl+C/V: Copy & Paste brushes",
+            "T: Toggle Asset Browser",
+        ]
+        self.last_tooltip_time = 0
+        self.tooltip_interval = 30  # Seconds between occasional tooltips
+        
+        # Timer for occasional tooltips
+        # The occasional-tip timer: tips are no longer toasted (show_tooltip),
+        # so it is kept, stopped, for whatever reads it.
+        self.tooltip_timer = QTimer(self)
+        self.tooltip_timer.timeout.connect(self._check_occasional_tooltip)
+        
+        # Track right-click state for camera movement detection
+        self.right_mouse_held = False
+        self.view_3d.installEventFilter(self)
+        # Install event filter on self to catch arrow keys globally for nudging
+        self.installEventFilter(self)
+        # The console key is caught before a text field types it.
+        self._console_shortcut_filter = ConsoleShortcutFilter(self)
+        QApplication.instance().installEventFilter(self._console_shortcut_filter)
+        # Holding W to walk must not open macOS's accent picker over the game.
+        self._held_key_filter = HeldKeyInputMethodFilter(self)
+        QApplication.instance().installEventFilter(self._held_key_filter)
+        
+        # Show startup tooltip after window is shown
+        QTimer.singleShot(1500, self._show_startup_tooltip)
+        
+        # Map files are written under one lock, so a background autosave and
+        # a save from the File menu never write at the same time; the
+        # autosave's writer thread is made on first use.
+        import threading
+        self._map_io_lock = threading.Lock()
+        self._autosave_executor = None
+        self._autosave_future = None
+        self._autosave_generation = 0
+        self._autosave_written = {}         # path -> newest generation written
+        self._autosave_finished.connect(self._on_autosave_finished)
+
+        # Autosave Timer
+        self.autosave_timer = QTimer(self)
+        self.autosave_timer.timeout.connect(self.autosave)
+        self.setup_autosave()
+
+        # REMOVED: Redundant 200ms play button sync timer.
+        # All code paths that change play_mode already call update_play_button_color() directly:
+        #   - enter_play_mode() → update_play_button_color()
+        #   - _exit_play_mode() → update_play_button_color()
+        #   - load_level_file() → enter_play_mode() → update_play_button_color()
+
+        # Overlay management for Properties dock
+        self._original_properties_widget = None   # the widget that was replaced
+        self._current_overlay = None              # currently active overlay widget
+        self._overlay_close_callback = None       # optional cleanup when overlay is closed
+
+
+    def _close_current_overlay(self):
+        """Close any active overlay and restore the original Properties dock content."""
+        if self._current_overlay is not None:
+            # Call custom close callback if provided
+            if self._overlay_close_callback:
+                self._overlay_close_callback()
+                self._overlay_close_callback = None
+
+            # Remove the overlay widget
+            self._current_overlay.setParent(None)
+            self._current_overlay.deleteLater()
+            self._current_overlay = None
+
+            # Restore original widget
+            if self._original_properties_widget:
+                self.properties_dock.setWidget(self._original_properties_widget)
+                self._original_properties_widget = None
+
+    def _cleanup_export_overlay(self):
+        """Clean up after the export overlay is closed, however it closes.
+
+        An unsaved level is exported from a temporary copy written into
+        ``maps/``; it is removed here so Cancel or the close button do not
+        leave an ``export_temp_*.json`` behind in the project.
+        """
+        if hasattr(self, '_export_dialog'):
+            self._export_dialog = None
+        self._discard_export_temp_file()
+        # The overlay itself will be destroyed by _close_current_overlay
+
+    def _discard_export_temp_file(self):
+        temp_file = getattr(self, '_export_temp_file', None)
+        self._export_temp_file = None
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.unlink(temp_file)
+            except OSError as e:
+                print(f"Warning: could not delete temp file {temp_file}: {e}")
+
+    def _show_overlay(self, overlay_widget, close_callback=None):
+        """
+        Replace the Properties dock content with overlay_widget.
+        Any existing overlay is closed first.
+        close_callback is called when the overlay is later closed.
+        """
+        self._close_current_overlay()
+        self._original_properties_widget = self.properties_dock.widget()
+        self.properties_dock.setWidget(overlay_widget)
+        self._current_overlay = overlay_widget
+        self._overlay_close_callback = close_callback
+
+    def update_title(self):
+        """Updates window title with filename and dirty status."""
+        fname = os.path.basename(self.file_path) if self.file_path else "Untitled"
+        dirty_marker = "*" if self.unsaved_changes else ""
+        self.setWindowTitle(f"Fio - {fname} {dirty_marker}")
+
+    # A key's name is a settings.ini option name and its command an option
+    # value, and configparser has rules for both: "Ctrl+=" and "Ctrl+:" hold a
+    # delimiter, "[" and "#" start a section or a comment, and a "%" in a
+    # command is interpolation syntax. Names are percent-encoded on disk and
+    # "%" doubled, so every key Qt can name and every command can be stored.
+
+    def load_key_bindings(self):
+        from urllib.parse import unquote
+        if self.config.has_section('KeyBindings'):
+            for key in self.config.options('KeyBindings'):
+                try:
+                    command = self.config.get('KeyBindings', key)
+                except configparser.InterpolationError:
+                    # A hand-edited command with a bare "%".
+                    command = self.config.get('KeyBindings', key, raw=True)
+                self.key_bindings[unquote(key)] = command
+
+    def save_key_bindings(self):
+        from urllib.parse import quote
+        if self.config.has_section('KeyBindings'):
+            self.config.remove_section('KeyBindings')
+        self.config.add_section('KeyBindings')
+        for key, command in self.key_bindings.items():
+            self.config.set('KeyBindings', quote(key, safe='+'),
+                            str(command).replace('%', '%%'))
+        self.save_config()
+
+    def set_key_binding(self, key_str, command):
+        """Bind a key to a console command. Warn if key already bound and ask to overwrite."""
+        from PyQt5.QtWidgets import QMessageBox
+
+        if key_str in self.key_bindings:
+            old_cmd = self.key_bindings[key_str]
+            reply = QMessageBox.question(
+                self,
+                "Key Binding Conflict",
+                f"Key '{key_str}' is already bound to:\n\n  {old_cmd}\n\nOverwrite?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return False
+
+        self.key_bindings[key_str] = command
+        self.save_key_bindings()
+        return True
+
+    def mark_as_modified(self):
+        """Mark the project as having unsaved changes.
+
+        Legacy maps may store sky_image on a non-primary PlayerStart or on
+        several starts. Preserve that data on load and during UI refreshes;
+        the first actual edit is the boundary at which it is canonicalised.
+        """
+        if getattr(self, "state", None) is not None:
+            self.canonicalize_sky_image_ownership()
+        if not self.unsaved_changes:
+            self.unsaved_changes = True
+            self.update_title()
+    
+    def check_unsaved_changes(self):
+        """
+        Checks for unsaved changes. Returns True if it's safe to proceed 
+        (changes saved, discarded, or no changes), False if canceled.
+        """
+        if not self.unsaved_changes:
+            return True
+            
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Question)
+        msg.setWindowTitle("Unsaved Changes")
+        msg.setText("You have unsaved changes.")
+        msg.setInformativeText("Do you want to save your changes?")
+        msg.setStandardButtons(QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
+        msg.setDefaultButton(QMessageBox.Save)
+        
+        ret = msg.exec_()
+        
+        if ret == QMessageBox.Save:
+            self.save_level()
+            # If save failed (user cancelled file dialog), unsaved is still True
+            return not self.unsaved_changes 
+        elif ret == QMessageBox.Discard:
+            self.unsaved_changes = False
+            return True
+        else: # Cancel
+            return False
+
+    def load_recent_files(self):
+        # Ensure the list exists by default (fixes AttributeError on first run)
+        self.recent_files = [] 
+
+        if self.config.has_section('History') and self.config.has_option('History', 'recent_files'):
+            try:
+                raw_data = self.config.get('History', 'recent_files')
+                if raw_data:
+                    self.recent_files = json.loads(raw_data)
+            except Exception:
+                # Fallback to empty list on JSON error
+                self.recent_files = []
+
+    def save_recent_files(self):
+        if not self.config.has_section('History'):
+            self.config.add_section('History')
+        # "%" is interpolation syntax to the parser: a map in "100% done/"
+        # made a save or a load that had worked report failure.
+        self.config.set('History', 'recent_files',
+                        json.dumps(self.recent_files).replace('%', '%%'))
+        self.save_config()
+
+    def add_recent_file(self, file_path):
+        # Normalize path
+        file_path = os.path.abspath(file_path)
+        
+        if file_path in self.recent_files:
+            self.recent_files.remove(file_path)
+        
+        self.recent_files.insert(0, file_path)
+        
+        # Keep only last 5
+        if len(self.recent_files) > 5:
+            self.recent_files = self.recent_files[:5]
+            
+        self.save_recent_files()
+        self.update_recent_files_menu()
+
+    def update_recent_files_menu(self):
+        if not hasattr(self, 'recent_menu'):
+            return
+        
+        # Actions are parented to the menu: clear() deletes only the actions
+        # it owns, so window-owned ones piled up on every map load.
+        self.recent_menu.clear()
+        
+        if not self.recent_files:
+            dummy = QAction("No recent files", self.recent_menu)
+            dummy.setEnabled(False)
+            self.recent_menu.addAction(dummy)
+            return
+            
+        for path in self.recent_files:
+            # Check if file still exists
+            if not os.path.exists(path):
+                continue
+                
+            fname = os.path.basename(path)
+            action = QAction(fname, self.recent_menu)
+            action.setToolTip(path)
+            # Use lambda with default arg to capture variable in loop
+            action.triggered.connect(lambda checked, p=path: self.open_level_file(p))
+            self.recent_menu.addAction(action)
+
+    def setup_autosave(self):
+        enabled = self.config.getboolean('Editor', 'autosave_enabled', fallback=True)
+        interval_min = self.config.getint('Editor', 'autosave_interval', fallback=10)
+        # settings.ini is hand-editable: 0 would autosave on every idle loop
+        # and a huge value overflows QTimer (raising during start-up). The
+        # Settings dialog offers 5-60 minutes.
+        interval_min = max(1, min(60, interval_min))
+
+        if enabled:
+            # Convert minutes to milliseconds
+            self.autosave_timer.start(interval_min * 60 * 1000)
+        else:
+            self.autosave_timer.stop()
+
+    def autosave(self):
+        """Background autosave to a specific autosave file.
+
+        The level is serialized here, on the GUI thread, so the file is one
+        consistent moment of it; only the writing happens on a worker thread.
+        """
+        if not self.unsaved_changes:
+            return # Nothing to save
+        if self._in_play_mode():
+            # The scene is the running game's world, not the authored map.
+            return
+        self._write_autosave(background=True)
+
+    def _in_play_mode(self):
+        view = getattr(self, 'view_3d', None)
+        return view is not None and bool(view.play_mode)
+
+    def _refuse_file_command_in_play(self, what):
+        """True (with a toast) when *what* must not run because Play is on.
+
+        During Play the scene holds the running game's world: monsters have
+        moved, doors are open, runtime keys sit on the entities. Writing it
+        would replace the authored map with that, and clearing it would pull
+        the world out from under the session.
+        """
+        if not self._in_play_mode():
+            return False
+        self.show_toast(f"Stop Play to {what}", is_error=True)
+        return True
+
+    def _write_autosave(self, background=False):
+        """Write the open level to its ``maps/*_autosave.json`` file.
+
+        Returns the path written, or ``None`` if the write failed. The
+        unsaved flag is left alone: an autosave is not the level's file.
+
+        *background*: serialize now and leave the writing to the autosave
+        thread (the timer's autosave); the path is returned once the write is
+        queued, and a failure is reported when it happens. Without it the
+        file is written before this returns (a level change in Play, which is
+        about to replace the scene). Autosaves are minified: the encoding is
+        the part done on the GUI thread, and an autosave is a copy to recover
+        from, which loads exactly as an indented map does.
+        """
+        try:
+            # Ensure maps directory exists
+            autosave_dir = writable_dir(self.root_dir, "maps")
+            if not os.path.exists(autosave_dir):
+                os.makedirs(autosave_dir)
+                
+            # Use a generic autosave name or derived from current file
+            if self.file_path:
+                base = os.path.splitext(os.path.basename(self.file_path))[0]
+                save_name = f"{base}_autosave.json"
+            else:
+                save_name = "untitled_autosave.json"
+                
+            save_path = os.path.join(autosave_dir, save_name)
+            texts = self._map_texts(minified=True, detach=background)
+            self._autosave_generation += 1
+            generation = self._autosave_generation
+            if background:
+                self._queue_autosave(save_path, texts, generation)
+                return save_path
+
+            self._commit_map_texts(save_path, texts, generation)
+            print(f"[Autosave] Saved to {save_path}")
+            return save_path
+            
+        except Exception as e:
+            self._report_autosave_failure(e)
+            return None
+
+    def _queue_autosave(self, path, texts, generation):
+        """Write an autosave's *texts* on the autosave thread."""
+        if self._autosave_executor is None:
+            from concurrent.futures import ThreadPoolExecutor
+            # One worker: autosaves are written in the order they were taken.
+            self._autosave_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="fio-autosave")
+        finished = self._autosave_finished
+
+        def write():
+            try:
+                self._commit_map_texts(path, texts, generation)
+            except Exception as e:          # reported on the GUI thread
+                finished.emit(path, str(e) or type(e).__name__)
+            else:
+                finished.emit(path, "")
+
+        self._autosave_future = self._autosave_executor.submit(write)
+
+    def _on_autosave_finished(self, path, error):
+        if error:
+            self._report_autosave_failure(error)
+        else:
+            print(f"[Autosave] Saved to {path}")
+
+    @staticmethod
+    def _report_autosave_failure(error):
+        print(f"Autosave failed: {error}")
+        # Said where it is seen: a windowed build has no console, and an
+        # autosave that quietly stopped working is found out too late.
+        debug_log("Warning", f"Autosave failed: {error}")
+
+    def wait_for_autosave(self, timeout=None):
+        """Block until a background autosave in progress has been written.
+        Returns False if *timeout* (seconds) ran out first."""
+        future = self._autosave_future
+        if future is None:
+            return True
+        from concurrent.futures import TimeoutError as _Timeout
+        try:
+            future.result(timeout)
+        except _Timeout:
+            return False
+        return True
+
+    def show_procedural_map_generator(self):
+        """Open the procedural map generator as an overlay in the Properties dock."""
+        from editor.procedural_generator import ProceduralMapWidget
+
+        # Create the generator widget (it will emit map_generated when closed)
+        generator = ProceduralMapWidget(self.properties_dock)
+        generator.map_generated.connect(self._on_procedural_map_generated)
+
+        # Show it in the overlay system
+        self._show_overlay(generator)
+
+    def _on_procedural_map_generated(self, map_data):
+        """
+        Handle the signal from the generator:
+        - if map_data is not None → load the generated map (keep generator open)
+        - if map_data is None → user clicked X → close the overlay
+        """
+        if map_data is not None:
+            # Regenerating replaces the generator's own previous, untouched
+            # output without asking; anything else unsaved is the user's work.
+            if (not self._is_untouched_generated_level()
+                    and not self.check_unsaved_changes()):
+                return
+            # Loaded straight from memory: the level has no file until the
+            # user saves it, so it opens untitled and unsaved.
+            if self._load_level(map_data, None):
+                self._generated_level_marker = (self._undo_top(),)
+                self.show_toast("Generated map loaded (not saved yet)", level='success')
+        else:
+            # User closed the generator – close the overlay
+            self._close_current_overlay()
+
+    def _is_untouched_generated_level(self):
+        """True while the open level is generator output nobody has edited."""
+        marker = self._generated_level_marker
+        return (marker is not None and self.file_path is None
+                and marker[0] is self._undo_top())
+
+    def _on_generate_level_requested(self, params=None):
+        """A LevelChanger asked for a new random level: make it and go there.
+
+        *params* are the procedural generator settings the LevelChanger
+        carries (the ones its own level was generated with); each level gets
+        a fresh seed. The level is loaded from memory exactly as a level
+        change to a map file is, so during Play the player keeps their weapons
+        and play resumes at the new level's start.
+        """
+        from editor.procedural_generator import create_map_data, sanitize_params
+
+        untouched = self._is_untouched_generated_level()
+        playing = self.view_3d is not None and bool(self.view_3d.play_mode)
+        if not playing and not untouched and not self.check_unsaved_changes():
+            return False
+
+        params = sanitize_params(params)
+        random.seed()
+        seed = random.randint(0, 999999)
+        random.seed(seed)
+        try:
+            map_data = create_map_data(params)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.show_toast(f"Could not generate a level: {e}", is_error=True)
+            return False
+
+        was_unsaved = self.unsaved_changes
+        if untouched:
+            # Generator output nobody edited holds nothing to keep: the level
+            # change must not autosave it.
+            self.unsaved_changes = False
+        if not self._load_level(map_data, None, None, from_game=True):
+            self.unsaved_changes = was_unsaved
+            return False
+        self._generated_level_marker = (self._undo_top(),)
+        self.show_toast(f"Generated a new level (seed {seed})")
+        return True
+
+    def _undo_top(self):
+        """The newest undo entry, or ``None``: any edit or undo changes it."""
+        stack = self.state.undo_stack
+        return stack[-1] if stack else None
+
+    def center_2d_views_on(self, world_pos):
+        """Center all 2D views on the given world position (list/tuple of [x, y, z])."""
+        from PyQt5.QtCore import QPointF
+        self.view_top.pan_offset = QPointF(world_pos[0], world_pos[2])
+        self.view_side.pan_offset = QPointF(world_pos[2], world_pos[1])
+        self.view_front.pan_offset = QPointF(world_pos[0], world_pos[1])
+        self.view_top.update()
+        self.view_side.update()
+        self.view_front.update()
+
+
+    @staticmethod
+    def _object_focus_target(obj):
+        """``(centre, radius)`` of a brush or thing, in world units.
+
+        The radius is what decides how far back to stand: a 2048-unit floor and
+        a light entity both want to fill the view, and a fixed distance would
+        bury one and lose the other.
+        """
+        if isinstance(obj, dict):
+            pos = obj.get('pos') or [0.0, 0.0, 0.0]
+            size = obj.get('size') or [64.0, 64.0, 64.0]
+            centre = [float(pos[0]), float(pos[1]), float(pos[2])]
+            radius = max(float(size[0]), float(size[1]), float(size[2])) * 0.5
+        else:
+            pos = getattr(obj, 'pos', None) or [0.0, 0.0, 0.0]
+            centre = [float(pos[0]), float(pos[1]), float(pos[2])]
+            radius = 48.0
+            getter = getattr(obj, 'get_radius', None)
+            if callable(getter):
+                try:
+                    radius = max(radius, float(getter()))
+                except Exception:
+                    pass
+        return centre, max(16.0, radius)
+
+    def focus_on_object(self, obj):
+        """Centre every view on one object, in 2D and in 3D."""
+        if obj is None:
+            return
+        centre, radius = self._object_focus_target(obj)
+        self.focus_on_bounds(centre, radius)
+        name = (obj.get('name') if isinstance(obj, dict)
+                else obj.properties.get('name', '')) or 'object'
+        self.show_toast("Focused on %s" % name)
+
+    def focus_on_bounds(self, centre, radius):
+        """Centre every view on a point, framed for something *radius* across.
+
+        The 3D camera keeps its current yaw and pitch and simply moves so the
+        target is in front of it. Snapping to a canned angle would be easier and
+        would throw away the orientation the user had chosen, which is usually
+        the thing they were reasoning about.
+        """
+        radius = max(16.0, float(radius))
+        self.center_2d_views_on(centre)
+        # Zoom so the object spans a comfortable fraction of the viewport rather
+        # than whatever zoom happened to be set.
+        for view in (self.view_top, self.view_side, self.view_front):
+            try:
+                extent = min(view.width(), view.height())
+                if extent > 0:
+                    view.zoom_factor = max(0.05, min(8.0, extent / (radius * 6.0)))
+                view.update()
+            except Exception:
+                pass
+
+        camera = self.view_3d.camera
+        try:
+            import glm
+            front = camera.get_front_vector()
+            distance = max(radius * 3.0, 128.0)
+            self.view_3d.set_editor_camera(
+                glm.vec3(centre[0], centre[1], centre[2]) - front * distance)
+            self.view_3d.update()
+        except Exception:
+            pass
+
+    def resizeEvent(self, event):
+        """Refit the tool strip as the editor's usable height changes."""
+        super().resizeEvent(event)
+        if hasattr(self, 'tool_toolbar'):
+            self._schedule_toolbar_fit()
+
+    def moveEvent(self, event):
+        """Handle window move."""
+        super().moveEvent(event)
+        if self.screen() is not self._minimum_size_screen:
+            self._cap_minimum_size()
+            if hasattr(self, 'tool_toolbar'):
+                self._schedule_toolbar_fit()
+
+    def _cap_minimum_size(self):
+        """1280x800 minimum, but never more than this window's screen holds.
+
+        A laptop's desktop (in points on macOS, or at a reduced UI Scale) can
+        be smaller than 1280x800 once the menu bar and Dock are taken, and a
+        larger minimum pushes the window's edges and status bar off-screen.
+        Re-run when the window lands on another screen, including a saved
+        layout restoring it onto a smaller one.
+        """
+        screen = self.screen() or QApplication.primaryScreen()
+        self._minimum_size_screen = screen
+        available = screen.availableGeometry() if screen is not None else None
+        self.setMinimumSize(
+            min(1280, available.width()) if available else 1280,
+            min(800, available.height()) if available else 800)
+
+    def toggle_debug_console(self):
+        # --- Play mode: use the overlay instead of switching tabs ---
+        if self.view_3d.play_mode:
+            if self._is_play_console_visible():
+                self._hide_play_console_overlay()
+            else:
+                # The view's own console, as its console key binding opens.
+                self.keys_pressed.clear()
+                self.view_3d._open_console_overlay()
+            return
+
+        # --- Editor mode: switch tabs as before ---
+        tab = self.properties_tab_widget
+        console_idx = tab.indexOf(self.debug_console)
+        # Ensure the properties dock is visible
+        self.properties_dock.setVisible(True)
+        if tab.currentIndex() == console_idx:
+            # Already on the console tab — switch back to Properties
+            tab.setCurrentIndex(0)
+        else:
+            tab.setCurrentIndex(console_idx)
+
+    def show_properties_panel(self):
+        """Bring the Properties tab to the front and make sure it is visible.
+
+        The dock is tabbed with the Debug Console and can be closed outright,
+        so showing the panel means three things, not one: the dock visible, the
+        dock raised above anything docked over it, and the Properties tab
+        selected rather than the console.
+        """
+        dock = getattr(self, 'properties_dock', None)
+        tab = getattr(self, 'properties_tab_widget', None)
+        if dock is not None:
+            dock.setVisible(True)
+            dock.raise_()
+        if tab is not None:
+            index = tab.indexOf(self.property_editor)
+            if index >= 0:
+                tab.setCurrentIndex(index)
+
+    def _clear_terrain(self, refresh=True):
+        """Remove the terrain object and clear all references."""
+        # Destroy the live terrain object
+        if self.terrain is not None:
+            self.terrain.cleanup()
+            self.terrain = None
+
+        # Clear terrain data from editor state
+        self.state.terrain_data = None
+
+        # Notify the 3D view's logic thread (if any) that terrain is gone
+        if self.view_3d is not None and self.view_3d.logic_thread:
+            self.view_3d.logic_thread.world_runtime.terrain = None
+
+        # Close the terrain editor panel if it is open in the Properties dock
+        self.close_terrain_editor()
+
+        # Force a UI refresh (not while a level is being applied: that
+        # refreshes everything once the new level is in).
+        if refresh:
+            self.update_all_ui()
+
+    # ------------------------------------------------------------------
+    #  Play-mode console overlay helpers
+    # ------------------------------------------------------------------
+
+    def _create_play_console_overlay(self):
+        """Create a translucent command overlay for use during play mode."""
+        from PyQt5.QtWidgets import QFrame, QVBoxLayout
+        from PyQt5.QtGui import QFont
+
+        # Container frame — parented to view_3d so it draws on top of the 3D view
+        self._play_console_frame = QFrame(self.view_3d)
+        self._play_console_frame.setStyleSheet("""
+            QFrame {
+                background-color: rgba(0, 0, 0, 200);
+                border-bottom: 2px solid #4CAF50;
+            }
+        """)
+        self._play_console_frame.setFixedHeight(50)
+        self._play_console_frame.hide()
+
+        layout = QVBoxLayout(self._play_console_frame)
+        layout.setContentsMargins(8, 4, 8, 4)
+
+        self._play_console_input = CommandInput(self._play_console_frame)
+        self._play_console_input.setPlaceholderText("Enter command...")
+        self._play_console_input.setFont(QFont("Fio Mono", 12))
+        self._play_console_input.setStyleSheet("""
+            QLineEdit {
+                background-color: rgba(30, 30, 30, 220);
+                color: #00FF00;
+                border: 1px solid #555;
+                padding: 4px 8px;
+                selection-background-color: #4CAF50;
+            }
+        """)
+        self._play_console_input.returnPressed.connect(self._on_play_console_submit)
+        layout.addWidget(self._play_console_input)
+
+    def _show_play_console_overlay(self):
+        """Show the overlay and release the mouse cursor."""
+        frame = self._play_console_frame
+        # Stretch to full width of the 3D view
+        frame.setFixedWidth(self.view_3d.width())
+        frame.move(0, 0)
+        frame.show()
+        frame.raise_()
+
+        # Temporarily restore cursor so the user can see what they type
+        QApplication.restoreOverrideCursor()
+        self.view_3d.setCursor(Qt.ArrowCursor)
+
+        self._play_console_input.clear()
+        self._play_console_input.reset_history_position()
+        self._play_console_input.setFocus()
+
+    def _hide_play_console_overlay(self):
+        """Hide the overlay and re-grab the mouse."""
+        if self.view_3d.console_overlay_active:
+            self.view_3d._close_console_overlay()
+            return
+        self._play_console_frame.hide()
+
+        # Re-hide cursor for FPS control
+        QApplication.setOverrideCursor(Qt.BlankCursor)
+        self.view_3d.setFocus()
+
+    def _is_play_console_visible(self):
+        return self.view_3d.console_overlay_active or self._play_console_frame.isVisible()
+
+    def _on_play_console_submit(self):
+        """Submit the typed command, echo it in the debug console, then hide."""
+        cmd = self._play_console_input.text().strip()
+        if cmd:
+            self._play_console_input.add_history(cmd)
+            self.console_handler.handle_command(cmd)
+        self._hide_play_console_overlay()
+
+
+    def cycle_2d_view(self):
+        """Cycles through the 2D view tabs (Top, Side, Front) unless in play mode."""
+        if self.view_3d.play_mode:
+            return
+        
+        # Access the tab widget created in ui.py
+        if hasattr(self, 'right_tabs'):
+            count = self.right_tabs.count()
+            if count > 0:
+                next_index = (self.right_tabs.currentIndex() + 1) % count
+                self.right_tabs.setCurrentIndex(next_index)
+
+    def eventFilter(self, obj, event):
+        """Track viewport input and the toolbar's available layout space."""
+        from PyQt5.QtCore import QEvent
+
+        if obj is getattr(self, 'tool_toolbar', None):
+            if event.type() in (QEvent.Resize, QEvent.Show):
+                self._schedule_toolbar_fit()
+
+        if obj == self.view_3d:
+            if event.type() == QEvent.MouseButtonPress:
+                if event.button() == Qt.RightButton:
+                    self.right_mouse_held = True
+            elif event.type() == QEvent.MouseButtonRelease:
+                if event.button() == Qt.RightButton:
+                    self.right_mouse_held = False
+
+        # --- Arrow key nudging: works from any widget focus ---
+        if event.type() == QEvent.KeyPress:
+            key = event.key()
+            if self.is_fit_key(event) and not self._typing_focus():
+                if self.fit_textures():
+                    return True
+            if key in (Qt.Key_Up, Qt.Key_Down, Qt.Key_Left, Qt.Key_Right):
+                # A face selected in the Surface Inspector takes them first:
+                # arrows nudge its texture, Shift+arrows rotate it.
+                if self._arrow_face_texture(event):
+                    return True
+                # Selected terrain stamps take the arrows while the stamp
+                # brush is active, selected decals while the Decal tool is.
+                if self._nudge_terrain_stamps(event):
+                    return True
+                if self._nudge_decals(event):
+                    return True
+                # Only nudge if we have a selected object and not in play mode
+                selected = self.primary_selection()
+                if selected and not self.view_3d.play_mode:
+                    # Determine which 2D view to use for nudging
+                    current_view = self.right_tabs.currentWidget()
+                    if isinstance(current_view, View2D):
+                        # Let the 2D view handle the nudge (it has all the logic)
+                        current_view.keyPressEvent(event)
+                        return True  # Event consumed, don't propagate further
+
+        return super().eventFilter(obj, event)
+
+    def _nudge_terrain_stamps(self, event):
+        """Move the selected terrain stamps with the arrow keys.
+
+        Follows brush nudging in the Top view: one grid step (16 units with
+        the grid hidden), five with Shift, the first stamp snapped to the grid,
+        up/down along -Z/+Z. A run of key repeats is one undo step.
+        """
+        view_3d = self.view_3d
+        terrain = self.terrain
+        if (view_3d is None or view_3d.play_mode or terrain is None
+                or not view_3d.terrain_sculpt_active
+                or not terrain.selected_stamp_ids):
+            return False
+        current_view = self.right_tabs.currentWidget() if hasattr(self, 'right_tabs') else None
+        grid_visible = getattr(current_view, 'grid_visible', True)
+        grid = getattr(current_view, 'grid_size', None) or getattr(view_3d, 'grid_size', 16)
+        step = grid if grid_visible else 16
+        if event.modifiers() & Qt.ShiftModifier:
+            step *= 5
+        dx, dz = {Qt.Key_Left: (-step, 0), Qt.Key_Right: (step, 0),
+                  Qt.Key_Up: (0, -step), Qt.Key_Down: (0, step)}[event.key()]
+        primary = next(s for s in terrain.paint_stamps
+                       if s['id'] in terrain.selected_stamp_ids)
+        if grid_visible and grid:
+            dx = round((primary['x'] + dx) / grid) * grid - primary['x']
+            dz = round((primary['z'] + dz) / grid) * grid - primary['z']
+
+        timer = getattr(self, '_stamp_nudge_timer', None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._finish_stamp_nudge)
+            self._stamp_nudge_timer = timer
+        if not timer.isActive():
+            self.state.terrain_data = terrain.to_dict()
+            self.save_state()
+        terrain.move_paint_stamps(terrain.selected_stamp_ids, dx, dz, defer=True)
+        timer.start(350)
+        view_3d.update()
+        return True
+
+    def _arrow_face_texture(self, event):
+        """The arrow keys on the Surface Inspector's selected face (see
+        :meth:`editor.surface_inspector.SurfaceInspector.arrow_key`). Not in
+        Play, and not while a text or number field has the keyboard, where
+        the arrows are that field's."""
+        if self.view_3d is None or self.view_3d.play_mode:
+            return False
+        if self.selected_face_target() is None or self._typing_focus():
+            return False
+        return self.surface_inspector.arrow_key(event)
+
+    @staticmethod
+    def _typing_focus():
+        """Whether a text or number field has the keyboard (its keys are its
+        own: arrows step it, Shift+5 types a '%')."""
+        from PyQt5.QtWidgets import (QAbstractSpinBox, QComboBox, QLineEdit,
+                                     QPlainTextEdit, QTextEdit)
+        return isinstance(QApplication.focusWidget(), (
+            QAbstractSpinBox, QComboBox, QLineEdit, QPlainTextEdit, QTextEdit))
+
+    @staticmethod
+    def is_fit_key(event):
+        """Shift+5: on most layouts Qt reports it as '%' (Key_Percent), on
+        others as 5 with Shift. No other modifier (macOS's keypad flag aside)."""
+        modifiers = event.modifiers() & ~Qt.KeypadModifier
+        if modifiers & ~Qt.ShiftModifier:
+            return False
+        return (event.key() == Qt.Key_Percent
+                or (event.key() == Qt.Key_5 and bool(modifiers & Qt.ShiftModifier)))
+
+    def fit_textures(self):
+        """Shift+5: Fit -- the texture spans the face (the Surface Inspector's
+        Fit, with its repeat counts) -- on the face selected in the Surface
+        Inspector, or, with none, on every face of every selected brush. The
+        textures themselves are left as they are. Returns whether anything
+        was fitted."""
+        if self.view_3d is None or self.view_3d.play_mode:
+            return False
+        inspector = getattr(self, 'surface_inspector', None)
+        if self.selected_face_target() is not None:
+            inspector._apply_fit()
+            faces = inspector.target_faces()
+            self.show_toast(f"Fit: {faces[0][1]}" if len(faces) == 1
+                            else f"Fit: {len(faces)} faces")
+            return True
+        brushes = [b for b in (self._selected_brushes() or [])
+                   if isinstance(b, dict)]
+        if not brushes:
+            return False
+        repeat = ((inspector.fit_w.value(), inspector.fit_h.value())
+                  if inspector is not None else (1.0, 1.0))
+        self.save_state()
+        for brush in brushes:
+            for face_key in face_texture.face_keys(brush):
+                face_texture.apply_fit(brush, face_key, repeat)
+        self.state.mark_lighting_dirty(brushes)
+        self.unsaved_changes = True
+        self.update_views()
+        if inspector is not None and inspector.isVisible():
+            inspector.refresh_from_face()
+        self.show_toast("Fit: all faces" if len(brushes) == 1
+                        else f"Fit: all faces of {len(brushes)} brushes")
+        return True
+
+    def _nudge_decals(self, event):
+        """Move the Decal tool's selection with the arrow keys (as stamps)."""
+        view_3d = self.view_3d
+        tool = getattr(view_3d, 'decal_tool', None)
+        if view_3d is None or view_3d.play_mode or tool is None or not tool.active:
+            return False
+        current_view = self.right_tabs.currentWidget() if hasattr(self, 'right_tabs') else None
+        grid_visible = getattr(current_view, 'grid_visible', True)
+        grid = getattr(current_view, 'grid_size', None) or getattr(view_3d, 'grid_size', 16)
+        return tool.nudge(event.key(), bool(event.modifiers() & Qt.ShiftModifier),
+                          grid=grid, grid_visible=grid_visible)
+
+    def toggle_decal_tool(self, checked=None):
+        """Tools > Decal Tool: place, select, drag and nudge decals."""
+        tool = self.view_3d.decal_tool
+        if self.view_3d.play_mode:
+            self.show_toast("Leave Play to edit decals", is_error=True)
+            tool.set_active(False)
+            return
+        tool.set_active(not tool.active if checked is None else bool(checked))
+
+    def _finish_stamp_nudge(self):
+        if self.terrain is not None:
+            self.terrain.finish_stamp_edit()
+            self.state.terrain_data = self.terrain.to_dict()
+            self.view_3d.update()
+
+    def toggle_asset_browser(self):
+        """Toggles the visibility of the Asset Browser dock."""
+        if hasattr(self, 'asset_browser_dock'):
+            is_visible = self.asset_browser_dock.isVisible()
+            if is_visible:
+                self.asset_browser_dock.hide()
+            else:
+                self.asset_browser_dock.show()
+                # Ensure it is raised if tabbed or floating
+                self.asset_browser_dock.raise_()
+
+
+    #: Levels a toast can have (editor.debug_console.TOAST_STYLES).
+    TOAST_LEVELS = ('success', 'info', 'warning', 'error')
+
+    def show_toast(self, message, is_error=False, duration=None, level=None):
+        """Show a toast -- for important things only.
+
+        A toast is shown when it is an error (``is_error``) or names its
+        *level*: ``'success'`` for loads and saves, ``'warning'``,
+        ``'error'`` or ``'info'``. Anything else -- tips, hints, routine
+        feedback ("Grid Size: 32", "Applied to north") -- is not toasted.
+        A toast is a card in the Debug Console only (no pop-up): its level's
+        tint and accent bar, no click-to-filter links, never hidden by a
+        filter. It turns faint after a few seconds and comes back to full
+        colour, with a tiny close button, when hovered or clicked.
+        *duration* is accepted for callers' sake and not used.
+        """
+        level = 'error' if is_error else level
+        if level not in self.TOAST_LEVELS:
+            return None
+        from editor.debug_console import debug_log_toast
+        debug_log_toast(str(message), level)
+        return None
+
+    def show_tooltip(self, message, duration=4000, toast_id=None):
+        """Tips are no longer shown as toasts (only loads, saves, warnings
+        and errors are). Kept so callers and plugins need no change."""
+        return None
+
+    def _after(self, delay_ms, callback):
+        """Run *callback* once after *delay_ms*, but never after this window.
+
+        ``QTimer.singleShot`` with a bare lambda has no receiver, so a flash or
+        toast scheduled just before the window closed fired on its destroyed
+        widgets. A timer parented to the window is destroyed with it.
+        """
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(callback)
+        timer.timeout.connect(timer.deleteLater)
+        timer.start(int(delay_ms))
+        return timer
+
+    def _show_startup_tooltip(self):
+        """Show the camera movement tooltip on startup if not yet learned."""
+        if self.camera_movement_learned:
+            return
+        if self.startup_tooltip_shown:
+            return
+        self.startup_tooltip_shown = True
+        # Duration 0 = persistent until dismissed
+        self.show_tooltip("Press Z or hold right mouse to look; WASD to move", duration=0, toast_id="camera_tip")
+
+    def _check_occasional_tooltip(self):
+        """Periodically show helpful tooltips."""
+        # Don't show tooltips in play mode
+        if hasattr(self, 'view_3d') and self.view_3d.play_mode:
+            return
+        
+        # Don't interrupt the startup tooltip
+        if not self.camera_movement_learned and self.startup_tooltip_shown:
+            return
+        
+        current_time = time.time()
+        if current_time - self.last_tooltip_time < self.tooltip_interval:
+            return
+        
+        # Pick a random tip
+        if self.tooltip_tips:
+            tip = random.choice(self.tooltip_tips)
+            self.show_tooltip(tip, duration=5000)
+            self.last_tooltip_time = current_time
+
+    def on_camera_moved_with_wasd(self):
+        """Called when the user moves with WASD during editor mouse look."""
+        if self.camera_movement_learned:
+            return
+        
+        self.camera_movement_learned = True
+        
+        # Save to config
+        if not self.config.has_section('Tooltips'):
+            self.config.add_section('Tooltips')
+        self.config.set('Tooltips', 'camera_movement_learned', 'True')
+        self.save_config()
+        
+        # FIX: Clear the notification label directly instead of using self.toast
+        self.ui.notification_label.setText("")
+
+    
+    def open_terrain_editor(self):
+        """Open the terrain editor floating window."""
+        from PyQt5.QtCore import Qt
+
+        if self.terrain_locked():
+            self.show_toast("The terrain is locked. Unlock it to edit it.",
+                            is_error=True)
+            return
+        
+       # Create terrain if it doesn't exist
+        if self.terrain is None:
+            # Show progress dialog BEFORE creating terrain
+            progress = QProgressDialog("Doing the thing...", None, 0, 0, self)
+            
+            # REVISION: Set window flags to force the dialog to the top of the Z-order
+            progress.setWindowFlags(progress.windowFlags() | Qt.WindowStaysOnTopHint | Qt.Dialog)
+            
+            progress.setWindowTitle("Please Wait")
+            
+            # REVISION: ApplicationModal is more aggressive than WindowModal for staying on top
+            progress.setWindowModality(Qt.ApplicationModal)
+            
+            progress.setMinimumDuration(0)
+            progress.setMinimumWidth(300)
+            progress.setMinimumHeight(100)
+            progress.setStyleSheet("""
+                QProgressDialog {
+                    font-size: 14px;
+                }
+                QLabel {
+                    font-size: 14px;
+                    padding: 15px;
+                }
+            """)
+            progress.show()
+            QApplication.processEvents()  # Force the dialog to appear immediately
+            
+            try:
+                # Now create the terrain (this is the slow part)
+                from engine.terrain import Terrain
+                self.terrain = Terrain(seed=42)
+                
+                # Load from state if available
+                if self.state.terrain_data:
+                    self.terrain.from_dict(self.state.terrain_data)
+                
+                # Wire up terrain to logic thread for collision
+                if self.view_3d is not None and self.view_3d.logic_thread:
+                    self.view_3d.logic_thread.world_runtime.terrain = self.terrain
+            finally:
+                # Always close the progress dialog, and delete it: a closed
+                # dialog is still this window's child, one more per terrain.
+                progress.close()
+                progress.deleteLater()
+
+            # Store terrain data in state so the scene hierarchy can see it
+            self.state.terrain_data = self.terrain.to_dict()
+            self.scene_hierarchy.refresh_list()
+            # A new terrain is an edit: without this, closing the map dropped
+            # it with no prompt and autosave skipped it.
+            self.mark_as_modified()
+        
+        # Show the terrain editor as an overlay in the Properties dock (bottom
+        # left pane), the same way as the procedural map generator — not a
+        # floating window.
+        self._show_terrain_editor_panel()
+
+    def _show_terrain_editor_panel(self):
+        """Open (or re-raise) the Terrain Editor overlay for the current terrain.
+
+        The single place the biome/sculpt/size panel is created, shared by the
+        Terrain menu action and by the Big World fill (which surfaces it so the
+        generated ground can be customised). No-op without a terrain.
+        """
+        if self.terrain is None:
+            return
+        # Already open → just make sure it's visible and on top.
+        panel = getattr(self, 'terrain_editor_window', None)
+        if panel is not None:
+            if panel.isWindow():
+                panel.show()
+                panel.raise_()
+                panel.activateWindow()
+                return
+            self.properties_dock.setVisible(True)
+            self.properties_dock.raise_()
+            return
+        panel = TerrainEditorPanel(self.terrain, self)
+        panel.terrain_changed.connect(self.on_terrain_changed)
+        # _show_overlay closes any existing overlay first (whose close callback
+        # may null terrain_editor_window), so store the reference afterwards.
+        self._show_overlay(panel, close_callback=self._on_terrain_editor_closed)
+        self.terrain_editor_window = panel
+        self.properties_dock.setVisible(True)
+        self.properties_dock.raise_()
+
+    def _on_terrain_editor_closed(self):
+        """Clear the reference when the terrain editor overlay is closed."""
+        self.terrain_editor_window = None
+
+    def terrain_editor_floating(self):
+        panel = self.terrain_editor_window
+        return panel is not None and panel.isWindow()
+
+    def set_terrain_editor_floating(self, floating):
+        """Move the Terrain Editor between the Properties dock and a window
+        of its own (the button at its top left). The same panel either way:
+        its settings, tab and brush stay as they are."""
+        from PyQt5.QtCore import Qt
+        panel = self.terrain_editor_window
+        floating = bool(floating)
+        if panel is None or floating == panel.isWindow():
+            return
+        view = self.view_3d
+        brush_on = bool(view is not None and view.terrain_sculpt_active)
+        if floating:
+            # Let go of the dock without closing the panel.
+            if self._current_overlay is panel:
+                self._current_overlay = None
+                self._overlay_close_callback = None
+            size = panel.size()
+            panel.setParent(self, Qt.Window)
+            if self._original_properties_widget is not None and \
+                    self._current_overlay is None:
+                self.properties_dock.setWidget(self._original_properties_widget)
+                self._original_properties_widget = None
+            panel.setWindowTitle("Terrain Editor")
+            panel.resize(max(size.width(), 520), max(size.height(), 720))
+            panel.show()
+            panel.raise_()
+        else:
+            self._show_overlay(panel, close_callback=self._on_terrain_editor_closed)
+            self.terrain_editor_window = panel
+            self.properties_dock.setVisible(True)
+            self.properties_dock.raise_()
+            panel.show()
+        # Leaving the dock (or a window) hides the panel for a moment, and a
+        # hidden panel puts its brush down: pick it up again.
+        if brush_on and view is not None:
+            view.set_terrain_sculpt_active(True)
+        panel.sync_float_button()
+
+    def close_terrain_editor(self):
+        """Close the Terrain Editor, docked or floating."""
+        panel = self.terrain_editor_window
+        if panel is None:
+            return
+        if self._current_overlay is panel:
+            self._close_current_overlay()
+        else:
+            panel.hide()
+            panel.setParent(None)
+            panel.deleteLater()
+        self.terrain_editor_window = None
+
+    def on_terrain_changed(self):
+        """Handle terrain changes."""
+        if self.terrain:
+            self.state.terrain_data = self.terrain.to_dict()
+            # The panel emits this for its edits only (appearance, grass,
+            # palette, generation); they are part of the map, so the map is
+            # now unsaved.
+            self.mark_as_modified()
+        self.update_all_ui()
+
+    def clone_selected_object(self):
+        """Clone the selection and hand it to the cursor to place.
+
+        Radiant's clone workflow is ``select -> Shift+Space -> move -> click``:
+        the
+        duplicate appears immediately and follows the cursor until a click drops
+        it, so a row of pillars is a sequence of taps rather than a clone
+        followed by a separate drag.  The initial grid offset is kept so an
+        immediate click still leaves the copy beside the original instead of
+        exactly on top of it, and clipboard copy/paste is untouched.
+        """
+        sources = list(self.state.selected_objects)
+        if not sources:
+            return
+        sources, skipped = self._drop_singleton_copies(sources)
+        if not sources:
+            return
+
+        # A clone while one is still being placed drops the pending one first,
+        # so repeated Shift+Space never strands half-placed duplicates.
+        self.finish_clone_placement()
+        self.save_state()
+
+        # Offset based on the current 2D view, in grid-size steps
+        current_view = self.right_tabs.currentWidget()
+        axis_map = {'top': ('x', 'z'), 'side': ('y', 'z'), 'front': ('x', 'y')}
+        pos_map = {'x': 0, 'y': 1, 'z': 2}
+        offset = self.grid_size_spinbox.value()
+        delta = [0.0, 0.0, 0.0]
+        if isinstance(current_view, View2D):
+            ax1_name, ax2_name = axis_map.get(current_view.view_type, ('x', 'z'))
+            delta[pos_map[ax1_name]] = offset
+            delta[pos_map[ax2_name]] = offset
+
+        # Names already in the scene, so each copy can be given one of its own
+        # as it is created (two copies sharing a name would make every
+        # name-addressed I/O connection ambiguous between them).
+        taken_names = set(self.state.get_all_entity_names())
+
+        clones = []
+        for source in sources:
+            if isinstance(source, dict):
+                # Drop the runtime-only geometry caches before copying: the
+                # clone derives its own, and deep-copying them is pure waste.
+                new_obj = copy.deepcopy({
+                    k: v for k, v in source.items()
+                    if k not in brush_geometry.GEO_RUNTIME_KEYS})
+                new_obj['id'] = str(uuid.uuid4())    # a clone is a new entity
+                name = source.get('name', '')
+                if name:
+                    new_obj['name'] = self._copy_name(name, taken_names)
+                self.state.brushes.append(new_obj)
+            else:
+                # Entities carry their whole property set across, with a fresh
+                # UUID and their own name.  (A plain copy.copy would leave the
+                # clone sharing the original's properties dict.)
+                new_obj = source.duplicate(existing_names=taken_names)
+                taken_names.add(new_obj.properties.get('name', ''))
+                self.state.things.append(new_obj)
+            self._translate_object(new_obj, delta)
+            clones.append(new_obj)
+
+        self.set_selected_objects(clones)
+        self.show_toast("Cloned — move the cursor and click to place (Esc cancels)")
+
+        # Hand the copies to the cursor; the 2D views drive the placement.
+        self.clone_placement = {'objects': clones, 'anchor': None}
+
+        for obj in clones:
+            if isinstance(obj, dict):
+                obj['_flash_until'] = time.time() + 0.5  # Flash for 0.5s
+                self._after(500, lambda o=obj: self._clear_flash(o))
+        self.update_all_ui()
+
+    def _drop_singleton_copies(self, sources):
+        """*sources* minus entities a copy of which would break a per-map
+        singleton (one BigWorldSettings per map, say), and how many went.
+
+        A copy is refused while the scene already holds an instance of its
+        type; the toast says so. Brushes and ordinary entities pass through.
+        """
+        kept, skipped = [], 0
+        for source in sources:
+            props = getattr(source, 'properties', None)
+            if (not isinstance(source, dict) and isinstance(props, dict)
+                    and singleton_instance(self.state.things, props.get('type'))
+                    is not None):
+                skipped += 1
+                continue
+            kept.append(source)
+        if skipped:
+            self.show_toast(
+                "Only one of this entity is allowed per map - not copied.",
+                is_error=True)
+        return kept, skipped
+
+    @staticmethod
+    def _copy_name(base, taken):
+        """``base`` with ``(copy)`` appended, numbered until it is unused.
+
+        ``taken`` is updated in place so a run of clones in one operation each
+        get a distinct name.
+        """
+        name = '%s (copy)' % base
+        counter = 2
+        while name in taken:
+            name = '%s (copy %d)' % (base, counter)
+            counter += 1
+        taken.add(name)
+        return name
+
+    @staticmethod
+    def _translate_object(obj, delta):
+        """Move a brush (plane set included) or entity by a world delta."""
+        if isinstance(obj, dict):
+            if brush_geometry.brush_has_geometry(obj):
+                # An angled brush carries world-space planes: move those too,
+                # or the geometry stays behind while 'pos' walks off.
+                brush_geometry.translate_brush(obj, delta)
+                return
+            pos = obj['pos']
+            pos[0] += delta[0]
+            pos[1] += delta[1]
+            pos[2] += delta[2]
+        else:
+            # Assign, don't mutate in place: the assignment journals the move
+            # so the 3D view's entity table picks it up this frame.
+            obj.pos = [float(obj.pos[0]) + delta[0],
+                       float(obj.pos[1]) + delta[1],
+                       float(obj.pos[2]) + delta[2]]
+
+    def clone_placement_active(self):
+        return self.clone_placement is not None
+
+    def move_clone_placement(self, delta):
+        """Slide the objects being placed by a world-space delta."""
+        if not self.clone_placement:
+            return
+        for obj in self.clone_placement['objects']:
+            self._translate_object(obj, delta)
+
+    def finish_clone_placement(self):
+        """Drop the copies where they are.  Returns ``True`` if one was pending."""
+        if not self.clone_placement:
+            return False
+        objects = list(self.clone_placement['objects'])
+        count = len(objects)
+        self.clone_placement = None
+        self.unsaved_changes = True
+        self.state.mark_lighting_dirty(objects)
+        self.show_toast("Placed %d copy(s)" % count)
+        self.update_all_ui()
+        return True
+
+    def cancel_clone_placement(self):
+        """Throw the pending copies away (Esc / right-click)."""
+        if not self.clone_placement:
+            return False
+        for obj in self.clone_placement['objects']:
+            if isinstance(obj, dict):
+                if obj in self.state.brushes:
+                    self.state.brushes.remove(obj)
+            elif obj in self.state.things:
+                self.state.things.remove(obj)
+        self.clone_placement = None
+        self.set_selected_objects([])
+        # The clone pushed an undo checkpoint it no longer needs.
+        self.state.discard_last_checkpoint()
+        self.show_toast("Clone cancelled")
+        self.update_all_ui()
+        return True
+
+    def _clear_flash(self, obj):
+        """Clear the flash flag from an object and refresh views."""
+        if isinstance(obj, dict) and '_flash_until' in obj:
+            del obj['_flash_until']
+            self.update_all_ui()
+
+
+    def tint_selected_brush(self):
+        """The Asset Browser's Tint button: pick the selected brush's colour --
+        the one colour a brush has (:meth:`set_brush_colour`), the same as
+        Appearance > Brush Colour and, for a Glow brush, its Glow Color."""
+        brush = self.primary_selection()
+        if not isinstance(brush, dict):
+            self.show_toast("Select a brush first", is_error=True)
+            return
+        current = self.brush_colour(brush)
+        color = QColorDialog.getColor(
+            QColor(int(current[0] * 255), int(current[1] * 255), int(current[2] * 255)),
+            self, "Choose Brush Colour")
+        if color.isValid():
+            self.save_state()
+            self.set_brush_colour(brush, [color.redF(), color.greenF(), color.blueF()])
+
+    @staticmethod
+    def brush_colour(brush):
+        """The colour *brush* is drawn (and, a Glow brush, glows) in, 0-1:
+        its tint if one was set (the console's ``tint``), else its colour."""
+        from engine.constants import normalize_color
+        return list(normalize_color(brush.get('tint') or brush.get('colour'),
+                                    default=[0.8, 0.8, 0.8]))
+
+    def set_brush_colour(self, brush, rgb):
+        """Give *brush* colour *rgb* (0-1): the one colour setting a brush
+        has, whichever control sets it -- the Asset Browser's Tint,
+        Appearance > Brush Colour, a Glow brush's Glow Color. A tint left
+        from the console, which would hide it, goes."""
+        brush['colour'] = [float(c) for c in rgb]
+        brush.pop('tint', None)
+        self.state.mark_world_changed([brush])
+        self.mark_as_modified()
+        self.update_all_ui()
+
+
+    def placement_position(self):
+        """Where a newly added object goes: on the floor just ahead of the
+        editor camera, short of any wall in the way (editor/placement.py)."""
+        from editor.placement import placement_ahead
+        camera = self.view_3d.camera
+        grid = self.view_3d.grid_size if self.snap_to_grid_enabled() else 0
+        return placement_ahead(camera.pos, camera.yaw, self.state.brushes,
+                               terrain=self.terrain, grid=grid)
+
+    def add_model_to_scene(self, filepath, rotation, scale, pos=None):
+        """Add *filepath* as a model Prop at *pos* -- by default where the user
+        is, ahead of the editor camera, not the world origin."""
+        if pos is None:
+            try:
+                pos = self.placement_position()
+            except Exception:
+                pos = [0.0, 0.0, 0.0]
+        self.save_state()
+        
+        # Optional: Try to make path relative to project root for portability
+        try:
+            # Assuming self.root_dir is set, otherwise just use filepath
+            if hasattr(self, 'root_dir'):
+                assets_dir = os.path.join(self.root_dir, "assets")
+                rel_path = os.path.relpath(filepath, assets_dir)
+                if not rel_path.startswith(".."):
+                    filepath = os.path.join("assets", rel_path)
+        except Exception:
+            pass
+
+        # Every model is a Prop, placed as solid scenery: Solid on, Physics
+        # and Gravity off (engine.prop_entity.MODEL_PROP_DEFAULTS).
+        new_model = Prop.for_model(filepath, pos=list(pos),
+                                   properties={'rotation': rotation})
+
+        # Downloaded OBJs are commonly authored in real-world units and can be
+        # only a few Fio units across. Fio's world is much larger (TILE_SIZE is
+        # 50), so an otherwise valid imported mesh can become effectively
+        # invisible in the editor at the default camera distance. When the Asset
+        # Browser supplies the neutral [1,1,1] scale, give unusually small OBJs a
+        # sensible initial scene scale. Existing authored maps and explicit
+        # non-unit scales are left untouched.
+        initial_scale = list(scale) if isinstance(scale, (list, tuple)) else scale
+        if (
+            str(filepath).lower().endswith('.obj')
+            and isinstance(initial_scale, (list, tuple))
+            and len(initial_scale) == 3
+            and all(float(v) == 1.0 for v in initial_scale)
+        ):
+            try:
+                from engine.obj_loader import OBJLoader
+                loader = OBJLoader()
+                if loader.load(filepath) and loader.vertices:
+                    verts = np.asarray(loader.vertices, dtype=np.float32)
+                    extent = float(np.max(verts.max(axis=0) - verts.min(axis=0)))
+                    if 0.0 < extent < TILE_SIZE * 0.2:
+                        fit_target = TILE_SIZE * 0.5
+                        fit = min(fit_target / extent, 25.0)
+                        initial_scale = [fit, fit, fit]
+            except Exception:
+                pass
+
+        new_model.properties['scale'] = initial_scale
+        
+        # Set a default name based on filename
+        model_name = os.path.splitext(os.path.basename(filepath))[0]
+        new_model.properties['name'] = model_name
+        
+        self.state.things.append(new_model)
+        self.set_selected_objects([new_model])
+        self.show_toast(f"Added {model_name}")
+
+    def set_selected_objects(self, objects):
+        """Set the authoritative multi-selection."""
+        # Component handles belong to the selection: drop them and mark the
+        # overlay stale, since the brushes it was drawing handles for changed.
+        self.components.clear()
+        self.components.invalidate()
+        self.terrain_selected = False       # objects are selected, or nothing is
+        # Callers pass [None] for "nothing" (a click on empty space); None is
+        # never a member, or a later Shift+click made a two-object "group"
+        # with nothing in it (and its bounding box raised).
+        self.state.selected_objects = [o for o in (objects or []) if o is not None]
+        primary = self.primary_selection()
+        self.update_all_ui(selection_only=True)
+        self.selection_changed.emit()
+
+    @property
+    def editor_dormant(self):
+        """Whether the editor's own UI is out of sight and does no work:
+        kiosk mode, where the game has the window (fullscreen, borderless or
+        windowed) and rendering has the UI thread to itself. Its panels and
+        2D views are brought up to date once, when kiosk mode is left."""
+        return bool(getattr(self, 'is_kiosk_mode', False))
+
+    def update_all_ui(self, selection_only=False):
+        # *selection_only*: called by set_selected_objects, so the hierarchy
+        # may keep what it read from the objects since the last transaction.
+        # Every editor operation ends here: a PlayerStart it created, deleted,
+        # pasted or cloned is held to the primary invariant inside that
+        # operation (and its undo step), before anything shows the level.
+        self.state.settle_player_starts()
+        self.sync_sky_image_from_map()
+        if self.editor_dormant:
+            # Kiosk mode (a level change inside the game, a console command):
+            # only what the game draws -- the sky above, and a Big World's
+            # terrain fill. The panels nobody can see wait for kiosk mode to
+            # end (exit_kiosk_mode).
+            self.sync_bigworld_terrain(allow_create=True)
+            self._editor_ui_stale = True
+            return
+        self._editor_ui_stale = False
+        self.property_editor.set_object(self._property_target())
+        self.scene_hierarchy.refresh_list(selection_only=selection_only)
+        self.sync_surface_inspector()
+        window = getattr(self, 'visgroups_window', None)
+        if window is not None and window.isVisible():
+            window.refresh()
+        self.update_views()
+
+    # -- the terrain, selected and locked as a brush is ----------------------
+
+    def _property_target(self):
+        """What the property editor shows: the terrain when it is selected
+        (and there still is one), else the primary selection."""
+        if self.terrain_selected:
+            if self.state.terrain_data is not None:
+                from editor.terrain_selection import TERRAIN
+                return TERRAIN
+            self.terrain_selected = False
+        return self.primary_selection()
+
+    def select_terrain(self):
+        """Select the map's terrain in place of any objects. False when the
+        map has none."""
+        if self.state.terrain_data is None:
+            return False
+        self.components.clear()
+        self.components.invalidate()
+        self.state.selected_objects = []
+        self.terrain_selected = True
+        self.update_all_ui()
+        self.selection_changed.emit()
+        return True
+
+    def terrain_locked(self):
+        """Whether the terrain is locked ("Prevent selection/editing")."""
+        data = self.state.terrain_data
+        return bool(isinstance(data, dict) and data.get('lock', False))
+
+    def set_terrain_locked(self, locked):
+        """Lock or unlock the terrain, as a brush's lock: locked, it is not
+        picked in the 3D view and its editor does not open."""
+        data = self.state.terrain_data
+        if not isinstance(data, dict) or bool(data.get('lock', False)) == bool(locked):
+            return
+        if locked:
+            data['lock'] = True
+            # An editor open on a terrain that may not be edited.
+            self.close_terrain_editor()
+        else:
+            data.pop('lock', None)
+        if self.terrain is not None:
+            self.terrain.locked = bool(locked)
+        self.mark_as_modified()
+        self.update_all_ui()
+
+    def notify_camera_moved(self):
+        """The 3D view's camera may have moved: each 2D view on screen
+        repaints if it did (View2D._check_camera_changed)."""
+        for view in (getattr(self, 'view_top', None), getattr(self, 'view_front', None),
+                     getattr(self, 'view_side', None)):
+            if view is not None:
+                view._check_camera_changed()
+
+    def update_views(self):
+        self.sync_bigworld_terrain(allow_create=True)
+        self.view_3d.update()
+        self.view_top.reset_state()
+        self.view_front.reset_state()
+        self.view_side.reset_state()
+
+    # ------------------------------------------------------------------
+    # Big World: "fill world with terrain" — editor preview
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _bigworld_truthy(val, default=False):
+        if val is None:
+            return default
+        if isinstance(val, bool):
+            return val
+        return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+    def _find_bigworld_settings(self):
+        """The map's BigWorldSettings entity, or None."""
+        for thing in self.state.things:
+            props = getattr(thing, 'properties', None) or {}
+            if getattr(thing, 'TYPE', None) == 'bigworldsettings' \
+                    or props.get('type') == 'bigworldsettings':
+                return thing
+        return None
+
+    def _bigworld_world_extent(self, pad):
+        """World-space (min_x, min_z, max_x, max_z) AABB of all placed content.
+
+        Mirrors the runtime session's notion of "the whole world" (the bounding
+        box of everything the map contains), padded so terrain extends a little
+        past the outermost object. Returns None when the map is empty.
+        """
+        stream = self.state.editor_stream
+        cache_key = (self.state.world_epoch, pad, id(stream))
+        cached = getattr(self, '_editor_world_extent_cache', None)
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+        min_x = min_z = float('inf')
+        max_x = max_z = float('-inf')
+        found = False
+        # A camera-streamed map's whole world, unloaded cells included.
+        brushes = stream.records['brushes'].values() if stream else self.state.brushes
+        for b in brushes:
+            pos = b.get('pos'); size = b.get('size') or [0, 0, 0]
+            if not pos:
+                continue
+            hx = abs(size[0]) / 2.0; hz = abs(size[2]) / 2.0
+            min_x = min(min_x, pos[0] - hx); max_x = max(max_x, pos[0] + hx)
+            min_z = min(min_z, pos[2] - hz); max_z = max(max_z, pos[2] + hz)
+            found = True
+        things = stream.records['things'].values() if stream else self.state.things
+        for t in things:
+            pos = t.get('pos') if isinstance(t, dict) else getattr(t, 'pos', None)
+            if not pos:
+                continue
+            min_x = min(min_x, pos[0]); max_x = max(max_x, pos[0])
+            min_z = min(min_z, pos[2]); max_z = max(max_z, pos[2])
+            found = True
+        if not found:
+            return None
+        result = (min_x - pad, min_z - pad, max_x + pad, max_z + pad)
+        self._editor_world_extent_cache = (cache_key, result)
+        return result
+
+    def _ensure_terrain(self):
+        """Create a procedural Terrain if the map has none, and return it.
+
+        Mirrors the terrain-creation path in :meth:`open_terrain_editor` (minus
+        the modal progress dialog) so "Fill world with terrain" can generate a
+        terrain to fill even on a map that never opened the terrain editor.
+        Must be called on the main thread (GL setup), never from a paint event.
+        """
+        if self.terrain is not None:
+            return self.terrain
+        try:
+            from engine.terrain import Terrain
+            self.terrain = Terrain(seed=42)
+            if self.state.terrain_data:
+                self.terrain.from_dict(self.state.terrain_data)
+            if self.view_3d is not None and self.view_3d.logic_thread:
+                self.view_3d.logic_thread.world_runtime.terrain = self.terrain
+            self.state.terrain_data = self.terrain.to_dict()
+            if hasattr(self, 'scene_hierarchy'):
+                try:
+                    self.scene_hierarchy.refresh_list()
+                except Exception:
+                    pass
+        except Exception as exc:
+            print(f"[bigworld] could not create terrain for fill: {exc}")
+            return None
+        return self.terrain
+
+    def sync_bigworld_terrain(self, allow_create=False):
+        """Reflect the BigWorldSettings ``terrain_fill`` option in the editor.
+
+        When the map opts in, expand the procedural terrain to cover the whole
+        world and switch it to streaming so the world is visible in the editor
+        straight away while only the chunks around the editor camera are meshed
+        (as the camera moves). Turning the option off — or removing the entity —
+        restores the authored terrain. Cheap and idempotent; called on any edit
+        and on every top-view repaint. Never persists the expansion (see
+        ``Terrain.to_dict``).
+
+        ``allow_create`` lets the fill *generate* a terrain when the map has
+        none yet (the common case when the user has never opened the terrain
+        editor). It does GL setup, so it is only passed from main-thread callers
+        (edits / the property toggle), never from the 2D paint path.
+        """
+        settings = self._find_bigworld_settings()
+        fill = bool(
+            settings is not None
+            and self._bigworld_truthy(settings.properties.get('enabled', True), True)
+            and self._bigworld_truthy(settings.properties.get('terrain_fill', False))
+        )
+        terrain = self.terrain
+        if terrain is None and fill and allow_create:
+            terrain = self._ensure_terrain()
+        if terrain is None:
+            return
+        if not fill:
+            terrain.editor_unfill_world()
+            self._refresh_terrain_editor_size_lock()
+            return
+        try:
+            radius = float(settings.properties.get('terrain_stream_radius', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            radius = 0.0
+        if radius <= 0.0:
+            try:
+                radius = float(settings.properties.get('activation_radius', 2048.0) or 2048.0)
+            except (TypeError, ValueError):
+                radius = 2048.0
+        if self._bigworld_truthy(settings.properties.get('terrain_infinite', False)):
+            # Stream the terrain forever around the camera — no edge to walk off.
+            # Only the ring of chunks near the camera is ever resident, so the
+            # huge extent costs nothing. (Matches BigWorldSession.INFINITE_HALF_EXTENT.)
+            h = 1.0e7
+            extent = (-h, -h, h, h)
+        else:
+            extent = self._bigworld_world_extent(pad=max(512.0, radius))
+        if extent is None:
+            terrain.editor_unfill_world()
+            return
+        min_wx, min_wz, max_wx, max_wz = extent
+        terrain.editor_fill_world(min_wx, min_wz, max_wx, max_wz, radius)
+        self._refresh_terrain_editor_size_lock()
+
+    def _refresh_terrain_editor_size_lock(self):
+        """If the Terrain Editor is open, lock/unlock its Size tab to match
+        whether Big World currently owns the world size."""
+        panel = self.terrain_editor_window
+        terrain = self.terrain
+        if panel is not None and terrain is not None:
+            try:
+                panel.set_bigworld_managed(terrain._authored_bounds is not None)
+            except Exception:
+                pass
+
+    def select_object(self, obj):
+        self.set_selected_objects([obj])
+
+    def highlight_in_hierarchy(self, obj):
+        """Highlight an object in the scene hierarchy without selecting it.
+        Used for locked objects when locked_not_selectable_2d is enabled."""
+        self.scene_hierarchy.highlight_item(obj)
+
+
+    def _schedule_toolbar_fit(self):
+        """Coalesce Qt resize/show events; resizing buttons can resize the bar."""
+        if getattr(self, '_toolbar_fit_pending', False):
+            return
+        self._toolbar_fit_pending = True
+        QTimer.singleShot(0, self._apply_pending_toolbar_fit)
+
+    def _apply_pending_toolbar_fit(self):
+        self._toolbar_fit_pending = False
+        toolbar = getattr(self, 'tool_toolbar', None)
+        if toolbar is not None and toolbar.isVisible():
+            self.apply_toolbar_button_size()
+
+    def apply_toolbar_button_size(self):
+        """Keep every editing button and Play within the available toolbar.
+
+        A fixed 45px icon and 250px vertical Play button were too tall for
+        laptop screens: Qt pushed Play into its overflow. Treat those as
+        maximum sizes, shrinking *all* buttons together when height is tight.
+        """
+        from editor.ui import fit_toolbar_metrics
+        toolbar = getattr(self, 'tool_toolbar', None)
+        if toolbar is None:
+            return
+        vertical = toolbar.orientation() == Qt.Vertical
+        screen = self.screen() or QApplication.primaryScreen()
+        if toolbar.isFloating() and screen is not None:
+            bounds = screen.availableGeometry()
+            available = (bounds.height() if vertical else bounds.width()) - 48
+        elif vertical:
+            # Calculate from the *window*, not the old toolbar size hint (which
+            # already includes the oversized buttons that caused overflow).
+            available = self.height() - 12
+            menubar = self.menuBar()
+            if menubar is not None and menubar.isVisible():
+                available -= menubar.height()
+            status = self.findChild(QStatusBar)
+            if status is not None and status.isVisible():
+                available -= status.height()
+            if toolbar.isVisible() and toolbar.height() > 200:
+                available = min(available, toolbar.height())
+        else:
+            available = self.width() - 12
+            if toolbar.isVisible() and toolbar.width() > 200:
+                available = min(available, toolbar.width())
+
+        buttons = [button for button in toolbar.findChildren(QPushButton)
+                   if button.property("toolbar_icon_button")]
+        separators = sum(action.isSeparator() for action in toolbar.actions())
+        style = toolbar.style()
+        icon, length = fit_toolbar_metrics(
+            self.config, available, len(buttons), separators, vertical,
+            spacing=style.pixelMetric(QStyle.PM_ToolBarItemSpacing, None, toolbar),
+            margin=style.pixelMetric(QStyle.PM_ToolBarItemMargin, None, toolbar),
+            handle=style.pixelMetric(QStyle.PM_ToolBarHandleExtent, None, toolbar),
+            separator_extent=style.pixelMetric(QStyle.PM_ToolBarSeparatorExtent, None, toolbar),
+        )
+        if (icon == getattr(self, '_toolbar_icon_size', None)
+                and length == getattr(self, '_play_button_length', None)
+                and (not buttons or buttons[0].height() == icon + 8)
+                and (not hasattr(self, 'play_button') or
+                     (self.play_button.height() if vertical else self.play_button.width()) == length)):
+            return
+        self._toolbar_icon_size = icon
+        self._play_button_length = length
+        for button in buttons:
+            button.setIconSize(QSize(icon, icon))
+            button.setFixedSize(icon + 4, icon + 8)
+        if hasattr(self, 'play_button'):
+            self.play_button.setIconSize(QSize(icon, icon))
+            sync = getattr(self, '_sync_play_button', None)
+            if sync is not None:
+                sync(toolbar.orientation())
+
+    def update_play_button_color(self):
+        """Update the Play button color based on current mode."""
+        action = getattr(self, 'show_whole_world_action', None)
+        if action is not None:
+            action.setEnabled(not self.view_3d.play_mode)
+        if hasattr(self, 'play_button'):
+            if self.view_3d.play_mode:
+                # Red for play mode
+                self.play_button.setStyleSheet("""
+                    QPushButton {
+                        background-color: #C62828;
+                        color: white;
+                        border: 1px solid #B71C1C;
+                        border-radius: 3px;
+                        padding: 5px 15px;
+                        font-weight: bold;
+                        min-width: 0px;
+                    }
+                    QPushButton:hover {
+                        background-color: #D32F2F;
+                    }
+                    QPushButton:pressed {
+                        background-color: #B71C1C;
+                    }
+                """)
+                self.play_button.setText("Stop")
+            else:
+                # Green for editor mode
+                self.play_button.setStyleSheet("""
+                    QPushButton {
+                        background-color: #2E7D32;
+                        color: white;
+                        border: 1px solid #1B5E20;
+                        border-radius: 3px;
+                        padding: 5px 15px;
+                        font-weight: bold;
+                        min-width: 0px;
+                    }
+                    QPushButton:hover {
+                        background-color: #388E3C;
+                    }
+                    QPushButton:pressed {
+                        background-color: #1B5E20;
+                    }
+                """)
+                self.play_button.setText("Play")
+
+    @staticmethod
+    def _snap_to_power_of_two(n):
+        if n <= 0: return 1
+        power = round(math.log2(n))
+        return int(2**power)
+
+    def start_mover_preview(self, brush):
+        if not brush or not isinstance(brush, dict):
+            return
+        
+        is_mover = brush.get('is_mover', False)
+        is_door = brush.get('is_door', False)
+        if not is_mover and not is_door:
+            return
+
+        # ── Rotate preview ───────────────────────────────────────────────
+        if is_mover and brush.get('rotate', False):
+            self.preview_data = {
+                'obj': brush,
+                'is_rotate': True,
+                'speed': brush.get('speed', 45.0),
+                'angle': 0.0,
+            }
+            self.preview_timer.start(16)
+            return
+
+        # Check for path-following preview
+        path_target = brush.get('path_target', '')
+        if path_target:
+            # Build chain of PathNodes
+            chain = []
+            visited = set()
+            current = path_target
+            while current and current not in visited:
+                node = self._find_path_node_by_name(current)
+                if not node:
+                    break
+                visited.add(current)
+                chain.append(node)
+                current = node.properties.get('next_node', '')
+            if not chain:
+                # No valid chain – fall back to oscillation preview
+                self._start_oscillation_preview(brush)
+                return
+
+            original_pos = list(brush_placement.authored_box(brush)[:3])
+
+            # As in Play: from where the mover is, to the first node, then
+            # along the chain. (It snapped the mover to the first node and then
+            # fell through to the back-and-forth preview, which kept that node
+            # as the position to restore -- so stopping the preview left the
+            # mover parked on the first node.)
+            self.preview_data = {
+                'obj': brush,
+                'is_path': True,
+                'chain': chain,
+                'current_idx': 0,
+                'lerp_t': 0.0,
+                'speed': brush.get('speed', 64.0),
+                'origin': np.array(original_pos, dtype=float),
+                'target': np.array(chain[0].pos, dtype=float),
+                'waiting': False,
+                'wait_remaining': 0.0,
+                'time': 0.0,
+                'original_pos': original_pos,
+            }
+            self.preview_timer.start(16)
+            return
+
+        # No path – use oscillation preview (original behaviour)
+        self._start_oscillation_preview(brush)
+
+    # FIX: Map door_direction strings to vectors for preview
+    _DOOR_DIR_MAP = {
+        'up': [0, 1, 0], 'down': [0, -1, 0],
+        'north': [0, 0, 1], 'south': [0, 0, -1],
+        'east': [1, 0, 0], 'west': [-1, 0, 0],
+    }
+
+    def _start_oscillation_preview(self, brush):
+        """Sine-wave oscillation preview.  Reads door_* properties and
+        translates them so the preview matches what _update_doors uses."""
+        # For doors, the editor stores door_speed/door_distance/door_direction.
+        # Translate to the engine-expected keys for the preview.
+        if brush.get('is_door'):
+            speed = brush.get('door_speed', brush.get('speed', 64.0))
+            distance = brush.get('door_distance', brush.get('distance', 128.0))
+            lip = float(brush.get('door_lip', 0.0))
+            distance = max(1.0, distance - lip)
+            dir_val = brush.get('door_direction', brush.get('direction', [0, 1, 0]))
+            if isinstance(dir_val, str):
+                direction = self._DOOR_DIR_MAP.get(dir_val, [0, 1, 0])
+            else:
+                direction = dir_val
+        else:
+            speed = brush.get('speed', 64.0)
+            distance = brush.get('distance', 128.0)
+            direction = brush.get('direction', [0, 1, 0])
+
+        self.preview_data = {
+            'obj': brush,
+            'is_path': False,
+            'original_pos': list(brush_placement.authored_box(brush)[:3]),
+            'direction': np.array(direction, dtype=float),
+            'distance': distance,
+            'speed': speed,
+            'time': 0.0,
+            'is_door': brush.get('is_door', False)
+        }
+        norm = np.linalg.norm(self.preview_data['direction'])
+        if norm > 0:
+            self.preview_data['direction'] /= norm
+        self.preview_timer.start(16)
+
+    def _find_path_node_by_name(self, name):
+        """Helper to locate a PathNode by name."""
+        for t in self.state.things:
+            from editor.things import PathNode
+            if isinstance(t, PathNode) and t.properties.get('name') == name:
+                return t
+        return None
+
+    def stop_mover_preview(self):
+        if self.preview_timer.isActive():
+            self.preview_timer.stop()
+            if self.preview_data and self.preview_data.get('obj'):
+                # The preview drove the brush's runtime transform, never its
+                # authored pos or spin: dropping it puts the brush back.
+                brush_placement.PREVIEW.clear(self.preview_data['obj'])
+                moved(self.preview_data['obj'])
+                self.preview_data = {}
+                self.update_views()
+
+                # Reset buttons
+                m_btn = self.property_editor._widgets.get('mover_preview_btn')
+                if m_btn:
+                    m_btn.blockSignals(True)
+                    m_btn.setChecked(False)
+                    m_btn.setText("▶ Preview Movement")
+                    m_btn.blockSignals(False)
+                d_btn = self.property_editor._widgets.get('door_preview_btn')
+                if d_btn:
+                    d_btn.blockSignals(True)
+                    d_btn.setChecked(False)
+                    d_btn.setText("▶ Preview Door")
+                    d_btn.blockSignals(False)
+
+    def update_mover_preview(self):
+        """One preview step. The brush is written in place, so it is journalled
+        for the render tables, which no longer poll movers every frame."""
+        brush = self.preview_data.get('obj') if self.preview_data else None
+        try:
+            self._advance_mover_preview()
+        finally:
+            if brush is not None:
+                moved(brush)
+
+    @staticmethod
+    def _preview_place(brush, centre):
+        """Show the previewed mover centred at *centre*: its runtime
+        transform (unified brush model, Stage 2b), never a write to its
+        ``pos``."""
+        brush_placement.PREVIEW.set(brush, centre=centre)
+
+    def _advance_mover_preview(self):
+        if not self.preview_data:
+            return
+
+        dt = 0.016  # ~60 FPS
+        data = self.preview_data
+        brush = data['obj']
+
+        if data.get('is_rotate'):
+            data['angle'] = (data['angle'] + data['speed'] * dt) % 360.0
+            brush_placement.PREVIEW.set(
+                brush, spin=(brush.get('rot_axis') or (0.0, 1.0, 0.0), data['angle']))
+            self.update_views()
+            return
+
+        # ------------------------------------------------------------------
+        #  Path‑following preview (when is_path is True)
+        # ------------------------------------------------------------------
+        if data.get('is_path'):
+            chain = data['chain']
+            idx = data['current_idx']
+            if idx >= len(chain):
+                self.stop_mover_preview()
+                return
+
+            current_node = chain[idx]
+            target_pos = np.array(current_node.pos, dtype=float)
+
+            # If waiting at a node, count down and then advance
+            if data['waiting']:
+                data['wait_remaining'] -= dt
+                if data['wait_remaining'] <= 0.0:
+                    data['waiting'] = False
+                    idx += 1
+                    data['current_idx'] = idx
+                    if idx < len(chain):
+                        data['origin'] = target_pos.copy()
+                        data['target'] = np.array(chain[idx].pos, dtype=float)
+                        data['lerp_t'] = 0.0
+                    else:
+                        # End of chain reached
+                        self._preview_place(brush, target_pos)
+                        self.update_views()
+                        self.stop_mover_preview()
+                        return
+                else:
+                    # Still waiting, no movement
+                    return
+
+            # Move toward the current target node
+            origin = data['origin']
+            target = data['target']
+            segment_vec = target - origin
+            segment_len = np.linalg.norm(segment_vec)
+
+            if segment_len < 1.0:
+                # Already at the node – snap and start waiting (or advance immediately)
+                data['lerp_t'] = 1.0
+                self._preview_place(brush, target)
+                wait_time = current_node.properties.get('wait_time', 0.0)
+                if wait_time > 0.0:
+                    data['waiting'] = True
+                    data['wait_remaining'] = wait_time
+                else:
+                    idx += 1
+                    data['current_idx'] = idx
+                    if idx < len(chain):
+                        data['origin'] = target.copy()
+                        data['target'] = np.array(chain[idx].pos, dtype=float)
+                        data['lerp_t'] = 0.0
+                    else:
+                        self._preview_place(brush, target)
+                        self.update_views()
+                        self.stop_mover_preview()
+                        return
+            else:
+                # Linear interpolation with speed multiplier
+                speed = data['speed'] * current_node.properties.get('speed', 1.0)
+                data['lerp_t'] += (speed * dt) / segment_len
+                t = min(data['lerp_t'], 1.0)
+                new_pos = origin + segment_vec * t
+                self._preview_place(brush, new_pos)
+
+                if t >= 1.0:
+                    # Arrived at the node
+                    wait_time = current_node.properties.get('wait_time', 0.0)
+                    if wait_time > 0.0:
+                        data['waiting'] = True
+                        data['wait_remaining'] = wait_time
+                    else:
+                        idx += 1
+                        data['current_idx'] = idx
+                        if idx < len(chain):
+                            data['origin'] = target.copy()
+                            data['target'] = np.array(chain[idx].pos, dtype=float)
+                            data['lerp_t'] = 0.0
+                        else:
+                            self._preview_place(brush, target)
+                            self.update_views()
+                            self.stop_mover_preview()
+                            return
+
+            self.update_views()
+
+        # ------------------------------------------------------------------
+        #  Original oscillation preview (direction‑based)
+        # ------------------------------------------------------------------
+        else:
+            data['time'] += dt
+            speed = data['speed']
+            distance = data['distance']
+            if distance == 0:
+                return
+
+            # Sine wave between 0 and distance
+            progress = (math.sin(data['time'] * (speed / distance) * math.pi - (math.pi / 2)) + 1) / 2
+            current_offset = progress * distance
+            movement_vector = data['direction'] * current_offset
+            original_pos = np.array(data['original_pos'])
+            new_pos = original_pos + movement_vector
+            self._preview_place(brush, new_pos)
+            self.update_views()
+
+    def load_config(self):
+        from editor.settings_file import read_settings
+        read_settings(self.config, self.config_path)
+        self.apply_window_colours()
+
+    def save_config(self):
+        # Serialised first and swapped in whole: a failed write must not
+        # leave settings.ini truncated (it is read once, at startup).  The
+        # locale encoding matches how config.read() decodes it.
+        buffer = io.StringIO()
+        self.config.write(buffer)
+        write_text_atomic(self.config_path, buffer.getvalue(), encoding=None)
+
+    def update_global_font(self):
+        font_size = self.config.getint('Display', 'font_size', fallback=11)
+        from editor.desktop_style import set_editor_font_size
+        set_editor_font_size(QApplication.instance(), font_size)
+
+    def show_settings_dialog(self):
+        # Store old values to check for changes
+        old_dpi_setting = self.config.getboolean('Display', 'high_dpi_scaling', fallback=False)
+        old_ui_scale = read_ui_scale_setting(self.config)
+        old_font_size = self.config.getint('Display', 'font_size', fallback=10)
+        old_show_caulk = self.config.getboolean('Display', 'show_caulk', fallback=True)
+        old_big_toolbar_buttons = self.config.getboolean('Display', 'big_toolbar_buttons', fallback=False)
+        
+        # New: Autosave setting check
+        old_autosave = self.config.getboolean('Editor', 'autosave_enabled', fallback=True)
+        old_autosave_interval = self.config.getint('Editor', 'autosave_interval', fallback=10)
+
+        dialog = SettingsWindow(self.config, self)
+        if dialog.exec_():
+            self.save_config()
+            self.update_shortcuts()
+            self.apply_gore_setting()
+            self.apply_tooltip_settings()
+            
+            # Update Autosave if changed
+            new_autosave = self.config.getboolean('Editor', 'autosave_enabled', fallback=True)
+            new_autosave_interval = self.config.getint('Editor', 'autosave_interval', fallback=10)
+            
+            if new_autosave != old_autosave or new_autosave_interval != old_autosave_interval:
+                self.setup_autosave()
+            
+            # Track which settings require restart
+            restart_required = []
+            
+            new_font_size = self.config.getint('Display', 'font_size', fallback=10)
+            if old_font_size != new_font_size:
+                self.update_global_font()
+                
+            new_show_caulk = self.config.getboolean('Display', 'show_caulk', fallback=True)
+            if old_show_caulk != new_show_caulk:
+                self.update_views()
+
+            self._apply_audio_volumes()
+            if getattr(self, 'is_kiosk_mode', False):
+                self._apply_kiosk_window_mode()
+
+            # Player glasses visibility is live; no restart is required.
+            self.view_3d.show_glasses = self.config.getboolean(
+                'Display', 'show_glasses', fallback=True
+            )
+            # So is whether a hidden light lights the editor.
+            self.view_3d.hide_hidden_lights = self.config.getboolean(
+                'Display', 'hide_hidden_lights', fallback=False)
+            self.update_views()
+            # So is player 1's choice of glasses (Settings > Appearance).
+            self.view_3d.player1_glasses = normalize_glasses(self.config.get(
+                'Appearance', 'glasses', fallback=DEFAULT_GLASSES
+            ))
+            self.view_3d.update()
+                
+            new_dpi_setting = self.config.getboolean('Display', 'high_dpi_scaling', fallback=False)
+            if old_dpi_setting != new_dpi_setting:
+                restart_required.append("High DPI scaling")
+
+            if read_ui_scale_setting(self.config) != old_ui_scale:
+                restart_required.append("UI scale")
+                
+            new_big_toolbar_buttons = self.config.getboolean('Display', 'big_toolbar_buttons', fallback=False)
+            if old_big_toolbar_buttons != new_big_toolbar_buttons:
+                self.apply_toolbar_button_size()
+            
+            # Show restart message if any settings require it
+            if restart_required:
+                QMessageBox.information(self, "Restart Required",
+                    f"The following settings have been changed:\n\n" +
+                    "\n".join(f"• {setting}" for setting in restart_required) +
+                    "\n\nPlease restart the application for the changes to take effect.")
+
+    def apply_tooltip_settings(self):
+        """Settings > Editor > Tooltips: show or hide each area's tooltips.
+
+        Split by area because they are read differently -- toolbar tooltips
+        are how the icons are learned and stop being wanted long before the
+        Property Editor's do.
+        """
+        panel = getattr(self, 'property_editor', None)
+        if panel is not None and hasattr(panel, 'set_tooltips_enabled'):
+            panel.set_tooltips_enabled(
+                self.config.getboolean('Editor', 'property_editor_tooltips',
+                                       fallback=True))
+
+        toolbar = getattr(self, 'tool_toolbar', None)
+        if toolbar is not None:
+            set_tooltips_enabled(
+                toolbar,
+                self.config.getboolean('Editor', 'toolbar_tooltips',
+                                       fallback=True))
+
+    def copy_selection(self):
+        """Copy the current object/multi-selection into the editor clipboard."""
+        sources = list(self.state.selected_objects or [])
+
+        if sources:
+            clipboard = []
+            for source in sources:
+                if isinstance(source, dict):
+                    source = {
+                        k: v for k, v in source.items()
+                        if k not in brush_geometry.GEO_RUNTIME_KEYS
+                    }
+                clipboard.append(copy.deepcopy(source))
+            self._brush_clipboard = clipboard
+
+            names = []
+            for source in clipboard:
+                if isinstance(source, dict):
+                    names.append(source.get('name', 'Brush'))
+                else:
+                    names.append(source.properties.get('name', 'Entity'))
+            if len(names) == 1:
+                self.show_toast(f"Copied: {names[0]}")
+            else:
+                self.show_toast(f"Copied {len(names)} objects")
+        else:
+            self._brush_clipboard = None
+            self.show_toast("Nothing to copy", is_error=True)
+
+    def paste_selection(self):
+        """Paste the editor clipboard with fresh UUIDs and a grid offset."""
+        if not self._brush_clipboard:
+            self.show_toast("Nothing to paste", is_error=True)
+            return
+        sources, _skipped = self._drop_singleton_copies(self._brush_clipboard)
+        if not sources:
+            return
+
+        self.save_state()
+        offset = self.grid_size_spinbox.value()
+        delta = [offset, 0.0, offset]
+        pasted_objects = []
+        taken_names = set(self.state.get_all_entity_names())
+
+        for source in sources:
+            pasted = copy.deepcopy(source)
+
+            if isinstance(pasted, dict):
+                pasted['id'] = str(uuid.uuid4())
+                base_name = pasted.get('name', 'Brush')
+                if base_name:
+                    pasted['name'] = self._copy_name(base_name, taken_names)
+
+                if brush_geometry.brush_has_geometry(pasted):
+                    brush_geometry.translate_brush(pasted, delta)
+                else:
+                    pasted['pos'] = [
+                        pasted['pos'][0] + delta[0],
+                        pasted['pos'][1] + delta[1],
+                        pasted['pos'][2] + delta[2],
+                    ]
+
+                pasted.pop('_io_connections', None)
+                pasted.pop('io_connections', None)
+                self.state.brushes.append(pasted)
+            else:
+                pasted.properties['id'] = str(uuid.uuid4())
+                base_name = pasted.properties.get('name', 'Entity')
+                pasted.properties['name'] = self._copy_name(base_name, taken_names)
+                pasted.pos = [
+                    pasted.pos[0] + delta[0],
+                    pasted.pos[1] + delta[1],
+                    pasted.pos[2] + delta[2],
+                ]
+                pasted.properties.pop('_io_connections', None)
+                pasted.properties.pop('io_connections', None)
+                self.state.things.append(pasted)
+
+            pasted_objects.append(pasted)
+
+        self.set_selected_objects(pasted_objects)
+        self.show_toast(
+            f"Pasted {len(pasted_objects)} object(s)"
+            if len(pasted_objects) != 1
+            else f"Pasted: {pasted_objects[0].get('name', 'Brush') if isinstance(pasted_objects[0], dict) else pasted_objects[0].properties.get('name', 'Entity')}"
+        )
+
+        for pasted in pasted_objects:
+            if isinstance(pasted, dict):
+                pasted['_flash_until'] = time.time() + 0.5
+                self._after(500, lambda o=pasted: self._clear_flash(o))
+
+    def handle_escape(self):
+        """Back out of whatever is in progress, innermost first.
+
+        Shared so that panels which would otherwise swallow Escape behave the
+        same as the viewports.  A QDialog closes itself on Escape, which meant
+        pressing it to leave Face Mode shut the Surface Inspector instead of
+        leaving the mode the panel had put the user in.
+
+        Returns True when something was backed out of, so a caller can tell an
+        Escape that did something from one that had nothing to do.
+        """
+        if self.view_3d.mouselook_active:
+            self.view_3d.stop_editor_mouselook()
+            return True
+        if self.cancel_clone_placement():
+            return True
+        if self.view_3d.terrain_sculpt_active:
+            self.view_3d.set_terrain_sculpt_active(False)
+            return True
+        if self.components.cancel_drag():
+            self.refresh_views()
+            return True
+        if self.components.is_component_mode():
+            self.set_component_mode(MODE_OBJECT)
+            return True
+        if self.view_3d.face_mode_active:
+            self.toggle_face_mode(False)
+            return True
+        if self.primary_selection():
+            self.set_selected_objects([])
+            return True
+        return False
+
+    def toggle_face_mode(self, active):
+        """Toggles the Face Mode in the 3D view."""
+        if not hasattr(self, 'view_3d'): return
+
+        self.view_3d.face_mode_active = active
+
+        # Sync the FACE button if Face Mode was toggled some other way (Esc,
+        # a shortcut).  It lives on the Surface Inspector, which is created
+        # lazily — nothing to sync until the panel has been opened once.
+        if self.surface_inspector is not None:
+            self.surface_inspector.sync_face_button(active)
+        
+        if active:
+            self.show_toast("FACE MODE: Select a face to texture (Orange) — Shift+arrows or Page Up/Down rotate it", duration=3000)
+            self.set_selected_objects([]) # Deselect current object to clear gizmos and allow clean hover
+            
+            # Change cursor to indicate mode
+            self.view_3d.setCursor(Qt.CrossCursor)
+        else:
+            self.show_toast("FACE MODE: OFF")
+            self.view_3d.hovered_face_info = None # Clear highlight
+            self.view_3d._face_hover_key = None
+            self.view_3d.setCursor(Qt.ArrowCursor)
+            # The panel stays open: it owns the FACE toggle now, and hiding it
+            # here would take the button away the moment it was switched off.
+
+        self.view_3d.update()
+
+    def apply_texture_to_specific_face(self, brush, face_name):
+        """Applies currently selected asset texture to the specific face of a brush."""
+        texture_path = self.asset_browser.get_selected_filepath()
+        if not texture_path:
+            self.show_toast("Select a texture first", is_error=True)
+            return
+
+        # Relative to assets/textures, so a texture in a subfolder
+        # (textures/decals, textures/Dev) keeps its folder and loads.
+        from editor.face_texture import texture_name as _texture_name
+        texture_name = _texture_name(texture_path)
+        self.save_state()
+
+        # The face's one material record: a box's per-tag dict, an angled
+        # brush's plane (tagged or cut). Invalidates an angled brush's
+        # derived faces and GPU mesh, which bake the texture.
+        if not brush_faces.set_face_material(brush, face_name, texture=texture_name):
+            self.state.discard_last_checkpoint()
+            self.show_toast("That face no longer exists", is_error=True)
+            return
+        # The face may only be hovered, not selected, so the checkpoint above
+        # did not journal it for the render projection.
+        self.state.mark_lighting_dirty([brush])
+
+        # Remember the last-textured face so the rotate-texture button / Page
+        # Up-Down keys know which face to act on when nothing is hovered.
+        self.face_texture_target = (brush, face_name)
+        self.update_views()
+        self.show_toast(f"Applied to {face_name}")
+
+    ALL_FACE_KEYS = ('north', 'south', 'east', 'west', 'top', 'down')
+
+    def _bump_face_angle(self, brush, face_name, delta_deg):
+        """Advance one face's texture rotation by ``delta_deg`` degrees."""
+        current = brush_faces.face_record(brush, face_name).get('uv_angle') or 0.0
+        angle = (current + delta_deg) % 360.0
+        brush_faces.set_face_material(brush, face_name, uv_angle=angle)
+        return angle
+
+    def rotate_textures(self, steps=1):
+        """Rotate brush-face texture(s) by ``steps`` * 90 degrees (Page Up/Down).
+
+        In face mode the highlighted face (falling back to the last-textured
+        face) is rotated on its own. Otherwise, if a brush is selected, every
+        face on that brush is rotated together.
+        """
+        delta = 90.0 if steps >= 0 else -90.0
+
+        # --- The Surface Inspector is open on a face: that face is what is
+        # being worked on, so it is what turns -- in Face Mode too, whatever
+        # the cursor happens to be over (and in "Whole brush" scope, every
+        # face it applies to). Before, Face Mode turned the hovered face.
+        inspector = getattr(self, 'surface_inspector', None)
+        target = self.selected_face_target()
+        if target is not None:
+            faces = inspector.target_faces()
+            self.save_state()
+            for brush, face_name in faces:
+                angle = self._bump_face_angle(brush, face_name, delta)
+            self.state.mark_lighting_dirty(
+                list({id(b): b for b, _ in faces}.values()))
+            self.face_texture_target = target
+            self.update_views()
+            inspector.refresh_from_face()
+            if len(faces) == 1:
+                self.show_toast(f"{faces[0][1]}: texture {int(angle)}°")
+            else:
+                self.show_toast(f"Brush textures rotated {int(delta):+d}°")
+            return
+
+        # --- Face mode: rotate only the highlighted / last-textured face ---
+        if self.view_3d.face_mode_active:
+            target = self.view_3d.face_under_cursor() or self.face_texture_target
+            if not target:
+                self.show_toast("Hover a face to rotate its texture", is_error=True)
+                return
+            brush, face_name = target
+            self.save_state()
+            angle = self._bump_face_angle(brush, face_name, delta)
+            self.face_texture_target = (brush, face_name)
+            self.update_views()
+            if getattr(self, 'surface_inspector', None):
+                self.surface_inspector.refresh_from_face()
+            self.show_toast(f"{face_name}: texture {int(angle)}°")
+            return
+
+        # --- Otherwise: rotate every face of the selected brush together ---
+        selected = self.primary_selection()
+        if isinstance(selected, dict):
+            self.save_state()
+            # Every face the brush has: a box's six sides, an angled brush's
+            # planes (cut faces included).
+            for face_name in brush_faces.face_keys(selected):
+                self._bump_face_angle(selected, face_name, delta)
+            self.update_views()
+            self.show_toast(f"Brush textures rotated {int(delta):+d}°")
+
+    def selected_face_target(self):
+        """``(brush, face key)`` the open Surface Inspector is bound to, or
+        None (closed, or bound to nothing). The selected face: what its
+        controls and Page Up/Down edit, and what the 3D view highlights."""
+        inspector = getattr(self, 'surface_inspector', None)
+        if inspector is None or not inspector.isVisible() or not inspector.target:
+            return None
+        return inspector.target
+
+    def show_surface_inspector(self, brush=None, face_name=None,
+                               raise_window=True):
+        """Open (or re-target) the Surface Inspector.
+
+        With no face it opens empty, its controls greyed out until there is
+        something to edit -- the panel is a tool, and a tool should open when
+        it is asked for.
+        """
+        if self.surface_inspector is None:
+            from editor.surface_inspector import SurfaceInspector
+            self.surface_inspector = SurfaceInspector(self, self)
+        self.surface_inspector.set_target(brush, face_name,
+                                          raise_window=raise_window)
+
+    def show_entity_inspector(self, entity):
+        """Open (or raise) the Entity Inspector for *entity*.
+
+        The inspector is a live, read-only view whose contents plugins supply
+        through ``EditorAPI.register_entity_inspector`` (API 1.5.0); an entity
+        no plugin describes shows its public properties. One panel per entity:
+        asking again for an entity already being inspected raises its panel.
+        Plugins open it from their own commands, e.g. a console command's
+        ``callback(args, main_window, logic, play_mode)``.
+        """
+        if entity is None:
+            return None
+        inspectors = self._entity_inspectors
+        panel = inspectors.get(id(entity))
+        if panel is not None and panel.entity is entity:
+            panel.show()
+            panel.raise_()
+            panel.activateWindow()
+            return panel
+        from editor.entity_inspector import EntityInspector
+
+        def _logic():
+            # The view owns the editor-facing Play Mode state. Providers receive
+            # the live engine host only while the view is actually in Play Mode.
+            view = self.view_3d
+            if view is None or not view.play_mode:
+                return None
+            return view.logic_thread
+
+        def _alive(e=entity):
+            return any(t is e for t in self.state.things)
+
+        panel = EntityInspector(entity, logic=_logic, alive=_alive, parent=self)
+        key = id(entity)
+        inspectors[key] = panel
+        panel.destroyed.connect(lambda *_a, k=key: inspectors.pop(k, None))
+        panel.show()
+        return panel
+
+    def begin_actor_pick(self, on_pick=None):
+        """Arm the Play Mode click-to-pick of an actor (see
+        ``QtGameView.begin_actor_pick``): the world pauses and the next click
+        on an actor calls ``on_pick(entity)``, by default opening the Entity
+        Inspector on it. Returns False when there is no play session to pick
+        in. Plugins arm it from their own commands.
+        """
+        view = self.view_3d
+        if view is None:
+            return False
+        return bool(view.begin_actor_pick(on_pick))
+
+    def sync_surface_inspector(self):
+        """Point an open Surface Inspector at something worth editing.
+
+        It can be opened with nothing selected, so it binds as soon as there
+        is a brush to bind to. A face it is already bound to stays bound
+        whatever the selection does: it is changed by clicking another face
+        (Face Mode) or picking one from the panel's list, and released by
+        closing the panel -- so adjustments always go to the face that was
+        chosen, never to whatever was selected or hovered since.
+        """
+        inspector = getattr(self, 'surface_inspector', None)
+        if inspector is None or not inspector.isVisible():
+            return
+        if inspector.target is not None:
+            return
+
+        brushes = self._selected_brushes()
+        if not brushes:
+            return
+
+        keys = face_texture.face_keys(brushes[0])
+        if keys:
+            self.show_surface_inspector(brushes[0], keys[0], raise_window=False)
+
+    def toggle_visgroups_window(self):
+        """Open (or close) Visgroups & Cordon (the eye on the toolbar)."""
+        window = getattr(self, 'visgroups_window', None)
+        return self.set_visgroups_window_visible(window is None or not window.isVisible())
+
+    def set_visgroups_window_visible(self, visible):
+        window = getattr(self, 'visgroups_window', None)
+        if window is None:
+            if not visible:
+                self.sync_visgroups_button()
+                return None
+            from editor.visgroups_window import VisgroupsWindow
+            window = self.visgroups_window = VisgroupsWindow(self)
+        if visible:
+            window.show()
+            window.raise_()
+            window.activateWindow()
+        else:
+            window.hide()
+        self.sync_visgroups_button()
+        return window
+
+    def sync_visgroups_button(self):
+        """Light the toolbar's eye, and tick View > Visgroups / Cordon,
+        while Visgroups & Cordon is open."""
+        window = getattr(self, 'visgroups_window', None)
+        shown = window is not None and window.isVisible()
+        for control in (getattr(self, 'visgroups_btn', None),
+                        getattr(self, 'visgroups_view_action', None)):
+            if control is not None and control.isChecked() != shown:
+                control.blockSignals(True)
+                control.setChecked(shown)
+                control.blockSignals(False)
+
+    def show_visgroup(self, group=None, rename=False):
+        """Open Visgroups & Cordon on *group* (its User tab), optionally
+        with its name ready to edit."""
+        window = self.set_visgroups_window_visible(True)
+        window.show_group(group, rename=rename)
+        return window
+
+    def add_to_visgroup(self, objects, group=None):
+        """Put *objects* in *group* -- or in a new visgroup, opened in Visgroups
+        & Cordon with its name ready to edit (Scene Hierarchy > Visgroup)."""
+        objects = [o for o in objects if o is not None]
+        if not objects:
+            return None
+        filters = self.state.view_filters
+        if group is None:
+            group = filters.add_visgroup("Visgroup %d" % (len(filters.visgroups) + 1), objects)
+            self.mark_as_modified()
+            self.update_views()
+            self.show_visgroup(group, rename=True)
+        else:
+            filters.add_to_visgroup(group, objects)
+            self.mark_as_modified()
+            self.update_views()
+            self._refresh_visgroups_window()
+            self.show_toast("Added to visgroup '%s'" % group.name)
+        return group
+
+    def remove_from_visgroup(self, objects, group):
+        self.state.view_filters.remove_from_visgroup(group, objects)
+        self.mark_as_modified()
+        self.update_views()
+        self._refresh_visgroups_window()
+        self.show_toast("Removed from visgroup '%s'" % group.name)
+
+    # -- brush groups (attached brushes) --------------------------------------
+
+    def with_group_mates(self, objects):
+        """*objects* plus the brushes and entities grouped with them: what a
+        move carries."""
+        from editor import brush_groups
+        return brush_groups.with_mates(brush_groups.scene_objects(self.state), objects)
+
+    def movable_with_mates(self, objects):
+        """:meth:`with_group_mates`, without the locked ones."""
+        return [o for o in self.with_group_mates(objects)
+                if not (o.get('lock', False) if isinstance(o, dict)
+                        else o.properties.get('lock', False))]
+
+    def set_brush_group(self, brushes, name):
+        """Put *brushes* (brushes and/or entities) in group *name* ('' ungroups
+        them): one undo step."""
+        from editor import brush_groups
+        brushes = [b for b in brushes if brush_groups.is_groupable(b)]
+        if not brushes:
+            return False
+        name = str(name or '').strip()
+        if name and not self.brush_group_allowed(brushes, name):
+            return False
+        self.save_state()
+        brush_groups.set_group(brushes, name)
+        self._brush_groups_changed()
+        return True
+
+    def brush_group_allowed(self, brushes, name):
+        """Whether *brushes* may join group *name*: a group holds at most
+        one mover (or door). Says so when they may not."""
+        from editor import brush_groups
+        joined = brush_groups.members(
+            brush_groups.scene_objects(self.state), name) + list(brushes)
+        if brush_groups.too_many_movers(joined):
+            self.show_toast(brush_groups.MAX_MOVERS_MESSAGE, is_error=True)
+            return False
+        return True
+
+    def ungroup_brushes(self, brushes):
+        """Take *brushes* (only those) out of their groups: one undo step.
+        A group left with a single brush is no group, so that one goes too."""
+        from editor import brush_groups
+        brushes = [b for b in brushes if brush_groups.group_of(b)]
+        if not brushes:
+            return
+        self.save_state()
+        brush_groups.set_group(brushes, '')
+        for chosen in brush_groups.groups(
+                brush_groups.scene_objects(self.state)).values():
+            if len(chosen) == 1:
+                brush_groups.set_group(chosen, '')
+        self._brush_groups_changed()
+
+    def set_brushes_hidden(self, brushes, hidden):
+        """Hide or show *brushes* (a whole group, from its menu; entities
+        too): one undo step."""
+        from engine.change_journal import touch
+        from engine.spatial import set_live_flag
+        from editor import brush_groups
+        brushes = [b for b in brushes if brush_groups.is_groupable(b)]
+        if not brushes:
+            return
+        self.save_state()
+        for brush in brushes:
+            if isinstance(brush, dict):
+                brush['hidden'] = bool(hidden)
+                touch(brush)
+            else:
+                set_live_flag(brush, 'hidden', bool(hidden))
+        self.mark_as_modified()
+        self.update_all_ui()
+
+    def rename_brush_group(self, old, new):
+        from editor import brush_groups
+        new = str(new or '').strip()
+        if not new or new == old:
+            return False
+        # A name already in use merges the two groups.
+        every = brush_groups.scene_objects(self.state)
+        if not self.brush_group_allowed(brush_groups.members(every, old), new):
+            return False
+        self.save_state()
+        brush_groups.rename(every, old, new)
+        self._brush_groups_changed()
+        return True
+
+    def _brush_groups_changed(self):
+        self.mark_as_modified()
+        self.update_all_ui()
+        self._refresh_visgroups_window()
+
+    def open_brush_group_dialog(self, brushes):
+        """Scene Hierarchy > Add to Group... / Edit Group..."""
+        from editor import brush_groups
+        from editor.brush_group_dialog import BrushGroupDialog
+        brushes = [b for b in brushes if brush_groups.is_groupable(b)]
+        if not brushes:
+            return None
+        all_brushes = brush_groups.scene_objects(self.state)
+        display_name = brush_groups.labeller(
+            self.state, getattr(self, 'scene_hierarchy', None))
+        dialog = BrushGroupDialog(self, all_brushes, brushes, display_name)
+        if self._run_brush_group_dialog(dialog):
+            if not dialog.allowed():
+                self.show_toast(brush_groups.MAX_MOVERS_MESSAGE, is_error=True)
+                return dialog
+            self.save_state()
+            if dialog.apply():
+                self._brush_groups_changed()
+        return dialog
+
+    def _run_brush_group_dialog(self, dialog):
+        return dialog.exec_() == dialog.Accepted
+
+    def _refresh_visgroups_window(self):
+        window = getattr(self, 'visgroups_window', None)
+        if window is not None and window.isVisible():
+            window.refresh()
+
+    def toggle_surface_inspector(self):
+        """Open (or close) the Surface Inspector on the current texture target.
+
+        T/Shift+S are plain editor shortcuts.  Never let a modified keystroke
+        such as Ctrl+Z reach this toggle, even if Qt delivers the QAction while
+        another shortcut is being processed.
+        """
+        if self.view_3d.play_mode:
+            return
+
+        modifiers = QApplication.keyboardModifiers()
+        if modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier):
+            return
+
+        inspector = self.surface_inspector
+        if inspector is not None and inspector.isVisible():
+            inspector.hide()
+            return
+
+        hovered = getattr(self.view_3d, 'face_under_cursor', None)
+        target = (hovered() if hovered is not None else None) \
+            or self.face_texture_target
+        if target is None:
+            brushes = self._selected_brushes()
+            keys = face_texture.face_keys(brushes[0]) if brushes else []
+            # Nothing to bind to is not a reason to refuse: the panel opens
+            # empty and binds itself as soon as a brush is selected.
+            target = (brushes[0], keys[0]) if keys else (None, None)
+        self.show_surface_inspector(*target)
+
+    def enter_play_mode(self):
+        """Toggle play mode on/off. Called by the Play/Stop button."""
+        # If already in play mode, exit instead
+        if self.view_3d.play_mode:
+            self._exit_play_mode()
+            return
+
+        player_start = self.state.resolve_player_start()
+        if player_start and self._restores_world_on_stop():
+            # With "Restore the world when leaving Play" on, a Play the author
+            # starts is a new game: every LogicState begins at its authored
+            # values (as last edited), not at what a playtest left. With it
+            # off the stores are kept, exactly as the world is.
+            # (A level change during Play restarts through _start_play and
+            # keeps the stores: that carry is what they are for.)
+            self._reset_logic_state_stores()
+        self._start_play(player_start)
+
+    def _restores_world_on_stop(self):
+        return self.config.getboolean('Settings', 'restore_world_on_stop',
+                                      fallback=False)
+
+    def _reset_logic_state_stores(self):
+        from editor.things import LogicState
+        LogicState.reset_stores(self.state.things)
+
+    def _start_play(self, player_start):
+        """Enter play mode with the player at *player_start* (a PlayerStart)."""
+        if not player_start:
+            QMessageBox.warning(self, "No Player Start", "Add a Player Start object to the scene before entering play mode.")
+            return
+        if self.view_3d.logic_thread is None:
+            # The game's logic starts with the renderer. Without an OpenGL
+            # context there is neither, and Play "started" into a world that
+            # never ran, with nothing said.
+            message = ("Play cannot start: the 3D view has no OpenGL 3.3 "
+                       "context. Check the graphics driver.")
+            debug_log("Error", message)
+            self.show_toast(message, is_error=True)
+            return
+
+        # Only once Play is certain to start: a refused Play must leave the
+        # side panel on the tab the author was using.
+        self._store_and_switch_to_debug_console()
+
+        if hasattr(self, 'mode_label'):
+            self.mode_label.setText("PLAY MODE")
+            self.mode_label.setStyleSheet("""
+                QLabel {
+                    background-color: #2E7D32;
+                    color: white;
+                    padding: 5px 10px;
+                    border-radius: 4px;
+                    font-weight: bold;
+                    font-size: 14px;
+                    border: 1px solid #1B5E20;
+                }
+            """)
+
+        with _loading_overlay(self).busy("Starting the game", "Building the world", 40):
+            self._capture_pre_play_world()
+            # Play runs on the complete authored world, not the editor's cells.
+            self.state.materialize_editor_world()
+            # The whole world's textures, before the first frame of play.
+            self.view_3d.preload_level_textures()
+            logic = self.view_3d.logic_thread
+            if logic is not None:
+                # A played package's cutscenes are read from the package.
+                logic.package = self._package
+            physics_enabled = self.config.getboolean('Settings', 'physics', fallback=True)
+            self.view_3d.toggle_play_mode(player_start, physics_enabled)
+            self.apply_gore_setting()
+            # The play world is built: settle the collector while the
+            # loading bar is still up (engine/gc_policy.py).
+            gc_policy.settle()
+        self.view_3d.setFocus()
+        
+        # Update play button color
+        self.update_play_button_color()
+
+        # A map transition may have restarted Play inside an outer loading
+        # overlay. Its final hide can invalidate the grab made above; run one
+        # last focus/capture pass after the whole nested operation unwinds.
+        QTimer.singleShot(0, self.view_3d.restore_play_mouse_capture)
+
+        #self.ui.notification_label.setText("ESC = EXIT PLAY MODE  |  F12 = FULLSCREEN")
+
+
+    def apply_gore_setting(self):
+        """Give the game the Settings' gore level (0 clears the blood)."""
+        logic = self.view_3d.logic_thread
+        if logic is not None:
+            logic.combat_runtime.set_gore_level(gore_level_from(self.config))
+
+    def _capture_pre_play_world(self):
+        """Remember the world as Play starts, if Stop is to put it back.
+
+        Optional (Settings -> Play Modes -> "Restore the world when leaving
+        Play"). By default the editor keeps showing what happened in play --
+        dead monsters, killed or hidden objects -- as it always has.
+        """
+        self._pre_play_world = None
+        if not self._restores_world_on_stop():
+            return
+        self._pre_play_world = (
+            self.state.snapshot(),
+            list(self.state.undo_stack),
+            list(self.state.redo_stack),
+            self.unsaved_changes,
+        )
+
+    def _restore_pre_play_world(self):
+        """Put back the world captured by :meth:`_capture_pre_play_world`.
+
+        Runs once the session has fully stopped. The same object replacement
+        undo uses, so everything holding a reference is re-pointed the same
+        way; the history and the unsaved flag go back too, so a restored
+        session leaves no trace.
+        """
+        captured = getattr(self, '_pre_play_world', None)
+        self._pre_play_world = None
+        if captured is None:
+            return
+        world, undo, redo, unsaved = captured
+        self.state.restore_state(world)
+        self.state.undo_stack.clear()
+        self.state.undo_stack.extend(undo)
+        self.state.redo_stack = redo
+        self._resync_components_after_history()
+        self.unsaved_changes = unsaved
+        self.update_title()
+        self.update_all_ui()
+
+    def sky_image_path_from_map(self):
+        """Resolve the effective panorama without changing authored map data.
+
+        A legacy map may have stored the value on a non-primary PlayerStart.
+        Prefer the current Primary, then recover the earliest-created stored
+        value so old maps still render correctly until the author edits them.
+        """
+        starts = self.state.player_starts()
+        primary = self.state.resolve_player_start()
+        if primary is not None:
+            candidate = primary.properties.get("sky_image", "")
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+
+        position = start_rules.earliest_created(
+            [start.properties for start in starts])
+        ordered = [starts[position]] if position is not None else []
+        ordered.extend(
+            start for start in starts
+            if start is not primary
+            and (position is None or start is not starts[position])
+        )
+        for start in ordered:
+            value = start.properties.get("sky_image", "")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    def canonicalize_sky_image_ownership(self, path=None):
+        """Store one panorama on the current Primary PlayerStart.
+
+        Called at explicit edit boundaries, never as part of a UI refresh.
+        Passing an empty path is an explicit request to clear the map setting;
+        omitting it recovers the current effective value from legacy data.
+        """
+        starts = self.state.player_starts()
+        primary = self.state.resolve_player_start()
+        if path is None:
+            path = self.sky_image_path_from_map()
+        path = path.strip() if isinstance(path, str) else ""
+        changed = []
+
+        if primary is not None:
+            if path:
+                if primary.properties.get("sky_image") != path:
+                    primary.properties["sky_image"] = path
+                    changed.append(primary)
+            elif "sky_image" in primary.properties:
+                primary.properties.pop("sky_image", None)
+                changed.append(primary)
+
+        for start in starts:
+            if start is not primary and "sky_image" in start.properties:
+                start.properties.pop("sky_image", None)
+                changed.append(start)
+
+        if changed:
+            self.state.mark_world_changed(changed)
+        self.sync_sky_image_from_map()
+        return path
+
+    def sync_sky_image_from_map(self):
+        """Publish the effective map panorama to the 3D renderer, read-only."""
+        path = self.sky_image_path_from_map()
+        view = getattr(self, "view_3d", None)
+        if view is not None:
+            view.sky_image_path = path
+        return path
+
+    def set_show_whole_world(self, shown):
+        """Load every editor cell of a Big World map, or only those near the camera."""
+        if not self.config.has_section('Display'):
+            self.config.add_section('Display')
+        self.config.set('Display', 'show_whole_world', str(bool(shown)))
+        self.save_config()
+        if self.view_3d.play_mode:
+            return
+        title = "Loading whole world" if shown else "Loading nearby cells"
+        with self.loading_overlay.busy(title, "Updating the editor", 30):
+            if self.state.set_editor_whole_world(shown, self.view_3d.camera.pos):
+                self.update_all_ui()
+
+    def _exit_play_mode(self):
+        """Exit play mode and return to editor."""
+        if (getattr(self, 'is_kiosk_mode', False)
+                and self.view_3d._native_surface is not None):
+            # Play ending on its own (repeated paint failures, a fatal tick)
+            # in native kiosk mode: leave kiosk mode too, or the editor window
+            # would stay hidden behind a window with no game in it.
+            self.exit_kiosk_mode(keep_play_mode=False, confirm=False)
+            return
+        if self.view_3d.play_mode:
+            self.view_3d.toggle_play_mode()
+            self.view_3d.play_mode = False  # Force state change before UI update
+            restoring = getattr(self, '_pre_play_world', None) is not None
+            self._restore_pre_play_world()
+            if restoring:
+                # The restored world is the authored one; so are its stores.
+                # (A level change during Play takes the captured world away
+                # before it stops the session, so its stores carry over.)
+                self._reset_logic_state_stores()
+            stream = self.state.editor_stream
+            if stream is not None and stream.suspended:
+                # Back to the cells around the editor camera.
+                stream.suspended = False
+                self.state.stream_editor_camera(self.view_3d.camera.pos, force=True)
+            # What play made and dropped is garbage now: collect it here.
+            gc_policy.settle()
+
+        self.ui.notification_label.setText("")
+        self._restore_properties_tab()
+
+        if hasattr(self, 'mode_label'):
+            self.mode_label.setText("EDITOR MODE")
+            self.mode_label.setStyleSheet("""
+                QLabel {
+                    background-color: #333333;
+                    color: #888888;
+                    padding: 5px 10px;
+                    border-radius: 4px;
+                    font-weight: bold;
+                    font-size: 14px;
+                    border: 1px solid #444;
+                }
+            """)
+
+        self.setFocus()
+        self.update_play_button_color()
+
+    def _store_and_switch_to_debug_console(self):
+        """Store current tab index and switch to Debug Console tab."""
+        # Only do this if we are actually entering play mode
+        if self.view_3d.play_mode:
+            return
+        self._prev_properties_tab_index = self.properties_tab_widget.currentIndex()
+        debug_console_idx = self.properties_tab_widget.indexOf(self.debug_console)
+        if debug_console_idx >= 0:
+            self.properties_tab_widget.setCurrentIndex(debug_console_idx)
+
+    def _restore_properties_tab(self):
+        """Restore previously active tab after play mode ends."""
+        if hasattr(self, '_prev_properties_tab_index') and self._prev_properties_tab_index is not None:
+            self.properties_tab_widget.setCurrentIndex(self._prev_properties_tab_index)
+            self._prev_properties_tab_index = None
+
+
+    def update_shortcuts(self):
+        save_layout_shortcut = self.config.get('Controls', 'save_layout', fallback='Ctrl+Shift+S')
+        if hasattr(self, 'save_layout_action'):
+            self.save_layout_action.setShortcut(QKeySequence(save_layout_shortcut))
+        restore_layout_shortcut = self.config.get('Controls', 'restore_layout', fallback='Ctrl+Shift+L')
+        if hasattr(self, 'restore_layout_action'):
+            self.restore_layout_action.setShortcut(QKeySequence(restore_layout_shortcut))
+        reset_layout_shortcut = self.config.get('Controls', 'reset_layout', fallback='Ctrl+Shift+R')
+        if hasattr(self, 'reset_layout_action'):
+            self.reset_layout_action.setShortcut(QKeySequence(reset_layout_shortcut))
+
+    def toggle_system_monitor(self):
+        """Toggles the debug system monitor overlay in the 3D view."""
+        self.view_3d.sysmon.toggle()
+        
+        # If in play mode, we need to handle cursor visibility when toggling the menu
+        if self.view_3d.play_mode:
+            if self.view_3d.sysmon.is_active():
+                # Show cursor for menu interaction
+                QApplication.restoreOverrideCursor()
+                self.view_3d.setCursor(Qt.ArrowCursor)
+            else:
+                # Hide cursor to resume play
+                center_pos = self.view_3d.mapToGlobal(self.view_3d.rect().center())
+                QCursor.setPos(center_pos)
+                self.view_3d.last_mouse_pos = self.view_3d.mapFromGlobal(center_pos)
+                QApplication.setOverrideCursor(Qt.BlankCursor)
+        
+        self.view_3d.update()
+
+        action = getattr(self, 'system_monitor_action', None)
+        if action is not None and action.isChecked() != self.view_3d.sysmon.is_active():
+            action.blockSignals(True)
+            action.setChecked(self.view_3d.sysmon.is_active())
+            action.blockSignals(False)
+
+    def set_grid_size(self, size):
+        snapped_size = self._snap_to_power_of_two(size)
+        self.grid_size_spinbox.blockSignals(True)       # sync the spinbox
+        self.grid_size_spinbox.setValue(snapped_size)
+        self.grid_size_spinbox.blockSignals(False)
+        for view in [self.view_top, self.view_side, self.view_front, self.view_3d]:
+            view.grid_size = snapped_size
+        self.view_3d.update_grid()
+        # Repaint without update_views(): it resets each 2D view's state,
+        # which ended a cut or a rotate in progress. The scissor and rotate
+        # tools re-snap to the new grid where they are.
+        for view in (self.view_top, self.view_side, self.view_front):
+            changed = getattr(view, 'grid_size_changed', None)
+            if changed is not None:
+                changed()
+        self.refresh_views()
+
+    def set_world_size(self, size):
+        snapped_size = self._snap_to_power_of_two(size)
+        if snapped_size != size:
+            self.world_size_spinbox.blockSignals(True)
+            self.world_size_spinbox.setValue(snapped_size)
+            self.world_size_spinbox.blockSignals(False)
+        for view in [self.view_top, self.view_side, self.view_front, self.view_3d]:
+            view.world_size = snapped_size
+        self.view_3d.update_grid()
+        self.update_views()
+
+    def set_view_filter(self, key, shown):
+        """Show or hide one kind of object in every editor view (Filter menu)."""
+        if self.state.view_filters.set_shown(key, shown):
+            action = self.filter_actions.get(key)
+            if action is not None and action.isChecked() != shown:
+                action.setChecked(shown)
+            self.update_views()
+
+    def show_all_view_filters(self):
+        self.state.view_filters.show_all()
+        for action in self.filter_actions.values():
+            action.setChecked(True)
+        self.update_views()
+
+    def set_brush_display_mode(self, text):
+        self.view_3d.brush_display_mode = text
+        self.view_3d.update()
+
+    def set_camera_mode(self, text):
+        """Switch the play-mode camera between First Person and Overhead."""
+        self.view_3d.set_camera_mode(text)
+
+    def sync_camera_mode_combo(self):
+        """Show the camera mode the game is actually using in the Camera dropdown.
+
+        Play can switch the camera itself (the ``cam`` command, usually run by a
+        logic_command, or a loaded save), so the dropdown follows the logic
+        thread's camera. Signals are blocked: re-applying the mode through the
+        dropdown would be redundant, and the engine already holds it.
+        """
+        lt = self.view_3d.logic_thread
+        mode = lt.camera.camera_mode if lt is not None else self.view_3d.camera_mode
+        mode = "Overhead" if str(mode).strip().lower() in (
+            "overhead", "top-down", "topdown") else "First Person"
+        self.view_3d.camera_mode = mode
+        combo = getattr(self, "camera_mode_combobox", None)
+        if combo is not None and combo.currentText() != mode:
+            combo.blockSignals(True)
+            try:
+                combo.setCurrentText(mode)
+            finally:
+                combo.blockSignals(False)
+
+    def reset_camera_mode(self):
+        """Return the play camera to First Person for a newly opened map.
+
+        A map that wants Overhead switches to it itself (a logic_command
+        running ``cam topdown``); the previous map's choice must not carry over.
+        """
+        lt = self.view_3d.logic_thread
+        if lt is not None:
+            lt.camera.camera_transition = None
+        self.view_3d.set_camera_mode("First Person")
+        self.sync_camera_mode_combo()
+
+    def set_cull_distance(self, distance):
+        """Set Cull Dist and mirror the actual clamped value in the spinner."""
+        self.view_3d.set_cull_distance(distance)
+        spin = getattr(self, "cull_dist_spinbox", None)
+        if spin is not None:
+            # ViewDistance is authoritative because it clamps the request.
+            # Block the signal so external changes do not recurse through the
+            # spinner's valueChanged handler.
+            spin.blockSignals(True)
+            try:
+                spin.setValue(int(round(self.view_3d.view_distance.distance)))
+            finally:
+                spin.blockSignals(False)
+
+    def save_state(self):
+        # Put legacy sky ownership repair inside this operation's undo
+        # checkpoint; undo must restore the canonical pre-edit state.
+        self.canonicalize_sky_image_ownership()
+        self.state.save_state()
+        # Every scene mutation funnels through here, so this is the cheap,
+        # once-per-operation place to tell the component overlay its cached
+        # handle positions may be stale.  It is a single integer bump; the
+        # overlay itself is only rebuilt the next time something draws it.
+        self.components.invalidate()
+        self.mark_as_modified() # Mark as dirty when state is saved for undo
+
+    def undo(self):
+        if self.state.undo():
+            self._resync_components_after_history()
+            self.mark_as_modified() # Undo changes state
+            self.update_all_ui()
+
+    def redo(self):
+        if self.state.redo():
+            self._resync_components_after_history()
+            self.mark_as_modified() # Redo changes state
+            self.update_all_ui()
+
+    def _resync_components_after_history(self):
+        """Re-point everything holding an object reference after an undo/redo.
+
+        Undo rebuilds the brush dicts and Things from JSON, so *every* reference
+        held from before now points at an object that is no longer in the scene.
+        ``EditorState`` has already re-pointed the selection itself by stable
+        id; the rest of the editor's references have to follow:
+
+        * component handles, dropped or re-resolved against the new geometry;
+        * the Surface Inspector and the "face last worked on", both of which
+          hold a brush directly and would otherwise edit a detached dict;
+        * the property editor's cached pages and the I/O reverse index, which
+          are keyed on objects that no longer exist;
+        * the Logic Graph window, whose nodes hold entities: Apply wrote into
+          the detached copies and reported success.
+        """
+        self.components.cancel_drag()
+        self.components.prune(self.state.brushes)
+        self.components.invalidate()
+        self._rebind_face_targets()
+        self._resync_terrain_after_history()
+        self.invalidate_entity_caches()
+        graph = getattr(self, '_logic_graph_win', None)
+        if graph is not None:
+            graph.resync_after_history()
+
+    def _resync_terrain_after_history(self):
+        """Reload live terrain when an undo/redo changed authored terrain data."""
+        terrain = self.terrain
+        terrain_data = self.state.terrain_data
+        if terrain is None or not isinstance(terrain_data, dict):
+            return
+
+        wanted_csg = [
+            list(cut) for cut in terrain_data.get('csg_subtractions', [])
+            if isinstance(cut, (list, tuple)) and len(cut) == 6
+        ]
+        current_csg = [list(cut) for cut in getattr(terrain, 'csg_subtractions', [])]
+
+        wanted_stamps = []
+        for stamp in terrain_data.get('texture_stamps', []):
+            if not isinstance(stamp, dict):
+                continue
+            bounds = stamp.get('bounds', [])
+            texture = str(stamp.get('texture', ''))
+            if len(bounds) != 4 or not texture:
+                continue
+            try:
+                wanted_stamps.append({
+                    'bounds': [float(v) for v in bounds],
+                    'texture': texture,
+                    'angle': float(stamp.get('angle', 0.0)),
+                    'feather': float(stamp.get('feather', 0.0)),
+                    'opacity': float(stamp.get('opacity', 1.0)),
+                })
+            except (TypeError, ValueError):
+                continue
+
+        current_stamps = [dict(stamp) for stamp in getattr(
+            terrain, 'texture_stamps', []) if isinstance(stamp, dict)]
+
+        wanted_paint_stamps = [dict(stamp) for stamp in terrain_data.get('paint_stamps', [])
+                               if isinstance(stamp, dict)]
+        current_paint_stamps = [dict(stamp) for stamp in getattr(terrain, 'paint_stamps', [])]
+        if (current_csg == wanted_csg and current_stamps == wanted_stamps
+                and current_paint_stamps == wanted_paint_stamps
+                and getattr(terrain, '_serialize_texture_paint', list)()
+                == list(terrain_data.get('texture_paint', []))):
+            return
+
+        terrain.from_dict(terrain_data)
+        if self.view_3d is not None and self.view_3d.logic_thread:
+            self.view_3d.logic_thread.world_runtime.terrain = terrain
+
+    def _rebind_face_targets(self):
+        """Re-point the face-texturing targets at the live scene.
+
+        Both the Surface Inspector's bound face and ``face_texture_target``
+        hold ``(brush, face key)``.  After a history step that brush is a
+        detached copy, so the panel would go on editing something nothing draws.
+        Each is moved to the brush with the same stable id, or dropped.
+        """
+        live = {}
+        for brush in self.state.brushes:
+            brush_id = brush.get('id')
+            if brush_id:
+                live[brush_id] = brush
+
+        def _rebind(target):
+            if not target or target[0] is None:
+                return target
+            brush, key = target
+            if any(brush is b for b in self.state.brushes):
+                return target
+            replacement = live.get(brush.get('id')) if isinstance(brush, dict) else None
+            return (replacement, key) if replacement is not None else None
+
+        current = self.face_texture_target
+        if current is not None:
+            self.face_texture_target = _rebind(current)
+
+        inspector = getattr(self, 'surface_inspector', None)
+        if inspector is not None and inspector.target is not None:
+            rebound = _rebind(inspector.target)
+            # Re-pointed, never re-opened: undo is not a window action.
+            if rebound is None:
+                inspector.set_target(None, None, raise_window=False,
+                                     reveal=False)
+            elif rebound is not inspector.target:
+                inspector.set_target(rebound[0], rebound[1],
+                                     raise_window=False, reveal=False)
+            else:
+                inspector.refresh_from_face()
+
+    def invalidate_entity_caches(self):
+        """Drop caches keyed on the scene's objects.
+
+        For the wholesale swaps — an undo, a map load — where the objects
+        themselves are replaced rather than edited, so nothing watching for
+        changes *within* an object can notice.
+        """
+        editor_panel = getattr(self, 'property_editor', None)
+        if editor_panel is not None:
+            editor_panel.invalidate_cache()
+        try:
+            from editor import io_system
+            io_system.bump_io_revision()
+        except ImportError:
+            pass
+
+    def set_render_mode(self, mode):
+        self.view_3d.render_mode = mode
+        self.update_views()
+
+    def show_shortcuts_window(self):
+        """Help > Keys: list every shortcut, including the user's own.
+
+        Kept on the window so reopening raises the one already there rather
+        than stacking copies; it re-reads its list each time it is shown.
+        """
+        from editor.shortcuts_window import ShortcutsWindow
+        if getattr(self, 'shortcuts_window', None) is None:
+            self.shortcuts_window = ShortcutsWindow(self, self)
+        self.shortcuts_window.show()
+        self.shortcuts_window.raise_()
+        self.shortcuts_window.activateWindow()
+
+    def show_about(self):
+        try:
+            with open(os.path.join(self.root_dir, 'editor', 'version.txt'), 'r') as f:
+                version = f.read().strip()
+        except FileNotFoundError:
+            version = "Version not found"
+
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("About Fio")
+        
+        container_widget = QWidget()
+        layout = QVBoxLayout(container_widget)
+
+        splash_label = QLabel()
+        pixmap = load_pixmap('assets/splash.png')
+        splash_label.setPixmap(pixmap.scaled(512, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        layout.addWidget(splash_label)
+
+        subtitle_label = QLabel("Real-time world machine")
+        subtitle_label.setAlignment(Qt.AlignCenter)
+        subtitle_label.setStyleSheet("""
+            QLabel {
+                color: #cccccc;
+                font-weight: bold;
+                padding: 4px 0px;
+            }
+        """)
+        layout.addWidget(subtitle_label)
+
+        version_label = QLabel(
+            f"{version}<br>"
+            f"<a href='https://github.com/ViciousSquid/Fio' style='color: #F08000; text-decoration: none;'>"
+            f"https://github.com/ViciousSquid/Fio"
+            f"</a><br>"
+            f"<a href='https://github.com/ViciousSquid/Fio/wiki' style='color: #A7B454; text-decoration: none;'>"
+            f"view the wiki"
+            f"</a>"
+        )
+        version_label.setTextFormat(Qt.RichText)
+        version_label.setAlignment(Qt.AlignCenter)
+        version_label.setOpenExternalLinks(True)
+        version_label.setStyleSheet("""
+            QLabel { color: #f0f0f0; }
+            a { color: #F08000; }
+        """)
+        layout.addWidget(version_label)
+        
+        msg_box.layout().addWidget(container_widget, 0, 0, 1, msg_box.layout().columnCount())
+        
+        msg_box.setStandardButtons(QMessageBox.Ok)
+
+        msg_box.exec_()
+
+    # ------------------------------------------------------------------
+    #  .fiopak Export Integration
+    # ------------------------------------------------------------------
+
+    def setup_package_actions(self):
+        """Add package actions to the Tools menu."""
+        export_action = QAction("Export Game Package...", self)
+        export_action.setShortcut("Ctrl+Shift+E")
+        export_action.triggered.connect(self.export_game_package)
+        self.tools_menu.addAction(export_action)
+
+        play_action = QAction("Play Game Package...", self)
+        play_action.triggered.connect(self.play_game_package)
+        self.tools_menu.addAction(play_action)
+
+    def export_game_package(self):
+        """Export a game package. If the level is unsaved, create a temporary saved copy first."""
+        import tempfile
+        import os
+        import json
+
+        # Close any open overlay first: its close callback runs now, not
+        # after the temporary copy below exists (an earlier export overlay's
+        # cleanup would otherwise delete this export's copy).
+        self._close_current_overlay()
+
+        # Determine the map path to use for export
+        if self.unsaved_changes or self.file_path is None:
+            # Unsaved or never saved – create a temporary file
+            try:
+                # Ensure maps directory exists (optional, temp can go to system temp)
+                maps_dir = os.path.join(self.root_dir, "maps")
+                if not os.path.exists(maps_dir):
+                    os.makedirs(maps_dir)
+
+                # Create a temporary file inside maps/ (or system temp)
+                fd, temp_path = tempfile.mkstemp(suffix=".json", prefix="export_temp_", dir=maps_dir)
+                os.close(fd)
+                self._export_temp_file = temp_path
+
+                # Write current level data to temp file
+                with open(temp_path, 'w', encoding='utf-8') as f:
+                    json.dump(self.state.get_level_data(), f, indent=4)
+
+                current_map = temp_path
+                self.show_toast("Using temporary saved copy for export...")
+            except Exception as e:
+                self._discard_export_temp_file()
+                self.show_toast(f"Failed to create temporary map: {e}", is_error=True)
+                return
+        else:
+            # Already saved – use the existing file
+            current_map = self.file_path
+
+        # Proceed with export using current_map (temp or real)
+        from editor.package_dialog import PackageMetadataDialog
+
+        # Create container + dialog
+        container = QWidget()
+        container.setObjectName("ExportContainer")
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self._export_dialog = PackageMetadataDialog(
+            current_map,
+            parent=container,
+            close_callback=self._cleanup_export_overlay
+        )
+        layout.addWidget(self._export_dialog)
+
+        # Replace the export button's default behaviour with actual export
+        self._export_dialog.export_btn.clicked.disconnect()
+        self._export_dialog.export_btn.clicked.connect(
+            lambda: self._run_export(self._export_dialog, current_map)
+        )
+
+        # Cancel button and close event should close the overlay
+        self._export_dialog.cancel_btn.clicked.disconnect()
+        self._export_dialog.cancel_btn.clicked.connect(self._close_current_overlay)
+        self._export_dialog.rejected.connect(self._close_current_overlay)
+
+        self._show_overlay(container, close_callback=self._cleanup_export_overlay)
+
+    def _run_export(self, dialog, current_map):
+        """Execute the export from the dialog's metadata."""
+        metadata = dialog.build_metadata()
+        if not metadata:
+            return
+
+        # Normalise paths
+        abs_map = os.path.abspath(current_map)
+        if not os.path.isfile(abs_map):
+            QMessageBox.critical(
+                dialog, "Export Error",
+                f"The map file could not be found:\n\n{abs_map}\n\n"
+                "Please save the level and try again."
+            )
+            return
+
+        # Ask user where to save the package
+        packages_dir = os.path.join(self.root_dir, "packages")
+        if not os.path.exists(packages_dir):
+            os.makedirs(packages_dir)
+
+        output_path, _ = QFileDialog.getSaveFileName(
+            dialog,
+            "Export Game Package",
+            os.path.join(packages_dir, f"{metadata['title']}.fiopak"),
+            "Game Packages (*.fiopak)"
+        )
+        if not output_path:
+            # Cancelled the file dialog only: the overlay stays open, so the
+            # temporary copy stays too (the overlay's close removes it).
+            return
+
+        job = getattr(self, '_export_job', None)
+        if job is not None and job.running:
+            self.show_toast("A package export is already running", is_error=True)
+            return
+
+        # The export runs on a worker thread and reads files only, so the
+        # scene it packages is fixed here, on the GUI thread: an unsaved
+        # level is written to a copy of its own, taken now (the overlay's
+        # temporary copy dates from when it opened, and the overlay may be
+        # closed -- removing that copy -- while the export still reads).
+        job_copy = None
+        if self.unsaved_changes or self.file_path is None or abs_map == os.path.abspath(
+                getattr(self, '_export_temp_file', None) or ''):
+            import tempfile
+            try:
+                text = _strict_json(self.state.get_level_data(), indent=4)
+                fd, job_copy = tempfile.mkstemp(suffix=".json", prefix="export_temp_",
+                                                dir=os.path.dirname(abs_map))
+                with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                    handle.write(text)
+            except Exception as e:
+                if job_copy and os.path.exists(job_copy):
+                    os.unlink(job_copy)
+                self.show_toast(f"Failed to snapshot the map for export: {e}", is_error=True)
+                return
+            abs_map = job_copy
+
+        def discard_copy():
+            if job_copy and os.path.exists(job_copy):
+                os.unlink(job_copy)
+
+        def finished(success, errors):
+            self._export_job = None
+            try:
+                bar.deleteLater()
+                dialog.cancel_btn.setEnabled(True)
+                if success:
+                    dialog.dep_label.setStyleSheet("color: #4CAF50; font-size: 12px; padding: 4px;")
+                    dialog.dep_label.setText(
+                        f"Export successful!\nSaved to: {os.path.basename(output_path)}")
+                    dialog.export_btn.setText("Done")
+                else:
+                    dialog.dep_label.setStyleSheet("color: #f44336; font-size: 12px; padding: 4px;")
+                    dialog.dep_label.setText("Export failed:\n" + "\n".join(errors[:5]))
+                    dialog.export_btn.setText("Export...")
+                    dialog.export_btn.setEnabled(True)
+            except RuntimeError:
+                pass                    # the overlay was closed meanwhile
+            if success:
+                self.show_toast(f"Package exported: {os.path.basename(output_path)}",
+                                level='success')
+            else:
+                first = (errors[0] if errors else "unknown error").splitlines()
+                self.show_toast(f"Package export failed: {' '.join(first[:2])}",
+                                is_error=True)
+
+        # Progress: a busy bar and a disabled Export button while it runs;
+        # the rest of the editor stays usable.
+        from PyQt5.QtWidgets import QProgressBar
+        bar = QProgressBar(dialog)
+        bar.setRange(0, 0)
+        bar.setTextVisible(False)
+        if dialog.layout() is not None:
+            dialog.layout().addWidget(bar)
+        dialog.export_btn.setEnabled(False)
+        dialog.export_btn.setText("Exporting...")
+        dialog.cancel_btn.setEnabled(False)
+        dialog.dep_label.setStyleSheet("color: #888; font-size: 12px; padding: 4px;")
+        dialog.dep_label.setText(f"Exporting {os.path.basename(output_path)}...")
+
+        from editor.export_job import ExportJob
+        from editor.package_exporter import PackageExporter
+        self._export_job = ExportJob(PackageExporter(self.state, self.root_dir),
+                                     output_path, metadata, abs_map, finished,
+                                     cleanup=discard_copy)
+        self._export_job.start()
+
+    def new_map(self):
+        if self._refuse_file_command_in_play("start a new map"):
+            return
+        # Check for unsaved changes
+        if not self.check_unsaved_changes():
+            return
+
+        self._clear_terrain()
+        self.state.clear_scene()
+        self._reset_logic_state_stores()
+        update_all_counters_from_entities([])
+        self.reset_camera_mode()
+
+        self.file_path = None
+        self.map_minified = False
+        self._generated_level_marker = None
+        self._close_package()
+        self.unsaved_changes = False
+        self.update_title()
+        self.update_all_ui()
+        self._refresh_logic_graph()
+
+    def perform_subtraction(self, push_undo=True, target_brush=None):
+        """CSG-subtract the selected brush, optionally from one target brush only.
+
+        ``target_brush`` is used by compound editor operations such as Hollow:
+        the temporary cutter must not modify unrelated geometry that happens to
+        sit inside the selected brush.
+
+        ``push_undo`` lets a caller that has already opened an undo checkpoint
+        (Hollow, which runs a subtract as one step of a larger operation) fold
+        this into that single step instead of stacking a second one.
+        """
+        if not isinstance(self.primary_selection(), dict):
+            QMessageBox.warning(self, "Invalid Selection", "Select a brush for CSG Subtract")
+            return
+
+        # Terrain is a heightfield, so terrain CSG is deliberately limited to
+        # plain AABB brushes. A brush carrying custom convex geometry is still a
+        # valid CSG cutter for ordinary brushes, but never becomes a terrain cut.
+        if self.terrain is not None and isinstance(self.state.terrain_data, dict):
+            # Keep the undo checkpoint's compact terrain-CSG snapshot in sync with
+            # the live terrain before the operation mutates it.
+            self.state.terrain_data = self.terrain.to_dict()
+
+        if push_undo:
+            self.save_state()
+
+        self.primary_selection()['operation'] = 'subtract'
+        subtract_brush = self.primary_selection()
+
+        terrain_cut = False
+        if (target_brush is None and self.terrain is not None
+                and brush_geometry.is_plain_aabb_brush(subtract_brush)):
+            sub_pos = subtract_brush['pos']
+            sub_size = subtract_brush['size']
+            terrain_cut = self.terrain.subtract_aabb(
+                [sub_pos[0] - sub_size[0] / 2,
+                 sub_pos[1] - sub_size[1] / 2,
+                 sub_pos[2] - sub_size[2] / 2],
+                [sub_pos[0] + sub_size[0] / 2,
+                 sub_pos[1] + sub_size[1] / 2,
+                 sub_pos[2] + sub_size[2] / 2],
+            )
+        elif (target_brush is None and self.terrain is not None
+              and not brush_geometry.is_plain_aabb_brush(subtract_brush)):
+            self.show_toast(
+                "Terrain CSG requires a plain axis-aligned box brush",
+                is_error=True,
+            )
+
+        if terrain_cut:
+            self.state.terrain_data = self.terrain.to_dict()
+
+        sub_pos = subtract_brush['pos']
+        sub_size = subtract_brush['size']
+        sub_min = [sub_pos[0] - sub_size[0]/2, sub_pos[1] - sub_size[1]/2, sub_pos[2] - sub_size[2]/2]
+        sub_max = [sub_pos[0] + sub_size[0]/2, sub_pos[1] + sub_size[1]/2, sub_pos[2] + sub_size[2]/2]
+        
+        new_brushes = []
+        for brush in self.state.brushes:
+            if brush is subtract_brush:
+                continue
+
+            # A targeted subtraction is deliberately isolated to the caller's
+            # brush.  This is essential for Hollow: an object already inside
+            # the outer box is not part of the hollowing operation and must be
+            # left completely untouched.
+            if target_brush is not None and brush is not target_brush:
+                new_brushes.append(brush)
+                continue
+                
+            if brush.get('operation') == 'subtract':
+                new_brushes.append(brush)
+                continue
+        
+            pos = brush['pos']
+            size = brush['size']
+            brush_min = [pos[0] - size[0]/2, pos[1] - size[1]/2, pos[2] - size[2]/2]
+            brush_max = [pos[0] + size[0]/2, pos[1] + size[1]/2, pos[2] + size[2]/2]
+            
+            # No intersection -> keep brush unchanged
+            if not (brush_min[0] < sub_max[0] and brush_max[0] > sub_min[0] and
+                    brush_min[1] < sub_max[1] and brush_max[1] > sub_min[1] and
+                    brush_min[2] < sub_max[2] and brush_max[2] > sub_min[2]):
+                new_brushes.append(brush)
+                continue
+                
+            fragments = []
+            # Each fragment takes the brush's whole face material -- every
+            # field of every tagged face, from its one record -- and its
+            # brush-wide tiling.
+            base_material = brush_faces.box_material_dicts(brush)
+            base_textures = base_material.get('textures', {})
+            base_color = brush.get('color', None)
+            base_name = brush.get('name', '')
+            
+            # ----- Left slab (x < sub_min[0]) -----
+            if brush_min[0] < sub_min[0]:
+                left_max = min(brush_max[0], sub_min[0])
+                if left_max - brush_min[0] > 0.01:
+                    frag = {
+                        'pos': [(brush_min[0] + left_max)/2, pos[1], pos[2]],
+                        'size': [left_max - brush_min[0], size[1], size[2]],
+                        'operation': 'add',
+                        'textures': base_textures.copy()
+                    }
+                    if base_color: frag['color'] = base_color
+                    if base_name: frag['name'] = f"{base_name}_left"
+                    fragments.append(frag)
+            
+            # ----- Right slab (x > sub_max[0]) -----
+            if brush_max[0] > sub_max[0]:
+                right_min = max(brush_min[0], sub_max[0])
+                if brush_max[0] - right_min > 0.01:
+                    frag = {
+                        'pos': [(right_min + brush_max[0])/2, pos[1], pos[2]],
+                        'size': [brush_max[0] - right_min, size[1], size[2]],
+                        'operation': 'add',
+                        'textures': base_textures.copy()
+                    }
+                    if base_color: frag['color'] = base_color
+                    if base_name: frag['name'] = f"{base_name}_right"
+                    fragments.append(frag)
+            
+            # ----- Bottom slab (y < sub_min[1]) -----
+            if brush_min[1] < sub_min[1]:
+                bottom_max = min(brush_max[1], sub_min[1])
+                # X overlap region (the part that hasn't been cut away by left/right)
+                x_min = max(brush_min[0], sub_min[0])
+                x_max = min(brush_max[0], sub_max[0])
+                if bottom_max - brush_min[1] > 0.01 and x_max - x_min > 0.01:
+                    frag = {
+                        'pos': [(x_min + x_max)/2, (brush_min[1] + bottom_max)/2, pos[2]],
+                        'size': [x_max - x_min, bottom_max - brush_min[1], size[2]],
+                        'operation': 'add',
+                        'textures': base_textures.copy()
+                    }
+                    if base_color: frag['color'] = base_color
+                    if base_name: frag['name'] = f"{base_name}_bottom"
+                    fragments.append(frag)
+            
+            # ----- Top slab (y > sub_max[1]) -----
+            if brush_max[1] > sub_max[1]:
+                top_min = max(brush_min[1], sub_max[1])
+                x_min = max(brush_min[0], sub_min[0])
+                x_max = min(brush_max[0], sub_max[0])
+                if brush_max[1] - top_min > 0.01 and x_max - x_min > 0.01:
+                    frag = {
+                        'pos': [(x_min + x_max)/2, (top_min + brush_max[1])/2, pos[2]],
+                        'size': [x_max - x_min, brush_max[1] - top_min, size[2]],
+                        'operation': 'add',
+                        'textures': base_textures.copy()
+                    }
+                    if base_color: frag['color'] = base_color
+                    if base_name: frag['name'] = f"{base_name}_top"
+                    fragments.append(frag)
+            
+            # ----- Front slab (z < sub_min[2]) -----
+            if brush_min[2] < sub_min[2]:
+                front_max = min(brush_max[2], sub_min[2])
+                x_min = max(brush_min[0], sub_min[0])
+                x_max = min(brush_max[0], sub_max[0])
+                y_min = max(brush_min[1], sub_min[1])
+                y_max = min(brush_max[1], sub_max[1])
+                if front_max - brush_min[2] > 0.01 and x_max - x_min > 0.01 and y_max - y_min > 0.01:
+                    frag = {
+                        'pos': [(x_min + x_max)/2, (y_min + y_max)/2, (brush_min[2] + front_max)/2],
+                        'size': [x_max - x_min, y_max - y_min, front_max - brush_min[2]],
+                        'operation': 'add',
+                        'textures': base_textures.copy()
+                    }
+                    if base_color: frag['color'] = base_color
+                    if base_name: frag['name'] = f"{base_name}_front"
+                    fragments.append(frag)
+            
+            # ----- Back slab (z > sub_max[2]) -----
+            if brush_max[2] > sub_max[2]:
+                back_min = max(brush_min[2], sub_max[2])
+                x_min = max(brush_min[0], sub_min[0])
+                x_max = min(brush_max[0], sub_max[0])
+                y_min = max(brush_min[1], sub_min[1])
+                y_max = min(brush_max[1], sub_max[1])
+                if brush_max[2] - back_min > 0.01 and x_max - x_min > 0.01 and y_max - y_min > 0.01:
+                    frag = {
+                        'pos': [(x_min + x_max)/2, (y_min + y_max)/2, (back_min + brush_max[2])/2],
+                        'size': [x_max - x_min, y_max - y_min, brush_max[2] - back_min],
+                        'operation': 'add',
+                        'textures': base_textures.copy()
+                    }
+                    if base_color: frag['color'] = base_color
+                    if base_name: frag['name'] = f"{base_name}_back"
+                    fragments.append(frag)
+            
+            for frag in fragments:
+                for key, entries in base_material.items():
+                    if key != 'textures':
+                        frag[key] = copy.deepcopy(entries)
+                if brush.get('texture_tiling'):
+                    frag['texture_tiling'] = True
+            new_brushes.extend(fragments)
+        
+        new_brushes.append(subtract_brush)
+        self.state.brushes = new_brushes
+        if terrain_cut:
+            # Terrain and brush CSG are one user operation; keep the serialized
+            # terrain modifier in EditorState as the authoritative undo/save data.
+            self.state.terrain_data = self.terrain.to_dict()
+            self.show_toast("Subtracted AABB from terrain")
+        self.update_all_ui()
+
+
+    def autocaulk(self):
+        """Automatically apply nodraw to faces that are never visible."""
+        self.save_state()  # Enables undo/redo
+
+        # Collect all solid additive brushes (exclude subtract, trigger, fog)
+        brushes = [
+            b for b in self.state.brushes
+            if b.get('operation') != 'subtract'
+            and not b.get('is_trigger', False)
+            and not b.get('is_fog', False)
+        ]
+
+        caulked_faces = 0
+        changed_brushes = []
+        for brush in brushes:
+            # The occlusion test samples the brush's AABB faces: an angled
+            # brush's faces are not those, so it is never caulked here.
+            if brush_geometry.brush_has_geometry(brush):
+                continue
+            for face in brush_faces.FACE_TAGS:
+                if brush_faces.box_record(brush, face).get('texture') == 'nodraw.jpg':
+                    continue   # already set
+
+                if self._is_face_occluded(brush, face, brushes):
+                    brush_faces.set_face_material(brush, face, texture='nodraw.jpg')
+                    changed_brushes.append(brush)
+                    caulked_faces += 1
+
+        if changed_brushes:
+            self.state.mark_lighting_dirty(changed_brushes)
+            self.update_views()
+            self.show_toast(f"Autocaulk applied: caulked {caulked_faces} face(s)", duration=5000)
+        else:
+            self.show_toast("Autocaulk: no occluded faces found")
+
+    def _is_face_occluded(self, brush, face, all_brushes):
+        """
+        Returns True if the given face of 'brush' is fully covered by any other
+        brush in 'all_brushes'. Uses a point sample just outside the face center.
+        """
+        pos = brush['pos']
+        size = brush['size']
+        epsilon = 1.0   # small offset to push sample outside the brush
+
+        # Compute the sample point (center of the face, shifted outward)
+        if face == 'north':
+            center = [pos[0], pos[1], pos[2] + size[2]/2 + epsilon]
+        elif face == 'south':
+            center = [pos[0], pos[1], pos[2] - size[2]/2 - epsilon]
+        elif face == 'east':
+            center = [pos[0] + size[0]/2 + epsilon, pos[1], pos[2]]
+        elif face == 'west':
+            center = [pos[0] - size[0]/2 - epsilon, pos[1], pos[2]]
+        elif face == 'top':
+            center = [pos[0], pos[1] + size[1]/2 + epsilon, pos[2]]
+        elif face == 'down':
+            center = [pos[0], pos[1] - size[1]/2 - epsilon, pos[2]]
+        else:
+            return False
+
+        # Check if the sample point lies inside any other brush
+        for other in all_brushes:
+            if other is brush:
+                continue
+            op = other['pos']
+            osize = other['size']
+            minx = op[0] - osize[0]/2
+            maxx = op[0] + osize[0]/2
+            miny = op[1] - osize[1]/2
+            maxy = op[1] + osize[1]/2
+            minz = op[2] - osize[2]/2
+            maxz = op[2] + osize[2]/2
+
+            # Use epsilon tolerance for floating-point safety
+            if (minx - epsilon <= center[0] <= maxx + epsilon and
+                miny - epsilon <= center[1] <= maxy + epsilon and
+                minz - epsilon <= center[2] <= maxz + epsilon):
+                return True
+        return False
+
+    def hollow_selected_brush(self):
+        """Hollow the selected outer box without modifying enclosed geometry.
+
+        The selected brush is converted into a shell with the requested wall
+        thickness.  Other brushes, including arbitrary/many-sided geometry
+        already enclosed by the box, are intentionally left untouched.
+        """
+        if not isinstance(self.primary_selection(), dict):
+            QMessageBox.warning(self, "Invalid Selection", "Select a brush to hollow.")
+            return
+
+        outer_brush = self.primary_selection()
+
+        if outer_brush.get('lock', False):
+            QMessageBox.warning(self, "Brush Locked", "Cannot hollow a locked brush.")
+            return
+
+        max_thickness = int(min(outer_brush['size']) // 2 - 1)
+        default_thickness = min(
+            max(int(getattr(self, 'last_hollow_thickness', 16)), 8),
+            max(8, max_thickness)
+        )
+        thickness, ok = QInputDialog.getInt(
+            self,
+            "Hollow Brush",
+            "Wall thickness (grid units):",
+            value=default_thickness,
+            min=8,
+            max=max(8, max_thickness)
+        )
+
+        if not ok:
+            return
+        self.last_hollow_thickness = thickness
+
+        min_size = min(outer_brush['size'])
+        if min_size <= thickness * 2:
+            QMessageBox.warning(
+                self,
+                "Brush Too Small",
+                f"The brush is too small to hollow with thickness {thickness}.\\n"
+                f"Minimum dimension ({min_size}) must be greater than {thickness * 2}."
+            )
+            return
+
+        self.save_state()
+
+        # Keep the original scene intact except for the selected outer brush.
+        # The generic subtract operation normally cuts every intersecting
+        # additive brush; Hollow must not do that because enclosed geometry is
+        # part of the user's scene, not part of the box shell.
+        before = set(id(b) for b in self.state.brushes)
+
+        outer_pos = outer_brush['pos']
+        outer_size = outer_brush['size']
+        inner_brush = {
+            'pos': list(outer_pos),
+            'size': [
+                outer_size[0] - thickness * 2,
+                outer_size[1] - thickness * 2,
+                outer_size[2] - thickness * 2
+            ],
+            'operation': 'subtract',
+            **brush_faces.box_material_dicts(outer_brush),
+            'name': f"{outer_brush.get('name', 'Brush')}_hollow_sub"
+        }
+
+        self.state.brushes.append(inner_brush)
+        self.state.selected_objects = [inner_brush]
+
+        # Only subtract the temporary inner volume from the selected outer
+        # brush.  An enclosed many-sided brush therefore survives unchanged.
+        self.perform_subtraction(push_undo=False, target_brush=outer_brush)
+
+        if inner_brush in self.state.brushes:
+            self.state.brushes.remove(inner_brush)
+
+        walls = [
+            b for b in self.state.brushes
+            if id(b) not in before
+        ]
+        if walls:
+            self.set_selected_objects(walls)
+        else:
+            self.set_selected_objects([])
+
+        self.show_toast(f"Hollowed with {thickness} unit walls")
+
+    def create_room_from_brush(self):
+        """Create a room by hollowing the brush and placing lights inside."""
+        if not isinstance(self.primary_selection(), dict):
+            QMessageBox.warning(self, "Invalid Selection", "Please select a brush to convert to a room.")
+            return
+
+        outer_brush = self.primary_selection()
+        
+        # Check if brush is locked
+        if outer_brush.get('lock', False):
+            QMessageBox.warning(self, "Brush Locked", "Cannot modify a locked brush.")
+            return
+
+        # Prompt for wall thickness
+        max_thickness = int(min(outer_brush['size']) // 2 - 1)
+        thickness, ok = QInputDialog.getInt(
+            self,
+            "Create Room",
+            "Wall thickness (grid units):",
+            value=16,
+            min=8,
+            max=max(8, max_thickness)
+        )
+        
+        if not ok:
+            return
+        
+        # Check if the brush is large enough
+        min_size = min(outer_brush['size'])
+        if min_size <= thickness * 2:
+            QMessageBox.warning(
+                self, 
+                "Brush Too Small", 
+                f"The brush is too small to hollow with thickness {thickness}.\n"
+                f"Minimum dimension ({min_size}) must be greater than {thickness * 2}."
+            )
+            return
+
+        self.save_state()
+        
+        # Get outer brush properties
+        outer_pos = outer_brush['pos']
+        outer_size = outer_brush['size']
+        
+        # Store inner dimensions for light placement
+        inner_width = outer_size[0] - thickness * 2
+        inner_depth = outer_size[2] - thickness * 2
+        inner_height = outer_size[1] - thickness * 2
+        
+        # Perform hollow operation
+        inner_brush = {
+            'pos': list(outer_pos),
+            'size': [inner_width, inner_height, inner_depth],
+            'operation': 'subtract',
+            **brush_faces.box_material_dicts(outer_brush),
+            'name': f"{outer_brush.get('name', 'Brush')}_hollow_sub"
+        }
+        
+        self.state.brushes.append(inner_brush)
+        self.state.selected_objects = [inner_brush]
+        # One undo step for the whole room: the checkpoint above covers it.
+        self.perform_subtraction(push_undo=False)
+
+        # Remove the inner brush
+        if inner_brush in self.state.brushes:
+            self.state.brushes.remove(inner_brush)
+        
+        # Calculate number of lights needed (one per 1024x1024 area)
+        # Using ceiling to ensure adequate lighting
+        import math
+        num_lights_x = max(1, math.ceil(inner_width / 1024))
+        num_lights_z = max(1, math.ceil(inner_depth / 1024))
+        
+        # Calculate spacing between lights
+        spacing_x = inner_width / num_lights_x if num_lights_x > 0 else 0
+        spacing_z = inner_depth / num_lights_z if num_lights_z > 0 else 0
+        
+        # Place lights at the ceiling of the room (top of inner space)
+        light_y = outer_pos[1] + thickness  # Top of inner space
+        
+        # Add lights
+        for i in range(num_lights_x):
+            for j in range(num_lights_z):
+                # Calculate light position - centered in its grid cell
+                x = outer_pos[0] - inner_width/2 + spacing_x/2 + i * spacing_x
+                z = outer_pos[2] - inner_depth/2 + spacing_z/2 + j * spacing_z
+                
+                light_pos = [x, light_y, z]
+                new_light = Light(pos=light_pos)
+                self.state.things.append(new_light)
+        
+        # Update UI
+        self.set_selected_objects([])
+        
+        # Show confirmation
+        light_count = num_lights_x * num_lights_z
+        self.show_toast(f"Created room with {thickness} unit walls and {light_count} light(s)")
+
+    def toggle_trigger_display(self, checked):
+        self.view_3d.show_triggers_as_solid = checked
+        self.view_3d.update()
+
+    def _has_user_binding(self, event):
+        """True when the user has bound this exact key combination themselves.
+
+        The editor's own new shortcuts step aside for a user binding from
+        Settings rather than silently shadowing it.
+        """
+        if not getattr(self, 'key_bindings', None):
+            return False
+        key_str = QKeySequence(event.key() | int(event.modifiers())).toString()
+        return key_str in self.key_bindings
+
+    def keyPressEvent(self, event):
+        # The key below Escape toggles the console in both modes, whatever
+        # character the keyboard layout gives it (console_key.py).
+        if is_console_key(event):
+            if not event.isAutoRepeat():
+                self.toggle_debug_console()
+            event.accept()
+            return
+
+        # ------------------------------------------------------------------
+        # PLAY MODE HANDLING (hardcoded shortcuts first)
+        # ------------------------------------------------------------------
+        if self.view_3d.play_mode:
+            # Autorepeat: holding a key down makes the OS/Qt resend keyPress
+            # (and, on some platforms, interleaved keyRelease) events for as
+            # long as it's held. The play-mode actions below are edge-triggered
+            # and must not re-fire on every repeat tick, so the synthetic
+            # repeats are dropped here. Real physical presses are never flagged
+            # as autorepeat, so nothing genuine is lost.
+            #
+            # Scoped to play mode ONLY: editor-mode handling below relies on
+            # autorepeat for held-key actions (nudging, etc.), so those events
+            # must keep flowing to the editor branch and to
+            # super().keyPressEvent().
+            if event.isAutoRepeat():
+                return
+            # If the play console overlay is open, swallow all keys except
+            # Escape, which closes it (as the console key does).
+            if self._is_play_console_visible():
+                if event.key() == Qt.Key_Escape:
+                    self._hide_play_console_overlay()
+                # All other keys go to the overlay input — don't process as game input
+                return
+
+            if event.key() == Qt.Key_Escape:
+                # Esc pauses (the pause menu's Exit leaves Play); with the
+                # player dead there is nothing to pause, and Esc leaves.
+                if not self.view_3d.handle_pause_menu_key(event):
+                    self.leave_play_mode_from_escape()
+                return
+
+            if self.view_3d.pause_menu_active:
+                self.view_3d.handle_pause_menu_key(event)
+                return
+
+            elif event.key() == Qt.Key_F3:
+                self.view_3d.show_sprites_in_play_mode = not self.view_3d.show_sprites_in_play_mode
+                self.view_3d.update()
+                return
+
+            elif event.key() == Qt.Key_F1:
+                # As the 3D view does when it has the keyboard (QtGameView.
+                # keyPressEvent): F1 shows or hides the connection lines.
+                self.set_connection_links_enabled(not self.show_logic_links)
+                return
+
+            elif event.key() == Qt.Key_F12:
+                if getattr(self, 'is_kiosk_mode', False):
+                    self.exit_kiosk_mode(keep_play_mode=True)
+                else:
+                    self.enter_kiosk_mode()
+                return
+
+            elif event.key() == Qt.Key_E:
+                if self.view_3d.game_state:
+                    self.view_3d.game_state.set_use_key_pressed()
+                self.keys_pressed.add(event.key())
+                return
+
+            else:
+                # Check for user‑defined key bindings (only if console input does NOT have focus)
+                console_input = self.debug_console.command_input
+                if not console_input.hasFocus():
+                    key_seq = QKeySequence(event.key() | int(event.modifiers()))
+                    key_str = key_seq.toString()
+                    if key_str in self.key_bindings:
+                        command = self.key_bindings[key_str]
+                        self.console_handler.handle_command(command)
+                        return
+                # If no binding, just record the key for later use (e.g., movement)
+                self.keys_pressed.add(event.key())
+                return
+
+        # ------------------------------------------------------------------
+        # EDITOR MODE HANDLING (including bindings)
+        # ------------------------------------------------------------------
+
+        # ESC: back out of whatever is in progress, innermost first
+        if event.key() == Qt.Key_Escape and self.view_3d.gizmo.dragging:
+            self.view_3d.gizmo.cancel()         # a gizmo drag, put back
+            return
+        if event.key() == Qt.Key_Escape:
+            if self.handle_escape():
+                return
+
+        # Component modes — Radiant's V / E / F reflexes, spelled with the Shift
+        # modifier Fio already uses for tool switches (Shift+S select, Shift+B
+        # brush) so none of the existing single-key bindings move.  A key the
+        # user has bound to a console command in Settings always wins.
+        user_bound = self._has_user_binding(event)
+
+        if not user_bound and event.key() == Qt.Key_Z and not event.modifiers():
+            if not event.isAutoRepeat():
+                self.view_3d.set_editor_freelook(not self.view_3d.editor_freelook_active)
+            event.accept()
+            return
+
+        if not user_bound and event.modifiers() == Qt.ShiftModifier and \
+                event.key() in (Qt.Key_V, Qt.Key_E, Qt.Key_F):
+            self.set_component_mode({Qt.Key_V: MODE_VERTEX,
+                                     Qt.Key_E: MODE_EDGE,
+                                     Qt.Key_F: MODE_FACE}[event.key()])
+            return
+        # R: the 3D gizmo's next mode (Move -> Rotate -> Scale).
+        if not user_bound and event.key() == Qt.Key_R and not event.modifiers():
+            self.view_3d.gizmo.cycle_mode()
+            return
+        if not user_bound and event.key() == Qt.Key_Q and not event.modifiers():
+            self.cycle_component_mode()
+            return
+
+        # Radiant's area selections (Select Touching / Inside / Tall).
+        if not user_bound:
+            ctrl = Qt.ControlModifier
+            ctrl_shift = Qt.ControlModifier | Qt.ShiftModifier
+            area_ops = {
+                (int(ctrl), Qt.Key_T): self.select_touching,
+                (int(ctrl), Qt.Key_I): self.select_inside,
+                (int(ctrl_shift), Qt.Key_T): self.select_partial_tall,
+                (int(ctrl_shift), Qt.Key_I): self.select_complete_tall,
+            }
+            handler = area_ops.get((int(event.modifiers()), event.key()))
+            if handler is not None:
+                handler()
+                return
+
+        # Ctrl+C: Copy the current selection.  The clipboard stores a
+        # detached list so a multi-selection can be pasted as one unit.
+        if event.key() == Qt.Key_C and event.modifiers() == Qt.ControlModifier:
+            sources = list(self.state.selected_objects or [])
+
+            if sources:
+                clipboard = []
+                for source in sources:
+                    if isinstance(source, dict):
+                        source = {
+                            k: v for k, v in source.items()
+                            if k not in brush_geometry.GEO_RUNTIME_KEYS
+                        }
+                    clipboard.append(copy.deepcopy(source))
+                self._brush_clipboard = clipboard
+
+                names = []
+                for source in clipboard:
+                    if isinstance(source, dict):
+                        names.append(source.get('name', 'Brush'))
+                    else:
+                        names.append(source.properties.get('name', 'Entity'))
+                if len(names) == 1:
+                    self.show_toast(f"Copied: {names[0]}")
+                else:
+                    self.show_toast(f"Copied {len(names)} objects")
+            else:
+                self._brush_clipboard = None
+                self.show_toast("Nothing to copy", is_error=True)
+            return
+
+        # Ctrl+V: Paste the copied brush or multi-selection.  Every pasted
+        # object receives a fresh UUID; the copied UUID is never reused.
+        if event.key() == Qt.Key_V and event.modifiers() == Qt.ControlModifier:
+            sources = []
+            if self._brush_clipboard:
+                sources, _skipped = self._drop_singleton_copies(
+                    self._brush_clipboard)
+                if not sources:
+                    return
+            if sources:
+                self.save_state()
+                offset = self.grid_size_spinbox.value()
+                delta = [offset, 0.0, offset]
+                pasted_objects = []
+                taken_names = set(self.state.get_all_entity_names())
+
+                for source in sources:
+                    pasted = copy.deepcopy(source)
+
+                    if isinstance(pasted, dict):
+                        pasted['id'] = str(uuid.uuid4())
+                        base_name = pasted.get('name', 'Brush')
+                        if base_name:
+                            pasted['name'] = self._copy_name(base_name, taken_names)
+
+                        if brush_geometry.brush_has_geometry(pasted):
+                            brush_geometry.translate_brush(pasted, delta)
+                        else:
+                            pasted['pos'] = [
+                                pasted['pos'][0] + delta[0],
+                                pasted['pos'][1] + delta[1],
+                                pasted['pos'][2] + delta[2],
+                            ]
+
+                        # Connections are authored relationships, not geometry.
+                        # Do not duplicate them onto a pasted object.
+                        pasted.pop('_io_connections', None)
+                        pasted.pop('io_connections', None)
+                        self.state.brushes.append(pasted)
+                    else:
+                        pasted.properties['id'] = str(uuid.uuid4())
+                        base_name = pasted.properties.get('name', 'Entity')
+                        pasted.properties['name'] = self._copy_name(base_name, taken_names)
+                        pasted.pos = [
+                            pasted.pos[0] + delta[0],
+                            pasted.pos[1] + delta[1],
+                            pasted.pos[2] + delta[2],
+                        ]
+                        pasted.properties.pop('_io_connections', None)
+                        pasted.properties.pop('io_connections', None)
+                        self.state.things.append(pasted)
+
+                    pasted_objects.append(pasted)
+
+                self.set_selected_objects(pasted_objects)
+                self.show_toast(
+                    f"Pasted {len(pasted_objects)} object(s)"
+                    if len(pasted_objects) != 1
+                    else f"Pasted: {pasted_objects[0].get('name', 'Brush') if isinstance(pasted_objects[0], dict) else pasted_objects[0].properties.get('name', 'Entity')}"
+                )
+
+                for pasted in pasted_objects:
+                    if isinstance(pasted, dict):
+                        pasted['_flash_until'] = time.time() + 0.5
+                        self._after(500, lambda o=pasted: self._clear_flash(o))
+            else:
+                self.show_toast("Nothing to paste", is_error=True)
+            return
+
+        # Delete / Backspace: the Decal tool's selection first (wherever the
+        # keyboard is), then the editor's.
+        if (event.key() in (Qt.Key_Delete, Qt.Key_Backspace)
+                and not self.view_3d.play_mode
+                and self.view_3d.decal_tool.delete_selected()):
+            return
+        if self.primary_selection() and event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            self.save_state()
+            primary_start = self.state.resolve_player_start()
+            sky_image = self.sky_image_path_from_map()
+            primary_is_deleted = any(
+                obj is primary_start for obj in self.state.selected_objects
+            )
+            for obj in list(self.state.selected_objects):
+                if isinstance(obj, dict):
+                    if obj in self.state.brushes:
+                        self.state.brushes.remove(obj)
+                else:
+                    if obj in self.state.things:
+                        self.state.things.remove(obj)
+            if primary_is_deleted:
+                # Preserve the map setting while the deleted Primary is
+                # replaced. Canonicalisation is part of this explicit edit.
+                self.state.settle_player_starts()
+                self.canonicalize_sky_image_ownership(sky_image)
+            self.set_selected_objects([])
+            return
+
+        # H hides the selection (brushes and things); Shift+H shows everything
+        # hidden again, whether or not anything is selected.
+        if event.key() == Qt.Key_H and event.modifiers() == Qt.ShiftModifier:
+            self.unhide_all_brushes()
+            return
+        if (event.key() == Qt.Key_H and event.modifiers() == Qt.NoModifier
+                and self.primary_selection()):
+            self.hide_selected_brush()
+            return
+
+        # Shift+Space: clone the selection and hand it to the cursor to place.
+        # Plain Space is deliberately left free.
+        if (self.primary_selection() and event.key() == Qt.Key_Space and
+                event.modifiers() == Qt.ShiftModifier):
+            self.clone_selected_object()
+            return
+
+        # G: toggle grid through the same path as the toolbar switch.
+        if event.key() == Qt.Key_G:
+            self.toggle_grid(not self.grid_visible)
+            return
+
+        # [  /  ] : decrease / increase grid size
+        if event.key() == Qt.Key_BracketLeft:
+            new_size = max(2, self.view_3d.grid_size // 2)
+            self.set_grid_size(new_size)
+            self.show_toast(f"Grid Size: {new_size}")
+            return
+        if event.key() == Qt.Key_BracketRight:
+            new_size = min(128, self.view_3d.grid_size * 2)
+            self.set_grid_size(new_size)
+            self.show_toast(f"Grid Size: {new_size}")
+            return
+
+        # Camera movement lesson (WASD during held or toggled mouse look)
+        if not self.camera_movement_learned and self.view_3d.mouselook_active:
+            if event.key() in (Qt.Key_W, Qt.Key_A, Qt.Key_S, Qt.Key_D):
+                self.on_camera_moved_with_wasd()
+
+        # Check for user‑defined key bindings (only if console input does NOT have focus)
+        console_input = self.debug_console.command_input
+        if not console_input.hasFocus():
+            key_seq = QKeySequence(event.key() | int(event.modifiers()))
+            key_str = key_seq.toString()
+            if key_str in self.key_bindings:
+                command = self.key_bindings[key_str]
+                self.console_handler.handle_command(command)
+                return
+
+        # If we reach here, no binding consumed the key – record it for normal editor use
+        self.keys_pressed.add(event.key())
+        super().keyPressEvent(event)
+
+    def hide_selected_brush(self):
+        """Hide every selected object -- brushes and things (H)."""
+        selected = list(self.state.selected_objects) or (
+            [self.primary_selection()] if self.primary_selection() else [])
+        if not selected:
+            return
+        self.save_state()
+        for obj in selected:
+            if isinstance(obj, dict):
+                obj['hidden'] = True
+                touch(obj)
+            else:
+                set_live_flag(obj, 'hidden', True)
+        # What is hidden cannot be seen selected.
+        self.set_selected_objects([])
+        self.update_all_ui()
+
+    def unhide_all_brushes(self):
+        """Show every hidden brush and thing again (Shift+H)."""
+        hidden_brushes = [b for b in self.state.brushes if b.get('hidden')]
+        hidden_things = [t for t in self.state.things if t.properties.get('hidden')]
+        if not hidden_brushes and not hidden_things:
+            return
+        self.save_state()
+        for brush in hidden_brushes:
+            brush['hidden'] = False
+            touch(brush)
+        for thing in hidden_things:
+            set_live_flag(thing, 'hidden', False)
+        self.update_all_ui()
+
+    def keyReleaseEvent(self, event):
+        if self.view_3d.play_mode:
+            # See keyPressEvent: drop synthetic autorepeat releases so a held
+            # key is not seen as released and re-pressed on every repeat tick.
+            # Play mode only -- editor-mode releases below are untouched.
+            if event.isAutoRepeat():
+                return
+            if event.key() in self.keys_pressed:
+                self.keys_pressed.remove(event.key())
+            return # Consume the event completely in play mode
+
+        # Editor mode key releases below
+        if event.key() in self.keys_pressed:
+            self.keys_pressed.remove(event.key())
+        # Repaint only: update_views() resets every 2D view's state, so any
+        # key's release -- [ or ] to change the grid among them -- threw
+        # away a half-placed cut and ended a rotate in progress.
+        self.refresh_views()
+        super().keyReleaseEvent(event)
+
+    def snap_to_grid_enabled(self):
+        """Whether editor drags snap to the grid.
+
+        The setting is held per 2D view (each one reads it on every drag), so
+        the top view is the one asked — they are always set together.  Exposed
+        here so the 3D viewport can honour the same switch rather than guessing
+        from whether its own grid happens to be drawn.
+        """
+        view = getattr(self, 'view_top', None)
+        return bool(getattr(view, 'snap_to_grid_enabled', True))
+
+    def component_grid_step(self, grid_size):
+        """``grid_size`` when snapping is on, 0 when it is off."""
+        return grid_size if self.snap_to_grid_enabled() else 0
+
+    def toggle_grid(self, visible):
+        """Set the 3D grid visibility and keep the toolbar switch in sync."""
+        visible = bool(visible)
+        self.grid_visible = visible
+        # Always assign the new value: guarding on the old value meant that
+        # hiding the grid permanently prevented it from being shown again.
+        self.view_3d.grid_visible = visible
+        self.view_3d.update()
+
+        button = getattr(self, 'grid_btn', None)
+        if button is not None and button.isChecked() != visible:
+            was_blocked = button.blockSignals(True)
+            try:
+                button.setChecked(visible)
+            finally:
+                button.blockSignals(was_blocked)
+
+    def set_connection_links_enabled(self, enabled):
+        """Set visibility of editor I/O connection links in all views."""
+        self.show_logic_links = bool(enabled)
+
+        action = getattr(self, 'connection_links_action', None)
+        if action is not None and action.isChecked() != self.show_logic_links:
+            action.blockSignals(True)
+            action.setChecked(self.show_logic_links)
+            action.blockSignals(False)
+
+        self.update_views()
+        self.show_toast(
+            "Connection Links: %s" % ("ON" if self.show_logic_links else "OFF")
+        )
+
+    # ======================================================================
+    # Base 2D tool: Select (marquee) vs Brush (draw geometry), Hammer-style
+    # ======================================================================
+
+    def set_tool_mode(self, mode):
+        """Switch the base 2D interaction tool between 'select' and 'brush'.
+
+        Picking a base tool also exits the Clip/Rotate drag tools and returns
+        component editing to object mode (they are mutually exclusive with
+        everything else, Hammer/Radiant style) and syncs the toolbar buttons +
+        view cursors.
+        """
+        mode = 'brush' if mode == 'brush' else 'select'
+        self.tool_mode = mode
+
+        # Leaving to a base tool cancels the special drag tools.
+        if self.clip_mode:
+            self.set_clip_mode(False)
+        if self.rotate_mode:
+            self.set_rotate_mode(False)
+        # ...and drops out of vertex/edge/face, so exactly one button in the
+        # base-tool group is lit.  Done on the controller rather than through
+        # set_component_mode() so this does not fire a second toast over the
+        # one below.
+        if self.components.set_mode(MODE_OBJECT):
+            self.refresh_views()
+
+        self._sync_tool_group_buttons()
+
+        cursor = Qt.ArrowCursor if mode == 'select' else Qt.CrossCursor
+        for view in (self.view_top, self.view_side, self.view_front):
+            view.reset_marquee()
+            view.setCursor(cursor)
+            view.update()
+
+        self.show_toast("Select tool — drag a box to select, click empty to deselect"
+                        if mode == 'select' else
+                        "Brush tool — drag in a 2D view to create geometry; Shift+click selects a brush")
+
+    # ======================================================================
+    # Component mode: OBJECT / FACE / EDGE / VERTEX
+    # ======================================================================
+
+    def set_component_mode(self, mode):
+        """Switch what a click in a view grabs: whole objects or components.
+
+        Radiant's mapper reflex is to stay on the geometry and change what the
+        mouse means, so this is a mode switch rather than a separate tool: the
+        current object selection is kept, and the same press/drag gesture now
+        grabs a face, an edge or a vertex of the selected brushes.
+        """
+        if mode not in COMPONENT_MODES:
+            return
+        if not self.components.set_mode(mode):
+            return
+        # Component work always happens on the current object selection, so
+        # leaving object mode with nothing selected is a no-op worth saying.
+        if mode != MODE_OBJECT and not self._selected_brushes():
+            self.show_toast("%s mode — select a brush first" % MODE_LABELS[mode],
+                            is_error=True)
+        else:
+            self.show_toast({
+                MODE_OBJECT: "Object mode — drag brushes, drag a side to stretch",
+                MODE_FACE: "Face mode — drag a face to move its plane "
+                           "(Ctrl-drag shears it)",
+                MODE_EDGE: "Edge mode — drag an edge",
+                MODE_VERTEX: "Vertex mode — drag a vertex",
+            }[mode])
+        self._sync_component_buttons()
+        self.refresh_views()
+
+    #: Q steps through the base-tool group in toolbar order.
+    TOOL_CYCLE = ('select', 'brush', MODE_VERTEX, MODE_EDGE, MODE_FACE)
+
+    def cycle_component_mode(self):
+        """Q: Select -> Brush -> Vertex -> Edge -> Face -> Select.
+
+        The whole base-tool group, in toolbar order. (It stepped only object,
+        vertex, edge and face, and object mode is whichever base tool was
+        active -- Brush in a new editor -- so Q never reached Select.)
+        """
+        current = self.components.mode
+        if current == MODE_OBJECT:
+            current = self.tool_mode
+        order = self.TOOL_CYCLE
+        index = order.index(current) if current in order else 0
+        nxt = order[(index + 1) % len(order)]
+        if nxt in ('select', 'brush'):
+            self.set_tool_mode(nxt)
+        else:
+            self.set_component_mode(nxt)
+
+    def _sync_tool_group_buttons(self):
+        """Light exactly one strip in the base-tool group.
+
+        The five buttons -- Select, Brush, Vertex, Edge, Face -- are one group
+        on the toolbar and show their state the way the grid switch does: the
+        strip underneath is grey until the button is the active one.  So only
+        one of them may be checked at a time.  A component mode supersedes the
+        base tool (the drag grabs a face/edge/vertex, not the object), which is
+        why it takes the light off Select/Brush; dropping back to object mode
+        hands it straight back.
+        """
+        component_mode = self.components.mode
+        in_components = component_mode != MODE_OBJECT
+        wanted_by_name = {
+            'select_tool_btn': not in_components and self.tool_mode == 'select',
+            'brush_tool_btn': not in_components and self.tool_mode == 'brush',
+            'vertex_mode_btn': component_mode == MODE_VERTEX,
+            'edge_mode_btn': component_mode == MODE_EDGE,
+            'face_mode_btn': component_mode == MODE_FACE,
+        }
+        for name, wanted in wanted_by_name.items():
+            btn = getattr(self, name, None)
+            if btn is None:
+                continue
+            if btn.isChecked() != wanted:
+                btn.blockSignals(True)
+                btn.setChecked(wanted)
+                btn.blockSignals(False)
+
+    def _sync_component_buttons(self):
+        """Keep the component-mode toolbar buttons and menu matching the mode."""
+        self._sync_tool_group_buttons()
+        for mode, action in getattr(self, 'component_mode_actions', {}).items():
+            wanted = self.components.mode == mode
+            if action.isChecked() != wanted:
+                action.blockSignals(True)
+                action.setChecked(wanted)
+                action.blockSignals(False)
+
+    def refresh_views(self):
+        """Repaint every view *without* disturbing what they are doing.
+
+        Deliberately not ``update_views()``, which calls ``reset_state()`` on
+        each 2D view and so tears down any drag that is still in progress —
+        fine between operations, fatal in the middle of one.
+        """
+        for view in (self.view_top, self.view_side, self.view_front):
+            view.update()
+        self.view_3d.update()
+
+    def _selected_brushes(self):
+        """Every brush in the current selection (things filtered out)."""
+        objs = list(self.state.selected_objects)
+        return [o for o in objs if isinstance(o, dict)]
+
+    def component_drag_targets(self):
+        """Brushes a component pick may test — the selection, never the scene.
+
+        Keeping the candidate set to the selection is what makes component
+        picking O(selected) instead of O(scene); it also matches Radiant, where
+        component modes only ever act on what is already selected.
+        """
+        return [b for b in self._selected_brushes()
+                if not b.get('lock', False) and not b.get('hidden', False)]
+
+    # ======================================================================
+    # Radiant-style area selection operations
+    # ======================================================================
+
+    def _active_2d_view(self):
+        """The 2D view the user is working in (falls back to the top view)."""
+        current = self.right_tabs.currentWidget()
+        if isinstance(current, View2D):
+            return current
+        return self.view_top
+
+    def _selection_skips_locked(self):
+        return self.config.getboolean('Display', 'locked_not_selectable_2d',
+                                      fallback=False)
+
+    def _marker_brush(self):
+        """The single selected brush an area-selection operation works from."""
+        brushes = self._selected_brushes()
+        if len(brushes) != 1:
+            self.show_toast("Select exactly one brush to use as the region",
+                            is_error=True)
+            return None
+        return brushes[0]
+
+    def _apply_area_selection(self, hits, marker, consume_marker, label):
+        """Commit an area-selection result through the normal selection path.
+
+        ``consume_marker`` deletes the region brush afterwards, the way
+        Radiant's Inside / Tall selections treat it as a throwaway lasso;
+        Select Touching keeps it, exactly as Radiant does.
+        """
+        if consume_marker:
+            self.save_state()
+            if marker in self.state.brushes:
+                self.state.brushes.remove(marker)
+        if hits:
+            self.set_selected_objects(hits)
+            self.show_toast("%s: %d object(s)" % (label, len(hits)))
+        else:
+            self.set_selected_objects([])
+            self.show_toast("%s: nothing found" % label, is_error=True)
+        self.update_all_ui()
+
+    def _area_selection_objects(self):
+        return list(self.state.brushes) + list(self.state.things)
+
+    def select_touching(self):
+        """Select everything whose bounds touch the selected brush's bounds."""
+        marker = self._marker_brush()
+        if marker is None:
+            return
+        lo, hi = component_edit.object_bounds(marker)
+        hits = component_edit.select_touching(
+            self._area_selection_objects(), lo, hi, exclude=marker,
+            skip_locked=self._selection_skips_locked())
+        # Radiant keeps the region brush selected along with what it caught.
+        self._apply_area_selection([marker] + hits, marker, False,
+                                   "Select Touching")
+
+    def select_inside(self):
+        """Select everything wholly inside the selected brush, then drop it."""
+        marker = self._marker_brush()
+        if marker is None:
+            return
+        lo, hi = component_edit.object_bounds(marker)
+        hits = component_edit.select_inside(
+            self._area_selection_objects(), lo, hi, exclude=marker,
+            skip_locked=self._selection_skips_locked())
+        self._apply_area_selection(hits, marker, True, "Select Inside")
+
+    def select_partial_tall(self):
+        """Select everything crossing the selected brush's column, any depth."""
+        marker = self._marker_brush()
+        if marker is None:
+            return
+        view = self._active_2d_view()
+        axes = view._axis_indices()
+        if axes is None:
+            return
+        i1, i2, _ = axes
+        lo, hi = component_edit.object_bounds(marker)
+        hits = component_edit.select_partial_tall(
+            self._area_selection_objects(), lo, hi, i1, i2, exclude=marker,
+            skip_locked=self._selection_skips_locked())
+        self._apply_area_selection(hits, marker, True, "Select Partial Tall")
+
+    def select_complete_tall(self):
+        """Select everything wholly within the selected brush's column."""
+        marker = self._marker_brush()
+        if marker is None:
+            return
+        view = self._active_2d_view()
+        axes = view._axis_indices()
+        if axes is None:
+            return
+        i1, i2, _ = axes
+        lo, hi = component_edit.object_bounds(marker)
+        hits = component_edit.select_complete_tall(
+            self._area_selection_objects(), lo, hi, i1, i2, exclude=marker,
+            skip_locked=self._selection_skips_locked())
+        self._apply_area_selection(hits, marker, True, "Select Complete Tall")
+
+    # ======================================================================
+    # Clip / slice tool  (Radiant-style, toggled with X)
+    # ======================================================================
+
+    def toggle_clip_mode(self, checked):
+        """Toolbar/shortcut handler: enter or leave clip mode."""
+        self.set_clip_mode(bool(checked))
+
+    def set_clip_mode(self, active):
+        """Enable/disable the clip tool and sync the toolbar button + cursors."""
+        active = bool(active)
+        if active and self.rotate_mode:
+            self.set_rotate_mode(False)  # the two drag tools are exclusive
+        self.clip_mode = active
+        # Keep the toolbar button's checked state in sync (e.g. when toggled by
+        # the Esc key rather than by clicking the button).
+        btn = getattr(self, 'scissor_btn', None)
+        if btn is not None and btn.isChecked() != active:
+            btn.blockSignals(True)
+            btn.setChecked(active)
+            btn.blockSignals(False)
+        for view in (self.view_top, self.view_side, self.view_front):
+            view.clear_clip()
+            view.setCursor(Qt.CrossCursor if active else Qt.ArrowCursor)
+        if active:
+            self.show_toast("Clip tool ON — click two points, Enter to cut, "
+                            "Shift+Enter to split in two  (X to exit)")
+        else:
+            self.show_toast("Clip tool OFF")
+
+    def toggle_rotate_mode(self, checked):
+        """Toolbar handler: enter or leave the free-rotate tool."""
+        self.set_rotate_mode(bool(checked))
+
+    def set_rotate_mode(self, active):
+        """Enable/disable free-rotate and sync the toolbar button + cursors.
+
+        In this mode, dragging with the left mouse in any 2D view spins the
+        selected brush(es) about that view's axis, snapped to a fixed angle
+        increment while grid snap is on (free/continuous when it is off).
+        """
+        active = bool(active)
+        if active and self.clip_mode:
+            self.set_clip_mode(False)  # the two drag tools are exclusive
+        self.rotate_mode = active
+        btn = getattr(self, 'rotate_btn', None)
+        if btn is not None and btn.isChecked() != active:
+            btn.blockSignals(True)
+            btn.setChecked(active)
+            btn.blockSignals(False)
+        for view in (self.view_top, self.view_side, self.view_front):
+            view.cancel_rotate()
+            view.setCursor(Qt.OpenHandCursor if active else Qt.ArrowCursor)
+        if active:
+            self.show_toast("Rotate tool ON — hold and drag in a 2D view to spin "
+                            "(grid snap on = 15° steps, off = free; Esc exits)")
+        else:
+            self.show_toast("Rotate tool OFF")
+
+    def selection_centre(self):
+        """Centre of the whole selection's combined bounds, or ``None``.
+
+        The pivot a free rotation spins about: one point for the selection as a
+        whole, so several brushes turn as one rigid body instead of each
+        spinning on the spot.
+        """
+        selected = self.with_group_mates(self.selected_objects_list())
+        if not selected:
+            return None
+        lo = np.array([float('inf')] * 3)
+        hi = np.array([float('-inf')] * 3)
+        for obj in selected:
+            o_lo, o_hi = component_edit.object_bounds(obj)
+            lo = np.minimum(lo, o_lo)
+            hi = np.maximum(hi, o_hi)
+        return ((lo + hi) * 0.5).tolist()
+
+    def selected_objects_list(self):
+        """The authoritative current selection as a plain list."""
+        return list(self.state.selected_objects)
+
+    def primary_selection(self):
+        """Return the first object in the authoritative multi-selection."""
+        selected = self.state.selected_objects
+        return selected[0] if selected else None
+
+    def apply_rotation_to_selection(self, angle_deg, axis, undoable=True,
+                                    pivot=None):
+        """Rotate the selection by ``angle_deg`` about ``axis``.
+
+        With no ``pivot`` each brush turns about its own centre (the old
+        per-brush behaviour).  Given one, every brush *and* entity orbits that
+        single point, so a multi-object selection keeps its layout while it
+        spins — which is what a drag-rotate should feel like.
+
+        Returns the number of objects moved.  ``undoable`` pushes a single undo
+        checkpoint; the live drag passes ``False`` for the incremental steps
+        and checkpoints once at the start.
+        """
+        chosen = self.selected_objects_list()
+        # Brushes grouped with a turned one are attached: they turn with it,
+        # as one rigid body about the centre of the lot.
+        selected = self.with_group_mates(chosen)
+        if pivot is None and len(selected) != len(chosen):
+            pivot = self.selection_centre()
+        brushes = [b for b in selected if isinstance(b, dict)]
+        things = [t for t in selected if not isinstance(t, dict)]
+        if not brushes and not (things and pivot is not None):
+            return 0
+        if undoable:
+            self.save_state()
+        count = 0
+        for brush in brushes:
+            if brush_geometry.rotate_brush(brush, angle_deg, axis, pivot=pivot):
+                count += 1
+        if pivot is not None:
+            # Entities have no geometry to turn, but their positions must orbit
+            # the pivot or they would be left behind by the brushes.
+            for thing in things:
+                thing.pos = brush_geometry.rotate_point(
+                    list(thing.pos), angle_deg, axis, pivot)
+                count += 1
+        return count
+
+    def apply_clip_to_selection(self, normal, offset, keep_positive, split=False):
+        """Clip every selected brush with the given plane; one coalesced undo.
+
+        With ``split``, the discarded half is kept as a second brush instead of
+        being thrown away — Radiant's Split, the difference between slicing a
+        piece off and cutting a brush in two.  Each new piece is a full copy of
+        the original with its own identity, so the two halves cannot be
+        confused with one another by anything that addresses brushes by name.
+
+        Returns the number of brushes the plane actually cut.  Things and
+        non-brush selections are ignored.
+        """
+        brushes = [b for b in self.selected_objects_list() if isinstance(b, dict)]
+        if not brushes:
+            return 0
+
+        self.save_state()  # single undo checkpoint for the whole operation
+        count = 0
+        pieces = []
+        taken_names = set(self.state.get_all_entity_names()) if split else set()
+
+        for brush in brushes:
+            # The other half has to be copied before the original is cut.
+            other = None
+            if split:
+                other = copy.deepcopy({
+                    k: v for k, v in brush.items()
+                    if k not in brush_geometry.GEO_RUNTIME_KEYS})
+
+            # Clip in place without an extra per-brush undo snapshot.
+            kept = brush_geometry.clip_brush(brush, normal, offset,
+                                             keep_positive=keep_positive)
+            if kept:
+                count += 1
+                pieces.append(brush)
+
+            if other is None:
+                continue
+            # The far side survives only when the plane really passed through
+            # the brush; a plane that missed leaves one whole brush, not two.
+            other_kept = brush_geometry.clip_brush(other, normal, offset,
+                                                   keep_positive=not keep_positive)
+            if kept and other_kept:
+                other['id'] = str(uuid.uuid4())
+                name = other.get('name', '')
+                if name:
+                    other['name'] = self._copy_name(name, taken_names)
+                self.state.brushes.insert(
+                    self.state.brushes.index(brush) + 1, other)
+                pieces.append(other)
+
+        if count:
+            self.state.mark_lighting_dirty()
+            self.unsaved_changes = True
+            if split and pieces:
+                # Both halves selected, so the next operation acts on the whole
+                # of what used to be one brush.
+                self.set_selected_objects(pieces)
+            self.update_views()
+            if pieces:
+                self.property_editor.set_object(pieces[0])
+        else:
+            # Nothing changed — drop the checkpoint we just pushed.
+            self.state.discard_last_checkpoint()
+        return count
+
+    #: The Save As dialog's two ways to write a map: the same JSON, indented
+    #: to be read and diffed, or minified (one line, no spaces) to be small.
+    MAP_FILTER = "Map (*.json)"
+    MAP_FILTER_MINIFIED = "Map, minified JSON (*.json)"
+
+    @staticmethod
+    def _is_minified_json(text):
+        """Whether a map file's text is minified: all on one line."""
+        return "\n" not in text.strip()
+
+    def _ask_save_path(self, minified):
+        """The Save As dialog: ``(path, minified)``; an empty path cancels."""
+        first = self.MAP_FILTER_MINIFIED if minified else self.MAP_FILTER
+        path, chosen = QFileDialog.getSaveFileName(
+            self, "Save Level As", "maps",
+            ";;".join((self.MAP_FILTER, self.MAP_FILTER_MINIFIED)), first)
+        return path, chosen == self.MAP_FILTER_MINIFIED
+
+    def save_level_as(self, minified=None):
+        """Save the map under a new name. *minified* picks the dialog's
+        starting format (None: the map's current one); the format chosen in
+        the dialog is the one the map is saved in from then on."""
+        if self._refuse_file_command_in_play("save the map"):
+            return
+        if not isinstance(minified, bool):          # a menu action's "checked"
+            minified = getattr(self, 'map_minified', False)
+        filePath, minified = self._ask_save_path(minified)
+        if filePath:
+            if not os.path.splitext(filePath)[1]:
+                # A bare name: without the extension the Open dialog's
+                # "*.json" filter hides the map that was just saved.
+                filePath += '.json'
+            self.file_path = filePath
+            self.map_minified = bool(minified)
+            self.stop_mover_preview()
+            self.save_level()
+
+    def save_level_as_minified(self):
+        """File > Save As Minified...: Save As, with minified JSON chosen."""
+        self.save_level_as(minified=True)
+
+    def _write_map(self, path, minified=None):
+        """Write the map to *path* -- indented, or minified when the map is
+        kept that way -- and its terrain paint and placed stamps beside it
+        in ``<map name>.paint`` (they are not kept in the map's JSON).
+
+        Everything is encoded before any file is touched, so a map that
+        cannot be written (a coordinate that is not a number) leaves the
+        file on disk as it was."""
+        if minified is None:
+            minified = getattr(self, 'map_minified', False)
+        self._commit_map_texts(path, self._map_texts(minified))
+
+    def _map_texts(self, minified, detach=False):
+        """The open level encoded for writing: ``(map JSON, paint file dict
+        or None)``.
+
+        Strict JSON: a NaN or infinite number raises ``ValueError`` naming
+        where it is. Python writes them as ``NaN``/``Infinity`` by default,
+        which saved fine and then made the map fail validation on load.
+
+        *detach*: the paint dict is for another thread, so it is copied off
+        the live terrain lists (its blobs are immutable strings, shared).
+        """
+        from engine import terrain_stamp
+        level, stamps = terrain_stamp.split_level(self.state.get_level_data())
+        layout = {'separators': (",", ":")} if minified else {'indent': 4}
+        text = _strict_json(level, **layout)
+        if stamps is not None:
+            where = _non_finite_at(stamps)
+            if where is not None:
+                raise ValueError(_non_finite_message(f"the paint file's {where}"))
+            if detach:
+                stamps = copy.deepcopy(stamps)
+        return text, stamps
+
+    def _commit_map_texts(self, path, texts, autosave_generation=None):
+        """Write encoded map *texts* (:meth:`_map_texts`) to *path*, and its
+        paint file beside it.
+
+        Under the map lock: a save and a background autosave never write at
+        once. *autosave_generation* orders autosaves of one path: an older
+        snapshot that reaches the lock after a newer one was written is
+        dropped rather than put back over it.
+        """
+        from engine import terrain_stamp
+        text, stamps = texts
+        with self._map_io_lock:
+            if autosave_generation is not None:
+                if autosave_generation < self._autosave_written.get(path, 0):
+                    return
+                self._autosave_written[path] = autosave_generation
+            write_text_atomic(path, text)
+            terrain_stamp.write_map_stamps(path, stamps)
+
+    def save_level(self):
+        if self._refuse_file_command_in_play("save the map"):
+            return
+        if not self.file_path:
+            self.save_level_as()
+            return
+
+        self.stop_mover_preview()
+
+        try:
+            self._write_map(self.file_path)
+            print(f"Level saved to {self.file_path}")
+            self.unsaved_changes = False
+            self.update_title()
+            self.add_recent_file(self.file_path)
+            self.show_toast("Saved (minified)" if getattr(self, "map_minified", False) else "Saved",
+                            level='success')
+        except Exception as e:
+            self.show_toast(f"Error saving: {e}", is_error=True)
+            print(f"Error saving level: {e}")
+
+    def load_level(self):
+        """Opens the file dialog to select a level, then loads it."""
+        # 1. Check for unsaved changes first
+        if not self.check_unsaved_changes():
+            return
+
+        # 2. Ask user for the file (Defines 'filePath')
+        filePath, _ = QFileDialog.getOpenFileName(self, "Load Level", "maps", "JSON Files (*.json)")
+        
+        # 3. If the user selected a file (didn't cancel), load it
+        if filePath:
+            self.load_level_file(filePath)
+
+    def _apply_level_data(self, level_data, *, validated=False):
+        """Replace the scene with *level_data*, terrain included.
+
+        The one place a parsed map becomes the editor's scene: opening a file,
+        a level change and playing a package all go through it. *validated*
+        says the caller has just validated *level_data* itself (see
+        :meth:`_load_level`); otherwise it is validated here.
+        """
+        # load_from_data validates and parses the whole map before it replaces
+        # the scene (and does everything clear_scene did but mark lighting
+        # dirty), so a malformed map or one that fails to parse leaves the open
+        # level as it was. Clearing first emptied the scene for any map that
+        # got past the shape check.
+        #
+        # The terrain is built first for the same reason: a terrain_data that
+        # passes validation can still fail to build, and failing *after* the
+        # scene was replaced left a half-built, untitled level (or, for a
+        # LevelChanger, a dead Play session). Built aside, it is refused with
+        # the open level untouched.
+        if not validated:
+            self.state.validate_level_data(level_data)
+            validated = True
+        new_terrain = None
+        if level_data.get('terrain_data'):
+            from engine.terrain import Terrain
+            _loading_step(self, "Building terrain", 35)
+            new_terrain = Terrain()
+            try:
+                new_terrain.from_dict(level_data['terrain_data'])
+            except Exception as e:
+                try:
+                    new_terrain.cleanup()
+                except Exception:
+                    pass
+                raise ValueError(f"the map's terrain could not be built: {e}") from e
+        try:
+            self.state.load_from_data(level_data, validated=validated, stream_editor=True)
+        except Exception:
+            if new_terrain is not None:
+                new_terrain.cleanup()
+            raise
+        self.state.set_editor_whole_world(
+            self.config.getboolean('Display', 'show_whole_world', fallback=True),
+            self.view_3d.camera.pos)
+        self.state.mark_lighting_dirty()
+
+        # Drop the previous map's terrain; this also clears terrain_data,
+        # so keep the one the new map just brought.
+        terrain_data = self.state.terrain_data
+        self._clear_terrain(refresh=False)
+        self.view_3d.terrain = None
+        self.state.terrain_data = terrain_data
+
+        # The new map's terrain, built above
+        if self.state.terrain_data and new_terrain is not None:
+            self.terrain = new_terrain
+            if self.state.editor_stream is not None:
+                # Only the terrain around the camera, like the cells.
+                self.terrain.set_streaming(True, self.state.editor_stream.config['activation_radius'])
+            _loading_step(self, "Preparing terrain", 65)
+
+            if self.view_3d is not None and self.view_3d.logic_thread:
+                self.view_3d.logic_thread.world_runtime.terrain = self.terrain
+
+    def _on_level_change_requested(self, filePath, destination_spawn=''):
+        """A LevelChanger asked for *filePath*: the game, not the user."""
+        return self.open_level_file(filePath, destination_spawn, from_game=True)
+
+    def open_level_file(self, filePath, destination_spawn=None, from_game=False):
+        """Open *filePath* in place of the current level, guarding unsaved work.
+
+        The entry point for every request that replaces the open level without
+        a file dialog of its own: Recent Files, a LevelChanger and the console
+        ``map`` command. In the editor it asks first, as File > Open does.
+        During Play it cannot stop the game to ask, so :meth:`_load_level`
+        writes the unsaved level to its autosave file instead.
+
+        *from_game* marks a change the running game asked for (a LevelChanger,
+        map logic's ``map`` command) rather than the user: see
+        :meth:`_load_level`.
+        """
+        package_map = self._package_map_path(filePath)
+        playing = self.view_3d is not None and bool(self.view_3d.play_mode)
+        if not playing and not self.check_unsaved_changes():
+            return False
+        if package_map is not None:
+            return self._load_package_map(package_map, destination_spawn, from_game)
+        return self.load_level_file(filePath, destination_spawn, from_game)
+
+    def _package_map_path(self, relative_path):
+        """The played package's member *relative_path* names, or ``None``.
+
+        While a level from a ``.fiopak`` is open, a level change names a map
+        inside that package (``maps/next.json``), not one in the editor's own
+        ``maps/`` folder. The package is read in place (PackageSession).
+        """
+        package = self._package
+        if package is None:
+            return None
+        return package.member(relative_path)
+
+    def _load_package_map(self, map_path, destination_spawn=None, from_game=False):
+        """Open the played package's map *map_path* (a member, read in place)
+        as an untitled, saved level.
+
+        Like the package's start map, it never takes the package's path as
+        its file: the first save goes through Save As.
+        """
+        name = os.path.splitext(os.path.basename(str(map_path)))[0]
+        with _loading_overlay(self).busy(f"Loading {name}", "Reading the map", 5):
+            try:
+                from editor.package_session import load_map
+                level_data = load_map(self._package, map_path)
+            except Exception as e:
+                print(f"ERROR loading level {map_path}: {e}")
+                self.show_toast(f"Failed to load level: {e}", is_error=True)
+                return False
+            if not self._load_level(level_data, None, destination_spawn, from_game):
+                return False
+        self.unsaved_changes = False
+        self.update_title()
+        return True
+
+    def load_level_file(self, filePath, destination_spawn=None, from_game=False):
+        """Loads a level from disk. Used for both normal loading and LevelChanger.
+
+        Replaces the open level unconditionally; callers that have not asked
+        about unsaved changes go through :meth:`open_level_file`.
+
+        *destination_spawn* names the PlayerStart a LevelChanger sends the
+        player to; empty or None means the level's primary start.
+        """
+        print(f"[MainWindow] Loading level: {filePath}")
+        name = os.path.splitext(os.path.basename(str(filePath)))[0]
+        with _loading_overlay(self).busy(f"Loading {name}", "Reading the map", 5):
+            try:
+                # utf-8-sig: a map saved by an editor that writes a
+                # byte-order mark is still a map (packages read theirs so).
+                with open(filePath, 'r', encoding='utf-8-sig') as f:
+                    text = f.read()
+                level_data = json.loads(text)
+                # A map saved minified is saved minified again.
+                minified = self._is_minified_json(text)
+                # Placed terrain stamps are kept beside the map.
+                from engine import terrain_stamp
+                missing_paint = terrain_stamp.missing_paint_file(level_data, filePath)
+                level_data = terrain_stamp.join_level(level_data, filePath)
+            except Exception as e:
+                print(f"ERROR loading level {filePath}: {e}")
+                self.show_toast(f"Failed to load level: {e}", is_error=True)
+                return False
+            loaded = self._load_level(level_data, filePath, destination_spawn, from_game)
+            if loaded:
+                self.map_minified = minified
+                if missing_paint:
+                    # The map was saved with paint, and its file is gone.
+                    message = terrain_stamp.missing_paint_message(missing_paint)
+                    print(f"[MainWindow] WARNING: {message}")
+                    self.show_toast(message, is_error=True)
+            if loaded and not self.view_3d.play_mode:
+                # The first frame of a new map uploads it to the GPU, which
+                # is a long paint of its own: draw it under the loading bar.
+                _loading_step(self, "Drawing the world", 85)
+                try:
+                    self.view_3d.repaint()
+                except Exception:
+                    pass
+            if loaded:
+                # The world just loaded, under the loading bar: collect now
+                # and freeze it, rather than in play (engine/gc_policy.py).
+                gc_policy.settle()
+            return loaded
+
+    @property
+    def loading_overlay(self):
+        """The window's staged loading bar (editor/loading_overlay.py)."""
+        return _loading_overlay(self)
+
+    def _load_level(self, level_data, file_path=None, destination_spawn=None,
+                    from_game=False):
+        """Make *level_data* the open level.
+
+        *file_path* is the file it was read from, or ``None`` for a level that
+        exists only in memory (a generated map): that one opens untitled and
+        unsaved, so the first save asks where it goes and closing warns.
+
+        *destination_spawn* is the name of the PlayerStart to start at (a
+        LevelChanger's ``destination_spawn``); empty or None means the level's
+        primary start. Play resumes there when a level change happens during
+        Play. A level without that start is refused before anything changes.
+
+        *from_game* marks a level change the running game asked for. A level
+        with no PlayerStart at all is refused then too, the same authoring
+        error as a missing destination spawn: Play carries on where it is.
+        A user opening such a level during Play gets it, with Play ended.
+        """
+        destination_spawn = destination_spawn or None
+        try:
+            self.state.validate_level_data(level_data)
+        except ValueError as e:
+            # Not a map at all: refused before anything changed, so the open
+            # level and its file stay exactly as they were.
+            print(f"ERROR loading level {file_path or '(generated)'}: {e}")
+            self.show_toast(f"Failed to load level: {e}", is_error=True)
+            return False
+        if (destination_spawn is not None
+                and start_rules.resolve_start_record(level_data, destination_spawn) is None):
+            # An authoring error: the named start is not in that map. Never
+            # swapped for its primary; the open level (and Play) carry on.
+            message = (f"LevelChanger: destination spawn '{destination_spawn}' "
+                       f"was not found in '{file_path or '(generated)'}'")
+            print(f"ERROR {message}")
+            debug_log("Error", message)
+            self.show_toast(message, is_error=True)
+            return False
+        if (from_game and self.view_3d is not None and self.view_3d.play_mode
+                and start_rules.resolve_start_record(level_data) is None):
+            message = (f"Level change: '{file_path or '(generated)'}' has no "
+                       f"Player Start")
+            print(f"ERROR {message}")
+            debug_log("Error", message)
+            self.show_toast(message, is_error=True)
+            return False
+
+        loaded = False
+        open_level = None
+        try:
+            # A level change during play: end the running session *before*
+            # the scene is replaced.  Its teardown (movers, doors, Props, the
+            # plugins' on_play_stop) restores state by index into the world it
+            # was started on, so it must run against that world, not the new one.
+            was_playing = bool(self.view_3d.play_mode)
+            logic = self.view_3d.logic_thread if was_playing else None
+            # The player keeps their weapons through a level change: taken
+            # before the session ends (ending it drops them), handed back once
+            # play has restarted on the new level (starting it clears them).
+            loadout = (logic.session_runtime.carried_loadout()
+                       if was_playing and logic is not None else None)
+            if was_playing:
+                # The world captured at Play belongs to the map being left.
+                captured = self._pre_play_world
+                self._pre_play_world = None
+                self._exit_play_mode()
+                self._keep_unsaved_work_on_level_change(captured)
+            else:
+                # Opening a map in the editor: the previous map's (or a
+                # playtest's) store values are not this map's.
+                from editor.things import LogicState
+                LogicState.reset_stores()
+
+            # From here the scene is being replaced.  Until it has been, it
+            # belongs to no file: a failure part-way must never leave the
+            # previous map's path on a half-built scene for Ctrl+S to write.
+            open_level = (self.file_path, self.unsaved_changes,
+                          self.state.brushes,
+                          self.state.things)
+            self.file_path = None
+            _loading_step(self, "Building the scene", 30)
+            # Validated at the top, before the open level was touched.
+            self._apply_level_data(level_data, validated=True)
+            self.reset_camera_mode()
+            _loading_step(self, "Refreshing the editor", 75)
+
+            # --- The start the player will spawn at; the camera goes there ---
+            spawn = self.state.resolve_player_start(destination_spawn)
+            player_start_pos = spawn.pos if spawn is not None else None
+            player_angle = spawn.get_angle() if spawn is not None else 0.0
+
+            if player_start_pos:
+                # Read user preference (default = True)
+                place_camera = self.config.getboolean('Display', 'place_camera_at_player_start', fallback=True)
+
+                if place_camera:
+                    # Place 3D editor camera exactly at player start, facing
+                    # the way the player spawns: Play turns the start's angle
+                    # into radians(90 - angle) + pi, which the play view
+                    # shows as yaw 90 - degrees(that) = angle - 180.
+                    self.view_3d.set_editor_camera(
+                        player_start_pos, yaw=player_angle - 180.0, pitch=0.0)
+
+                    # Center 2D views so the camera frustum is visible
+                    self.center_2d_views_on(player_start_pos)
+                     # Force a second update after event loop
+                    self._after(50, lambda: self.center_2d_views_on(player_start_pos))
+                else:
+                    # Old behaviour: offset camera behind the spawn
+                    self.view_3d.set_editor_camera(
+                        (player_start_pos[0],
+                         player_start_pos[1] + 80,
+                         player_start_pos[2] + 200),
+                        yaw=-90, pitch=-20)
+            else:
+                # No player start – reset camera to default position
+                self.view_3d.set_editor_camera((0, 150, 400), yaw=-90, pitch=-20)
+
+            # Update file path and UI state
+            self.file_path = file_path
+            # Indented unless the file it was read from says otherwise
+            # (load_level_file, once this returns).
+            self.map_minified = False
+            self._generated_level_marker = None
+            if file_path is not None:
+                # A map opened from disk ends the package session.
+                self._close_package()
+            self.unsaved_changes = file_path is None
+            loaded = True
+            self.update_title()
+            if file_path:
+                self.add_recent_file(file_path)
+
+            # Full UI and view refresh: set_selected_objects runs
+            # update_all_ui itself (a second call rebuilt the hierarchy again).
+            self.set_selected_objects([])
+
+            # Resume play on the new level, at the destination start.
+            # Opened by the user mid-Play with nowhere to resume: said in the
+            # load toast, never with the No Player Start dialog, which would
+            # block the game loop.
+            play_stopped = was_playing and spawn is None
+            if was_playing and not play_stopped:
+                print("[MainWindow] Restarting Play Mode with new level...")
+                _loading_step(self, "Restarting play", 85)
+                self._start_play(spawn)
+                if (loadout is not None
+                        and self.view_3d.play_mode):
+                    logic.session_runtime.restore_loadout(loadout)
+
+            name = os.path.basename(file_path) if file_path else "generated level"
+            print(f"[MainWindow] Successfully loaded {name}")
+            if play_stopped:
+                self.show_toast(f"Loaded {name}; Play stopped: it has no "
+                                f"Player Start", level='warning')
+            else:
+                self.show_toast(f"Loaded {name}", level='success')
+
+            # Keep the Logic Graph in sync
+            self._refresh_logic_graph()
+            # The map's textures, here rather than in its first frame.
+            self.view_3d.preload_level_textures()
+
+            return True
+
+        except Exception as e:
+            if (not loaded
+                    and open_level is not None
+                    and open_level[2] is not None and open_level[3] is not None
+                    and self.state.brushes is open_level[2]
+                    and self.state.things is open_level[3]):
+                # The map failed to parse, or its terrain to build: the open
+                # level was never replaced (load_from_data publishes the new
+                # objects only once everything is parsed), so it keeps its file.
+                self.file_path, self.unsaved_changes = open_level[:2]
+                self.update_title()
+            elif not loaded:
+                # Whatever made it into the scene is unsaved work of no file.
+                self.unsaved_changes = True
+                self.update_title()
+            print(f"ERROR loading level {file_path or '(generated)'}: {e}")
+            import traceback
+            traceback.print_exc()
+            self.show_toast(f"Failed to load level: {e}", is_error=True)
+            return False
+
+    def _keep_unsaved_work_on_level_change(self, captured):
+        """Save unsaved edits to the autosave file before a level change in Play.
+
+        A LevelChanger or a map's ``map`` command replaces the level while the
+        game runs, so there is no moment to ask. *captured* is the world taken
+        when Play started (``None`` unless Stop restores it); when it held
+        unsaved edits it is put back first, so the autosave holds what the
+        user built rather than what the game did to it.
+        """
+        if captured is not None and captured[3]:
+            self._pre_play_world = captured
+            self._restore_pre_play_world()
+        if not self.unsaved_changes:
+            return None
+        path = self._write_autosave()
+        if path:
+            self.show_toast(
+                f"Unsaved changes kept in maps/{os.path.basename(path)}",
+                level='success')
+        else:
+            self.show_toast("Could not keep unsaved changes before the "
+                            "level change", is_error=True)
+        return path
+
+    def _enforce_layout_constraints(self):
+        """Keep saved/restored Qt layout state inside Fio's supported topology.
+
+        Dock widgets remain dockable/floating in any normal Qt dock area.  The
+        editor toolbar is intentionally narrower: top, bottom, or right only;
+        right-docked means vertical.  Floating widgets are also kept on-screen
+        so a saved layout cannot strand a panel outside every display.
+        """
+        allowed_toolbar_areas = (
+            Qt.TopToolBarArea | Qt.BottomToolBarArea | Qt.RightToolBarArea)
+
+        for toolbar in self.findChildren(QToolBar):
+            toolbar.setMovable(True)
+            toolbar.setFloatable(True)
+            toolbar.setAllowedAreas(allowed_toolbar_areas)
+
+            if not toolbar.isFloating():
+                area = self.toolBarArea(toolbar)
+                if area == Qt.RightToolBarArea:
+                    toolbar.setOrientation(Qt.Vertical)
+                elif area in (Qt.TopToolBarArea, Qt.BottomToolBarArea):
+                    toolbar.setOrientation(Qt.Horizontal)
+                elif area != Qt.NoToolBarArea:
+                    self.addToolBar(Qt.TopToolBarArea, toolbar)
+                    toolbar.setOrientation(Qt.Horizontal)
+
+        for dock in self.findChildren(QDockWidget):
+            dock.setAllowedAreas(Qt.AllDockWidgetAreas)
+        hierarchy = getattr(self, 'scene_hierarchy_dock', None)
+        if hierarchy is not None and hierarchy.collapsed:
+            hierarchy.dock_left()
+
+        # Clamp floating editor panels to a real screen.  QMainWindow will not
+        # repair an old state that was saved with a floating window entirely
+        # off-screen after a monitor was removed.
+        for widget in [*self.findChildren(QDockWidget),
+                       *self.findChildren(QToolBar)]:
+            if not widget.isFloating():
+                continue
+            screen = QApplication.screenAt(widget.frameGeometry().center())
+            if screen is None:
+                screen = QApplication.primaryScreen()
+            if screen is None:
+                continue
+            available = screen.availableGeometry()
+            geometry = widget.frameGeometry()
+            width = min(geometry.width(), available.width())
+            height = min(geometry.height(), available.height())
+            x = min(max(geometry.x(), available.left()),
+                    available.right() - width + 1)
+            y = min(max(geometry.y(), available.top()),
+                    available.bottom() - height + 1)
+            if (geometry.x(), geometry.y()) != (x, y):
+                widget.move(x, y)
+
+    def _restore_default_layout(self):
+        """Restore the layout captured immediately after UI construction."""
+        hierarchy = self.scene_hierarchy_dock
+        hierarchy.set_collapsed(False)
+        hierarchy.restore_width(hierarchy.DEFAULT_WIDTH)
+        state = getattr(self, '_default_layout_state', None)
+        if state is not None and not state.isEmpty():
+            if self.restoreState(QByteArray(state), LAYOUT_VERSION):
+                self._enforce_layout_constraints()
+                hierarchy.restore_width(hierarchy.DEFAULT_WIDTH)
+                if self.menuBar():
+                    self.menuBar().setVisible(True)
+                self.statusBar().setVisible(True)
+                return True
+
+        # This should only be needed if a future Qt change makes the captured
+        # state unusable.  The normal construction path is already the default.
+        self._enforce_layout_constraints()
+        return False
+
+    def save_layout(self):
+        self._enforce_layout_constraints()
+        if not self.config.has_section('Layout'):
+            self.config.add_section('Layout')
+        self.config['Layout']['geometry'] = self.saveGeometry().toHex().data().decode()
+        self.config['Layout']['state'] = self.saveState(LAYOUT_VERSION).toHex().data().decode()
+        self.config['Layout']['version'] = str(LAYOUT_VERSION)
+        self.config['Layout']['scene_hierarchy_collapsed'] = str(self.scene_hierarchy_dock.collapsed)
+        self.config['Layout']['scene_hierarchy_width'] = str(self.scene_hierarchy_dock.expanded_width)
+        self.save_config()
+        self.statusBar().showMessage("Layout saved.", 2000)
+
+    def restore_layout(self):
+        """Restore the previously saved layout from settings.ini without restarting."""
+        if not self.config.has_section('Layout') or \
+           not (self.config.has_option('Layout', 'geometry') and
+                self.config.has_option('Layout', 'state')):
+            self.show_toast("No saved layout found. Save a layout first.", is_error=True)
+            return
+
+        try:
+            geometry_ok = True
+            state_ok = True
+
+            if self.config.has_option('Layout', 'geometry'):
+                geometry_ok = self.restoreGeometry(
+                    QByteArray.fromHex(self.config['Layout']['geometry'].encode()))
+            if self.config.has_option('Layout', 'state'):
+                self._load_hierarchy_layout()
+                state_ok = self.restoreState(
+                    QByteArray.fromHex(self.config['Layout']['state'].encode()),
+                    LAYOUT_VERSION)
+
+            if not state_ok:
+                self._restore_default_layout()
+                self.config.remove_option('Layout', 'state')
+                self.config['Layout']['version'] = str(LAYOUT_VERSION)
+                self.save_config()
+                self.show_toast(
+                    "Saved dock layout was invalid; defaults restored.",
+                    is_error=True)
+                return
+
+            self._enforce_layout_constraints()
+
+            # Restore menu bar and status bar visibility (not saved in state)
+            if self.menuBar():
+                self.menuBar().setVisible(True)
+            self.statusBar().setVisible(True)
+
+            if geometry_ok:
+                self.show_toast("Layout restored")
+            else:
+                self.show_toast(
+                    "Layout restored, but the saved window geometry was invalid.",
+                    is_error=True)
+        except Exception as e:
+            self._restore_default_layout()
+            self.show_toast(
+                f"Failed to restore layout; defaults restored: {e}",
+                is_error=True)
+            import traceback
+            traceback.print_exc()
+
+    def _load_hierarchy_layout(self):
+        dock = self.scene_hierarchy_dock
+        dock.set_collapsed(self.config.getboolean('Layout', 'scene_hierarchy_collapsed', fallback=False))
+        dock.restore_width(self.config.getint('Layout', 'scene_hierarchy_width', fallback=dock.DEFAULT_WIDTH))
+
+    def load_layout(self):
+        """Restore the saved window layout, unless the default has moved on.
+
+        The layout is saved on every close.  A saved layout from an older
+        LAYOUT_VERSION is dropped once; the window geometry is kept either way.
+        """
+        if not self.config.has_section('Layout'):
+            return
+
+        if self.config.has_option('Layout', 'geometry'):
+            self.restoreGeometry(
+                QByteArray.fromHex(self.config['Layout']['geometry'].encode()))
+
+        saved_version = self.config.getint('Layout', 'version', fallback=1)
+        if saved_version != LAYOUT_VERSION:
+            if self.config.has_option('Layout', 'state'):
+                self.config.remove_option('Layout', 'state')
+                # Deferred: this runs from __init__, before the window is up,
+                # and a toast shown then is never seen.
+                self._after(0, lambda: self.show_toast(
+                    "Dock layout reset to the new default", level='warning'))
+            return
+
+        if self.config.has_option('Layout', 'state'):
+            try:
+                self._load_hierarchy_layout()
+                state_ok = self.restoreState(
+                    QByteArray.fromHex(self.config['Layout']['state'].encode()),
+                    LAYOUT_VERSION)
+            except Exception:
+                state_ok = False
+
+            if not state_ok:
+                self.config.remove_option('Layout', 'state')
+                self.config['Layout']['version'] = str(LAYOUT_VERSION)
+                self.save_config()
+                self._after(0, lambda: self.show_toast(
+                    "Saved dock layout was invalid; using the default.",
+                    is_error=True))
+                self._restore_default_layout()
+                return
+
+        self._enforce_layout_constraints()
+
+    def reset_layout(self):
+        """Reset the current dock/toolbar arrangement to the editor default."""
+        reply = QMessageBox.question(
+            self,
+            "Reset Layout",
+            "Reset dock and toolbar layout to the Fio default?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            if self.config.has_section('Layout'):
+                self.config.remove_section('Layout')
+                self.save_config()
+
+            self._restore_default_layout()
+            self.show_toast("Layout reset to defaults")
+        except Exception as e:
+            self._restore_default_layout()
+            self.show_toast(
+                f"Failed to reset layout; defaults restored: {e}",
+                is_error=True)
+            import traceback
+            traceback.print_exc()
+
+    def _close_package(self):
+        """End the package session: its maps, cutscenes and assets are no
+        longer looked up (nothing to delete: it was never extracted)."""
+        self._package = None
+        from engine.asset_archives import set_package
+        set_package(None)
+
+    def play_game_package(self):
+        """Pick a .fiopak and launch it in kiosk mode."""
+        packages_dir = os.path.join(self.root_dir, "packages")
+        start_dir = packages_dir if os.path.exists(packages_dir) else self.root_dir
+
+        filePath, _ = QFileDialog.getOpenFileName(
+            self, "Select Game Package", start_dir, "Game Packages (*.fiopak)"
+        )
+        if filePath:
+            self.play_package_from_path(filePath)
+
+    def play_package_from_path(self, file_path):
+        """Load and launch a game package (Tools menu and asset browser).
+
+        The package is read in place (editor/package_session.py): checked
+        first, then its start map loaded; nothing is extracted.
+        """
+        if not self.check_unsaved_changes():
+            return
+
+        if not os.path.exists(file_path):
+            self.show_toast(f"Package not found: {file_path}", is_error=True)
+            return
+
+        try:
+            from editor.package_session import PackageSession, load_map
+            session = PackageSession(file_path)
+            level_data = load_map(session, session.start_map)
+
+            # Never point file_path at the package: save_level() writes that
+            # path, and writing a map over the .fiopak replaces the archive
+            # with a JSON file.  Cleared before the scene is replaced, so no
+            # failure below can leave the previous map's path attached to
+            # this scene.  The first save goes through Save As.
+            self.file_path = None
+            self.map_minified = False
+            self._apply_level_data(level_data)
+
+            # One package at a time.
+            self._close_package()
+            self._package = session
+            from engine.asset_archives import set_package
+            set_package(session.path, session.names)
+
+            self.unsaved_changes = False
+            self.update_title()
+            self.set_selected_objects([])
+            self.update_all_ui()
+
+            launch_in_editor = self.config.getboolean('Kiosk', 'launch_in_editor', fallback=False)
+            if launch_in_editor:
+                self.show_toast(f"Loaded package: {os.path.basename(file_path)}", level='success')
+            else:
+                self.enter_kiosk_mode()
+
+        except Exception as e:
+            self.show_toast(f"Failed to load game package: {e}", is_error=True)
+            import traceback
+            traceback.print_exc()
+
+    def leave_play_mode_from_escape(self):
+        """Leave Play the way Esc did before the pause menu.
+
+        Kiosk mode quits the game (after asking); otherwise Play ends and the
+        editor returns.
+        """
+        if getattr(self, 'is_kiosk_mode', False):
+            self.exit_kiosk_mode()
+            return
+        self._exit_play_mode()
+        if not self.camera_movement_learned:
+            self._after(500, lambda: self.show_tooltip(
+                "Press Z or hold right mouse to look; WASD to move", duration=0, toast_id="camera_tip"))
+
+    def open_pause_menu(self):
+        """Open the Play Mode pause menu (what Esc does). False outside Play."""
+        return self.view_3d.open_pause_menu()
+
+    def close_pause_menu(self):
+        """Close the pause menu and play on. False when it was not open."""
+        return self.view_3d.close_pause_menu()
+
+    def quit_immediately(self):
+        """Console ``quit``: close Fio now, without the unsaved-changes prompt."""
+        self._quit_without_prompt = True
+        self.close()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+    # -- Save slots (pause menu > Save Game / Load Game) -----------------------
+
+    SAVE_SLOTS = 3
+
+    def _slot_save_name(self, slot):
+        return f"slot{int(slot)}"
+
+    def save_slot_time(self, slot):
+        """When slot *slot* was saved ("09 Oct 2026  14:02"), or None if empty."""
+        path = self.console_handler._resolve_save_path(self._slot_save_name(slot))
+        try:
+            return time.strftime("%d %b %Y  %H:%M", time.localtime(os.path.getmtime(path)))
+        except OSError:
+            return None
+
+    def save_to_slot(self, slot):
+        """Save the play session to slot *slot* (saves/slotN.fiosave)."""
+        return bool(self.console_handler.cmd_save(self._slot_save_name(slot)))
+
+    def load_from_slot(self, slot):
+        """Restore slot *slot* into the running play session."""
+        return bool(self.console_handler.cmd_load(self._slot_save_name(slot)))
+
+    # -- Volumes (Settings > Play Modes > Audio, pause menu > Options) -------
+    # Music is what plays from assets/music; every other game sound is sound
+    # (engine.speaker_audio.is_music). Each has its own volume.
+
+    def _audio_volume(self, key):
+        try:
+            value = self.config.getint('Audio', key, fallback=100)
+        except ValueError:
+            value = 100
+        return max(0, min(100, value))
+
+    def _set_audio_volume(self, key, percent):
+        percent = max(0, min(100, int(percent)))
+        if not self.config.has_section('Audio'):
+            self.config.add_section('Audio')
+        self.config.set('Audio', key, str(percent))
+        self._apply_audio_volumes()
+        self.save_config()
+
+    def _apply_audio_volumes(self):
+        self.view_3d.audio.sound_volume = self.sound_volume() / 100.0
+        self.view_3d.audio.music_volume = self.music_volume() / 100.0
+
+    def sound_volume(self):
+        """The volume of every game sound but music, 0-100."""
+        return self._audio_volume('sound_volume')
+
+    def set_sound_volume(self, percent):
+        self._set_audio_volume('sound_volume', percent)
+
+    def music_volume(self):
+        """The volume of music (files from assets/music), 0-100."""
+        return self._audio_volume('music_volume')
+
+    def set_music_volume(self, percent):
+        self._set_audio_volume('music_volume', percent)
+
+    # -- Game window mode (Settings > Play Modes > Display Mode, F12) ---------
+
+    KIOSK_WINDOW_MODES = ("Fullscreen", "Borderless", "Windowed")
+
+    def kiosk_window_mode(self):
+        mode = self.config.get('Kiosk', 'window_mode', fallback='Fullscreen')
+        return mode if mode in self.KIOSK_WINDOW_MODES else 'Fullscreen'
+
+    def set_kiosk_window_mode(self, mode):
+        """Pick the game window mode, and show the game in it now.
+
+        The same setting as Settings > Play Modes > Display Mode. In Play
+        outside the game window, choosing a mode switches to it (as F12 does).
+        """
+        if mode not in self.KIOSK_WINDOW_MODES:
+            return
+        if not self.config.has_section('Kiosk'):
+            self.config.add_section('Kiosk')
+        self.config.set('Kiosk', 'window_mode', mode)
+        self.save_config()
+        if getattr(self, 'is_kiosk_mode', False):
+            self._apply_kiosk_window_mode()
+        elif self.view_3d.play_mode:
+            self.enter_kiosk_mode()
+
+    def kiosk_native_surface_enabled(self):
+        """[Kiosk] native_surface: kiosk frames are presented on a native
+        window of their own rather than composited through the editor's 3D
+        view (engine/kiosk_surface.py). Off by default."""
+        return self.config.getboolean('Kiosk', 'native_surface', fallback=False)
+
+    def _begin_native_kiosk(self):
+        """Present kiosk mode on a native window: the same renderer and GL
+        context, made current on it. False -- with the reason in the console
+        -- when this platform or context cannot, so the caller shows kiosk
+        mode on the 3D view as before."""
+        from engine.kiosk_surface import NativePresentationError
+        view = self.view_3d
+        try:
+            surface = view.begin_native_presentation()
+            surface.show_in_mode(
+                self.kiosk_window_mode(),
+                self.config.getint('Kiosk', 'res_width', fallback=1280),
+                self.config.getint('Kiosk', 'res_height', fallback=720),
+                screen=self.screen())
+            view.verify_native_presentation()
+        except NativePresentationError as exc:
+            view.end_native_presentation()
+            debug_log("Kiosk", "Native presentation unavailable (%s); kiosk mode "
+                               "is shown on the 3D view." % exc)
+            return False
+        # The editor window is out of sight while the game has its own.
+        self.hide()
+        surface.requestActivate()
+        return True
+
+    def set_kiosk_native_surface(self, enabled):
+        """Turn [Kiosk] native_surface on or off and save it. In kiosk mode
+        the game switches presentation now, by the same paths kiosk mode is
+        entered and left by; it falls back to the 3D view if the native
+        window cannot be used. Returns whether the native window presents."""
+        if not self.config.has_section('Kiosk'):
+            self.config.add_section('Kiosk')
+        self.config.set('Kiosk', 'native_surface', str(bool(enabled)))
+        self.save_config()
+        view = self.view_3d
+        if getattr(self, 'is_kiosk_mode', False):
+            if enabled and view._native_surface is None:
+                if self._begin_native_kiosk():
+                    self._restore_editor_window_state_for_native()
+            elif not enabled and view._native_surface is not None:
+                view.end_native_presentation()
+                self.show()
+                self._apply_kiosk_window_mode()
+                view.setFocus()
+        return view._native_surface is not None
+
+    def _restore_editor_window_state_for_native(self):
+        """The editor window was fullscreen (or frameless) for kiosk mode on
+        the 3D view; hidden behind a native kiosk window it goes back to a
+        normal window, as it is when native kiosk mode starts from the
+        editor."""
+        if self.windowFlags() & Qt.FramelessWindowHint:
+            self.setWindowFlag(Qt.FramelessWindowHint, False)
+        # Left hidden throughout (showNormal() would show it).
+        self.setWindowState(self.windowState() & ~Qt.WindowFullScreen)
+        self.hide()
+
+    def kiosk_native_presentation_failed(self):
+        """The native window could not present a frame: carry on in kiosk
+        mode on the 3D view."""
+        if self.view_3d._native_surface is None:
+            return
+        self.view_3d.end_native_presentation()
+        if getattr(self, 'is_kiosk_mode', False):
+            self.show()
+            self._apply_kiosk_window_mode()
+            self.view_3d.setFocus()
+
+    def _apply_kiosk_window_mode(self):
+        """Show the window as the configured game window mode.
+
+        Toggling the frameless hint keeps the native window (and the 3D
+        view's GL context): Qt 5 updates the flags in place. While a native
+        kiosk window presents, it is that window that takes the mode.
+        """
+        surface = self.view_3d._native_surface
+        if surface is not None:
+            surface.show_in_mode(
+                self.kiosk_window_mode(),
+                self.config.getint('Kiosk', 'res_width', fallback=1280),
+                self.config.getint('Kiosk', 'res_height', fallback=720))
+            return
+        mode = self.kiosk_window_mode()
+        frameless = mode == 'Borderless'
+        if bool(self.windowFlags() & Qt.FramelessWindowHint) != frameless:
+            self.setWindowFlag(Qt.FramelessWindowHint, frameless)
+        if mode == 'Fullscreen':
+            self.showFullScreen()
+            return
+        self.showNormal()
+        self.setWindowState(Qt.WindowNoState)
+        screen = self.screen() or QApplication.primaryScreen()
+        area = screen.geometry() if mode == 'Borderless' else screen.availableGeometry()
+        if mode == 'Borderless':
+            self.setGeometry(area)
+        else:
+            width = min(self.config.getint('Kiosk', 'res_width', fallback=1280), area.width())
+            height = min(self.config.getint('Kiosk', 'res_height', fallback=720), area.height())
+            self.resize(width, height)
+            self.move(area.x() + (area.width() - width) // 2,
+                      area.y() + (area.height() - height) // 2)
+
+    def enter_kiosk_mode(self):
+        """Hide all editor UI and launch play mode fullscreen."""
+        self.is_kiosk_mode = True
+
+        # Save layout before hiding
+        self.save_layout()
+
+        # Hide menu bar and status bar
+        if self.menuBar():
+            self.menuBar().setVisible(False)
+        self.statusBar().setVisible(False)
+
+        # Hide all toolbars
+        for toolbar in self.findChildren(QToolBar):
+            toolbar.setVisible(False)
+
+        # Hide all docks except the 3D view
+        for dock in self.findChildren(QDockWidget):
+            if dock is not self.view_3d_dock:
+                dock.setVisible(False)
+
+        # Ensure 3D view is visible
+        self.view_3d_dock.setVisible(True)
+
+        # Hide the floating play button
+        if hasattr(self, 'play_button'):
+            self.play_button.setVisible(False)
+
+        # Hide sysmon overlay by default in kiosk mode (F3 to toggle back on)
+        self.view_3d.sysmon.set_active(False)
+
+        # Fullscreen, borderless or windowed (Settings > Play Modes): on a
+        # native window of its own when [Kiosk] native_surface asks and the
+        # platform allows, otherwise this window.
+        if not (self.kiosk_native_surface_enabled() and self._begin_native_kiosk()):
+            self._apply_kiosk_window_mode()
+
+        # Launch play mode ONLY if not already in play mode
+        if not self.view_3d.play_mode:
+            self.enter_play_mode()
+
+        # The game has the UI thread: each frame is painted the moment it is
+        # published, and the editor does no work until kiosk mode ends
+        # (editor_dormant).
+        self.view_3d.set_paint_on_publish(True)
+
+    def exit_kiosk_mode(self, keep_play_mode=False, confirm=True):
+        """Restore editor UI and exit play mode.
+
+        Args:
+            keep_play_mode: If True, stay in play mode (F12 toggle).
+                            If False, also exit play mode (ESC quit).
+            confirm: If True, show a "Quit? Are you sure?" dialog before
+                    exiting. Only applies when keep_play_mode=False (ESC flow).
+        """
+        # Show confirmation dialog when quitting via ESC
+        if confirm and not keep_play_mode:
+            reply = QMessageBox.question(
+                self,
+                "Quit Game",
+                "Quit game and return to editor?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return  # User cancelled — stay in kiosk mode
+
+        self.is_kiosk_mode = False
+
+        # Back on the 3D view: the context is handed back to the widget (its
+        # framebuffer) and the native window goes, before anything else
+        # draws or the editor window returns.
+        if self.view_3d._native_surface is not None:
+            self.view_3d.end_native_presentation()
+            self.show()
+
+        # Exit play mode only if not keeping it (F12 toggle vs Escape)
+        if not keep_play_mode and self.view_3d.play_mode:
+            self._exit_play_mode()
+        else:
+            # --- Restore previous tab ---
+            self._restore_properties_tab()
+
+        # Frames go on being painted when published while Play goes on (F12
+        # back to the editor); leaving Play turned it off.
+        self.view_3d.set_paint_on_publish(bool(self.view_3d.play_mode))
+
+        # Exit fullscreen FIRST - critical for proper geometry restoration
+        if self.windowFlags() & Qt.FramelessWindowHint:
+            self.setWindowFlag(Qt.FramelessWindowHint, False)
+        self.showNormal()
+
+        # Restore the complete layout state (geometry, docks, toolbars)
+        # This must happen BEFORE manual visibility fixes so restoreState()
+        # has full control over dock positions and toolbar states
+        self.load_layout()
+
+        # restoreState()/restoreGeometry() handle docks and toolbars,
+        # but menu bar and status bar visibility are NOT saved in the state
+        if self.menuBar():
+            self.menuBar().setVisible(True)
+        self.statusBar().setVisible(True)
+
+        # Play button is a floating widget, not part of QMainWindow state
+        if hasattr(self, 'play_button'):
+            self.play_button.setVisible(True)
+
+        # Update play button and mode label — only reset to editor state if
+        # we are actually leaving play mode (not an F12 fullscreen toggle).
+        # Note: _exit_play_mode() already handles button/mode updates when keep_play_mode=False
+
+        # If keeping play mode, recapture mouse for seamless FPS control
+        if keep_play_mode and self.view_3d.play_mode:
+            center_pos = self.view_3d.mapToGlobal(self.view_3d.rect().center())
+            QCursor.setPos(center_pos)
+            self.view_3d.last_mouse_pos = self.view_3d.mapFromGlobal(center_pos)
+            QApplication.setOverrideCursor(Qt.BlankCursor)
+            self.view_3d.setFocus()
+
+        # What changed while the editor was dormant (a level changed inside
+        # the game) reaches its panels and views now, once.
+        if getattr(self, '_editor_ui_stale', False):
+            self.update_all_ui()
+
+    # =========================================================================
+    # LOGIC GRAPH / WIZARD
+    # =========================================================================
+
+    def _refresh_logic_graph(self):
+        """
+        Rebuild the Logic Graph scene to match the current map.
+        Called automatically after every map load and New Map.
+        If the window is open it reloads immediately; if it is closed the
+        stale window is discarded so the next open starts fresh.
+        """
+        win = getattr(self, '_logic_graph_win', None)
+        if win is None:
+            return
+        if win.isVisible():
+            win._reload()
+        else:
+            # Quietly discard the stale window — a new one will be built on
+            # next open(), using the current editor_state automatically.
+            # Deleted, not just closed: a closed window is still the main
+            # window's child, holding the previous map's whole graph, and one
+            # was left behind per map load.
+            win.close()
+            win.deleteLater()
+            self._logic_graph_win = None
+
+    def open_item_editor(self):
+        """Tools > Custom Items: redefine the custom1 / custom2 item slots."""
+        from editor.item_editor import ItemEditorDialog
+        ItemEditorDialog(self).exec_()
+
+    def open_logic_graph(self):
+        """Open (or raise) the Logic Graph Editor window."""
+        from editor.logic_graph_widget import LogicGraphWindow
+        if not hasattr(self, '_logic_graph_win') or self._logic_graph_win is None:
+            self._logic_graph_win = LogicGraphWindow(self.state, parent=self)
+            self._logic_graph_win.about_to_apply.connect(
+                self._on_logic_graph_about_to_apply)
+            self._logic_graph_win.applied.connect(self._on_logic_graph_applied)
+        self._logic_graph_win.show()
+        self._logic_graph_win.raise_()
+        self._logic_graph_win.activateWindow()
+
+    def _on_logic_graph_applied(self):
+        """Called when the Logic Graph writes connections back to entities.
+
+        Applying rewrites connections across the whole scene, which is exactly
+        the kind of change undo exists for — and it had no checkpoint, so Ctrl+Z
+        after an Apply stepped over it to whatever came before.
+        """
+        self.mark_as_modified()
+        self.invalidate_entity_caches()
+        debug_log("IO", "Logic Graph applied connections to scene")
+
+    def _on_logic_graph_about_to_apply(self):
+        """Checkpoint the scene before the Logic Graph rewrites it.
+
+        Applying rewrites connections across the whole scene, which is exactly
+        what undo exists for, and it had no checkpoint at all — Ctrl+Z after an
+        Apply stepped over it to whatever came before. The checkpoint goes in
+        *before* the change, like every other tool in Fio, so the entry on the
+        stack is the state to go back to.
+        """
+        try:
+            self.state.save_state()
+        except Exception:
+            pass
+
+    def open_cutscene_wizard(self):
+        """Open (or raise) the modeless Cutscene authoring panel."""
+        from editor.cutscene_wizard import CutsceneWizard
+        wizard = getattr(self, "_cutscene_wizard", None)
+        if wizard is not None and wizard.isVisible():
+            wizard.raise_()
+            wizard.activateWindow()
+            return
+        wizard = CutsceneWizard(self, parent=self)
+        self._cutscene_wizard = wizard
+        wizard.show()
+        wizard.raise_()
+        wizard.activateWindow()
+
+    def open_logic_wizard(self):
+        """Open the Logic Wizard (guided I/O scenario setup)."""
+        from editor.logic_graph_widget import LogicGraphScene
+        from editor.logic_wizard import LogicWizard
+        # Reuse the existing graph window's scene if it is already open,
+        # so that wizard-added connections appear there immediately.
+        if hasattr(self, '_logic_graph_win') and self._logic_graph_win is not None:
+            scene  = self._logic_graph_win.get_scene()
+            parent = self._logic_graph_win
+        else:
+            # Build a temporary scene — the wizard will still call apply_to_entities
+            scene  = LogicGraphScene(self.state)
+            parent = self
+        wiz = LogicWizard(self.state, scene, parent=parent)
+        if wiz.exec_():
+            # If the graph window is not yet open, open it so the user can review
+            # and press Apply to persist the connections.
+            self.open_logic_graph()
+
+    def open_project_overview(self):
+        """Show what this map contains, as a report rather than a panel.
+
+        It lived in the bottom third of the Scene Hierarchy, where a report
+        competed for height with the list people open that panel to use.
+        """
+        try:
+            from editor.project_overview import show_project_overview
+        except ImportError:
+            QMessageBox.warning(self, "Project Overview",
+                                "The overview is unavailable in this build.")
+            return
+        show_project_overview(self)
+
+    def validate_io_connections(self):
+        """Report every broken connection in the map.
+
+        The checking itself lives in :mod:`editor.io_system`, next to the
+        dispatcher whose rules it has to agree with — a second copy of "how does
+        a connection find its target" here is a second copy that can drift, and
+        the one that used to be here had: it treated a connection's ``target_id``
+        as missing only when it was ``None``, but the field defaults to the empty
+        string, so every name-addressed connection in every legacy map was
+        reported broken.
+
+        It also reports inputs and outputs the entity types do not declare, which
+        nothing checked before: a connection calling ``Opne`` instead of ``Open``
+        resolved its target perfectly well and then did nothing, with no error
+        anywhere until someone noticed the door was not opening.
+        """
+        try:
+            from editor.io_system import (validate_all_scene_connections,
+                                          PROBLEM_MISSING_TARGET)
+        except ImportError:
+            QMessageBox.warning(self, "Validate Connections",
+                                "The I/O system is unavailable in this build.")
+            return
+
+        from editor.io_system import resolve_group_target
+        validation = validate_all_scene_connections(
+            self.state.brushes,
+            self.state.things,
+            find_group=lambda name, group_id='': resolve_group_target(
+                self.state, name, group_id),
+        )
+
+        problems = validation['problems']
+        total = validation['total']
+
+        def _name(entity):
+            if hasattr(entity, 'properties'):
+                return entity.properties.get('name', '?')
+            return entity.get('name', '?')
+
+        # Format validation problems.  I/O and PathNode problems use the
+        # same four-item tuple shape, but their connection objects differ.
+        # Missing targets first: a connection pointing at nothing is a broken
+        # map, while an unknown input is usually a typo in an otherwise sound one.
+        ordered = sorted(problems,
+                         key=lambda p: 0 if p[2] == PROBLEM_MISSING_TARGET else 1)
+        lines = []
+
+        for entity, connection, code, message in ordered:
+            if code in (
+                "missing_pathnode_target",
+                "invalid_pathnode_target",
+            ):
+                if isinstance(entity, dict):
+                    properties = entity.get("properties", entity)
+                else:
+                    properties = getattr(entity, "properties", {})
+
+                name = properties.get("name", "<unnamed PathNode>")
+
+                lines.append(
+                    "PathNode '%s': %s" % (name, message)
+                )
+            else:
+                # An I/O message names the target, not the connection's
+                # owner: say which entity and output it is.
+                lines.append("  %s.%s %s" % (
+                    _name(entity), getattr(connection, 'output_name', '?'),
+                    message))
+
+        QMessageBox.warning(
+            self,
+            "Validate Connections",
+            "%d of %d connection(s) have problems:\n\n%s"
+            % (
+                len(problems),
+                total,
+                "\n".join(lines),
+            ),
+        )
+
+    def closeEvent(self, event):
+        try:
+            # Leave Play first, so the prompt's "Save" writes the authored
+            # map (the pre-play world is put back) and not the running game.
+            if self._in_play_mode():
+                try:
+                    self._exit_play_mode()
+                except Exception as e:
+                    print(f"Leaving Play on close failed: {e}")
+            if (not getattr(self, '_quit_without_prompt', False)
+                    and not self.check_unsaved_changes()):
+                event.ignore()
+                return
+
+            # Stop timers
+            if hasattr(self, 'tooltip_timer'):
+                self.tooltip_timer.stop()
+            if hasattr(self, 'autosave_timer'):
+                self.autosave_timer.stop()
+            # An autosave being written finishes before the editor goes.
+            if getattr(self, '_autosave_executor', None) is not None:
+                self.wait_for_autosave(timeout=30)
+                self._autosave_executor.shutdown(wait=False)
+                self._autosave_executor = None
+
+            # The played package, if any, is no longer read.
+            self._close_package()
+
+            try:
+                self.save_layout()
+            except Exception as e:
+                print(f"save_layout failed: {e}")
+
+            if self.view_3d is not None and self.view_3d.logic_thread:
+                logic_thread = self.view_3d.logic_thread
+                logic_thread.stop()
+                # The thread starts in initializeGL; a window closed before
+                # (or after a failed) GL initialisation has nothing to join.
+                if logic_thread.is_alive():
+                    logic_thread.join(timeout=1.0)
+
+            # The world was frozen out of the collector (gc_policy.settle);
+            # a closed window's world must be collectable.
+            gc_policy.release()
+            event.accept()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            event.accept()
+
+    def open_colours_dialog(self):
+        """Edit > Colours: the grid's colours, and the floating windows'."""
+        dialog = ColoursDialog(self.config, self)
+        if dialog.exec_() == QDialog.Accepted:
+            self.apply_window_colours()
+            # Refresh all views that draw a grid or a floating window
+            self.view_3d.update()
+            self.view_top.update()
+            self.view_side.update()
+            self.view_front.update()
+            self.show_toast("Colours updated")
+
+    def apply_window_colours(self):
+        """The floating windows (SysMon, the pause menu, the editor's
+        overlays) take their title bar colour from settings.ini
+        [WindowColours]; the rest of their colours are fixed."""
+        from engine import floating_windows
+        floating_windows.set_theme({'header': self.config.get(
+            'WindowColours', 'header', fallback=floating_windows.DEFAULT_THEME['header'])})
+
+
+class ColoursDialog(QDialog):
+    """Edit > Colours: a tab for the grid, a tab for the floating windows'
+    title bar. OK saves every colour of both tabs to settings.ini."""
+
+    GRID_SECTION = "GridColours"
+    GRID_DEFAULTS = {"major": "#5a5a5a", "minor": "#404040", "background": "#2b2b2b"}
+    GRID_LABELS = (("major", "Major colour:"), ("minor", "Minor colour:"),
+                   ("background", "Background:"))
+    WINDOW_SECTION = "WindowColours"
+    WINDOW_LABELS = (("header", "Title bar:"),)
+
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
+        from engine.floating_windows import DEFAULT_THEME
+        self.config = config
+        self.parent_window = parent
+        self.setWindowTitle("Colours")
+        self.setModal(True)
+        self.setMinimumWidth(380)
+        #: {(section, key): QColor} being edited, and each section's defaults.
+        self.colours = {}
+        self.buttons = {}
+        self.defaults = {self.GRID_SECTION: dict(self.GRID_DEFAULTS),
+                         self.WINDOW_SECTION: {key: DEFAULT_THEME[key]
+                                               for key, _text in self.WINDOW_LABELS}}
+
+        layout = QVBoxLayout(self)
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+        self.tabs.addTab(self._tab(self.GRID_SECTION, self.GRID_LABELS), "Grid")
+        self.tabs.addTab(self._tab(self.WINDOW_SECTION, self.WINDOW_LABELS,
+                                   "SysMon, the pause menu and the other windows "
+                                   "floating in the 3D view."), "Windows")
+
+        self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+    def _tab(self, section, labels, note=None):
+        page = QWidget()
+        column = QVBoxLayout(page)
+        if note:
+            hint = QLabel(note)
+            hint.setWordWrap(True)
+            hint.setStyleSheet("color: #aaa; font-style: italic;")
+            column.addWidget(hint)
+        for key, text in labels:
+            colour = QColor(self.config.get(section, key, fallback=self.defaults[section][key]))
+            if not colour.isValid():
+                colour = QColor(self.defaults[section][key])
+            self.colours[(section, key)] = colour
+            row = QHBoxLayout()
+            label = QLabel(text)
+            label.setFixedWidth(200)
+            row.addWidget(label)
+            row.addStretch()
+            button = QPushButton()
+            button.setFixedSize(32, 32)
+            button.clicked.connect(lambda _c=False, s=section, k=key: self.pick_colour(s, k))
+            self.buttons[(section, key)] = button
+            self._show(section, key)
+            row.addWidget(button)
+            column.addLayout(row)
+        column.addStretch()
+        defaults = QPushButton("Defaults")
+        defaults.clicked.connect(lambda _c=False, s=section: self.reset_to_defaults(s))
+        row = QHBoxLayout()
+        row.addWidget(defaults)
+        row.addStretch()
+        column.addLayout(row)
+        return page
+
+    def _show(self, section, key):
+        self.buttons[(section, key)].setStyleSheet(
+            f"background-color: {self.colours[(section, key)].name()}; border: 1px solid #888;")
+
+    def pick_colour(self, section, key):
+        col = QColorDialog.getColor(self.colours[(section, key)], self)
+        if col.isValid():
+            self.colours[(section, key)] = col
+            self._show(section, key)
+
+    def reset_to_defaults(self, section):
+        """Reset one tab's colours to their defaults."""
+        for key, value in self.defaults[section].items():
+            self.colours[(section, key)] = QColor(value)
+            self._show(section, key)
+
+    def accept(self):
+        for (section, key), colour in self.colours.items():
+            if not self.config.has_section(section):
+                self.config.add_section(section)
+            self.config.set(section, key, colour.name())
+        # Window colours the dialog no longer offers are not kept: a value
+        # left from an older version could not be seen or reset.
+        if self.config.has_section(self.WINDOW_SECTION):
+            for key in list(self.config.options(self.WINDOW_SECTION)):
+                if (self.WINDOW_SECTION, key) not in self.colours:
+                    self.config.remove_option(self.WINDOW_SECTION, key)
+        self.parent_window.save_config()
+        super().accept()
